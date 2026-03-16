@@ -1,0 +1,1906 @@
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder } = require("obsidian");
+
+// ═══════════════════════════════════════════════════════════════
+//  UTILITIES
+// ═══════════════════════════════════════════════════════════════
+
+function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseDateFromFilename(name) {
+    const cleaned = name
+        .replace(/\.md$/, "")
+        .replace(/^\w+,\s*/, "")
+        .replace(/(\d+)(st|nd|rd|th)/, "$1");
+    const d = new Date(cleaned);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+function formatDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}
+
+function startOfDay(d) {
+    const r = new Date(d);
+    r.setHours(0, 0, 0, 0);
+    return r;
+}
+
+function getMonthStart(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+function getMonthEnd(d) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
+
+function getISOWeek(d) {
+    const t = new Date(d);
+    t.setHours(0, 0, 0, 0);
+    t.setDate(t.getDate() + 3 - ((t.getDay() + 6) % 7));
+    const y1 = new Date(t.getFullYear(), 0, 1);
+    return Math.ceil((((t - y1) / 86400000) + 1) / 7);
+}
+
+function getWeekStart(d) {
+    const r = new Date(d);
+    r.setHours(0, 0, 0, 0);
+    const day = r.getDay();
+    r.setDate(r.getDate() - day + (day === 0 ? -6 : 1));
+    return r;
+}
+
+function getWeekEnd(d) {
+    const s = getWeekStart(d);
+    s.setDate(s.getDate() + 6);
+    return s;
+}
+
+function monthName(d) {
+    return d.toLocaleDateString("en-US", { month: "long" });
+}
+
+function addDays(d, n) {
+    const r = new Date(d);
+    r.setDate(r.getDate() + n);
+    return r;
+}
+
+function mergeFrontmatter(content, fields) {
+    const lines = Object.entries(fields).map(([k, v]) => `${k}: ${v}`).join("\n");
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (fmMatch) {
+        const existing = fmMatch[1];
+        return content.replace(/^---\n[\s\S]*?\n---/, `---\n${existing}\n${lines}\n---`);
+    }
+    return `---\n${lines}\n---\n${content}`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+
+const SYNODIC_PERIOD = 29.53059;
+
+const MOON_PHASES = ["New Moon", "First Quarter", "Full Moon", "Last Quarter"];
+const MOON_PHASE_SHORT = { "New Moon": "new", "First Quarter": "q1", "Full Moon": "full", "Last Quarter": "q3" };
+
+const SIGN_GLYPHS = {
+    Aries: "\u2648", Taurus: "\u2649", Gemini: "\u264A", Cancer: "\u264B",
+    Leo: "\u264C", Virgo: "\u264D", Libra: "\u264E", Scorpio: "\u264F",
+    Sagittarius: "\u2650", Capricorn: "\u2651", Aquarius: "\u2652", Pisces: "\u2653",
+};
+
+// Each sign's ingress (0 deg) = Zhongqi (major term), 15 deg = Jieqi (minor term)
+const SOLAR_TERMS = {
+    Aries:       { major: { en: "Spring Equinox",       cn: "\u6625\u5206" }, minor: { en: "Clear and Bright",      cn: "\u6E05\u660E" } },
+    Taurus:      { major: { en: "Grain Rain",           cn: "\u8C37\u96E8" }, minor: { en: "Start of Summer",       cn: "\u7ACB\u590F" } },
+    Gemini:      { major: { en: "Grain Buds",           cn: "\u5C0F\u6EE1" }, minor: { en: "Grain in Ear",          cn: "\u8292\u79CD" } },
+    Cancer:      { major: { en: "Summer Solstice",      cn: "\u590F\u81F3" }, minor: { en: "Minor Heat",            cn: "\u5C0F\u6691" } },
+    Leo:         { major: { en: "Major Heat",           cn: "\u5927\u6691" }, minor: { en: "Start of Autumn",       cn: "\u7ACB\u79CB" } },
+    Virgo:       { major: { en: "End of Heat",          cn: "\u5904\u6691" }, minor: { en: "White Dew",             cn: "\u767D\u9732" } },
+    Libra:       { major: { en: "Autumn Equinox",       cn: "\u79CB\u5206" }, minor: { en: "Cold Dew",              cn: "\u5BD2\u9732" } },
+    Scorpio:     { major: { en: "Frost's Descent",      cn: "\u971C\u964D" }, minor: { en: "Start of Winter",       cn: "\u7ACB\u51AC" } },
+    Sagittarius: { major: { en: "Minor Snow",           cn: "\u5C0F\u96EA" }, minor: { en: "Major Snow",            cn: "\u5927\u96EA" } },
+    Capricorn:   { major: { en: "Winter Solstice",      cn: "\u51AC\u81F3" }, minor: { en: "Minor Cold",            cn: "\u5C0F\u5BD2" } },
+    Aquarius:    { major: { en: "Major Cold",           cn: "\u5927\u5BD2" }, minor: { en: "Start of Spring",       cn: "\u7ACB\u6625" } },
+    Pisces:      { major: { en: "Rain Water",           cn: "\u96E8\u6C34" }, minor: { en: "Awakening of Insects",  cn: "\u60CA\u86F0" } },
+};
+
+const DEFAULT_NAMING = {
+    calendar: { container: "{{month-name}} {{year}}", subdivision: "Week {{week}} \u2014 {{week-start}}" },
+    moon:     { container: "{{phase}} {{date}}",       subdivision: "{{phase}} {{date}}" },
+    solar:    { container: "{{term}} {{year}}",        subdivision: "{{term}} {{date}}" },
+};
+
+const MODE_LABELS = {
+    calendar: { container: "Monthly",     subdivision: "Weekly",  containerNote: "Monthly Note",     subdivisionNote: "Weekly Note" },
+    moon:     { container: "Moon Cycle",  subdivision: "Phase",   containerNote: "Moon Cycle Note",  subdivisionNote: "Phase Note" },
+    solar:    { container: "Solar Cycle", subdivision: "Term",    containerNote: "Solar Cycle Note", subdivisionNote: "Term Note" },
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  LLM PROVIDERS (from Daily Ritual)
+// ═══════════════════════════════════════════════════════════════
+
+const PROVIDERS = {
+    gemini: {
+        name: "Google Gemini",
+        buildUrl(s) { return `https://generativelanguage.googleapis.com/v1beta/models/${s.model}:generateContent?key=${s.apiKey}`; },
+        buildBody(prompt, s, sys) { return { system_instruction: { parts: [{ text: sys }] }, contents: [{ role: "user", parts: [{ text: prompt }] }] }; },
+        extractText(d) { return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""; },
+        async listModels(key) {
+            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
+            if (!r.ok) throw new Error(`${r.status}`);
+            const d = await r.json();
+            return (d.models || []).filter(m => m.supportedGenerationMethods?.includes("generateContent")).map(m => m.name.replace("models/", "")).sort();
+        },
+    },
+    openai: {
+        name: "OpenAI",
+        buildUrl() { return "https://api.openai.com/v1/chat/completions"; },
+        buildBody(prompt, s, sys) { return { model: s.model, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }] }; },
+        extractText(d) { return d.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) { return { Authorization: `Bearer ${s.apiKey}` }; },
+        async listModels(key) {
+            const r = await fetch("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${key}` } });
+            if (!r.ok) throw new Error(`${r.status}`);
+            const d = await r.json();
+            return (d.data || []).filter(m => m.id.startsWith("gpt") || m.id.startsWith("o")).map(m => m.id).sort();
+        },
+    },
+    anthropic: {
+        name: "Anthropic Claude",
+        buildUrl() { return "https://api.anthropic.com/v1/messages"; },
+        buildBody(prompt, s, sys) { return { model: s.model, max_tokens: 1024, system: sys, messages: [{ role: "user", content: prompt }] }; },
+        extractText(d) { return d.content?.[0]?.text?.trim() || ""; },
+        headers(s) { return { "x-api-key": s.apiKey, "anthropic-version": "2023-06-01" }; },
+        async listModels(key) {
+            const r = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": key, "anthropic-version": "2023-06-01" } });
+            if (!r.ok) throw new Error(`${r.status}`);
+            const d = await r.json();
+            return (d.data || []).map(m => m.id).sort();
+        },
+    },
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  DEFAULT SETTINGS
+// ═══════════════════════════════════════════════════════════════
+
+function makeQuestion(text) {
+    return {
+        text: text || "",
+        injectVar: false,
+        varField: "",
+        varSource: "previous",
+        varNotePath: "",
+        outputToField: false,
+        outputFieldName: "",
+        outputFieldType: "inline",
+    };
+}
+
+function makeReflectionConfig() {
+    return {
+        questions: [],
+        systemPromptPrepend: "",
+        systemPromptFile: "",
+        dataPassThrough: "answers-only",
+        selectedFields: [],
+        outputFieldName: "",
+        outputFieldType: "inline",
+    };
+}
+
+const DEFAULT_SETTINGS = {
+    mode: "calendar",
+    solarSubdivision: "terms",
+
+    containerTemplate: "",
+    containerFolder: "",
+    containerNaming: "",
+    generateAt: "start",
+
+    subdivisionTemplate: "",
+    subdivisionFolder: "",
+    subdivisionNaming: "",
+
+    includeSignGlyphs: false,
+    includeEclipseFlags: false,
+
+    dailyNotesFolder: "",
+
+    dailyToSubFields: [],
+    subToContainerFields: [],
+
+    llmEnabled: false,
+    provider: "gemini",
+    apiKey: "",
+    model: "",
+
+    containerReflection: makeReflectionConfig(),
+    subdivisionReflection: makeReflectionConfig(),
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  MODALS
+// ═══════════════════════════════════════════════════════════════
+
+class MarkdownFileSuggestModal extends FuzzySuggestModal {
+    constructor(app, onChoose) {
+        super(app);
+        this.onChooseCallback = onChoose;
+        this.setPlaceholder("Search for a markdown file...");
+    }
+    getItems() { return this.app.vault.getFiles().filter(f => f.extension === "md"); }
+    getItemText(file) { return file.path; }
+    onChooseItem(file) { this.onChooseCallback(file); }
+}
+
+class FolderSuggestModal extends FuzzySuggestModal {
+    constructor(app, onChoose) {
+        super(app);
+        this.onChooseCallback = onChoose;
+        this.setPlaceholder("Search for a folder...");
+    }
+    getItems() {
+        const folders = [];
+        this.app.vault.getAllLoadedFiles().forEach(f => {
+            if (f instanceof TFolder) folders.push(f);
+        });
+        return folders;
+    }
+    getItemText(folder) { return folder.path; }
+    onChooseItem(folder) { this.onChooseCallback(folder); }
+}
+
+class ReflectionModal extends Modal {
+    constructor(app, questions, injectedVars, onSubmit) {
+        super(app);
+        this.questions = questions;
+        this.injectedVars = injectedVars;
+        this.onSubmit = onSubmit;
+        this.answers = questions.map(() => "");
+        this.step = 0;
+    }
+
+    onOpen() { this.renderStep(); }
+
+    renderStep() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        const q = this.questions[this.step];
+        const injected = this.injectedVars[this.step];
+
+        if (injected) {
+            const varEl = contentEl.createEl("p");
+            varEl.createEl("strong", { text: injected });
+            varEl.style.cssText = "margin-bottom:8px;font-size:1.1em;";
+        }
+
+        contentEl.createEl("h5", { text: q.text }).style.cssText = "margin-bottom:12px;";
+
+        const input = contentEl.createEl("input", { type: "text" });
+        input.style.cssText = "width:100%;margin-bottom:16px;";
+        input.value = this.answers[this.step];
+        input.addEventListener("input", () => { this.answers[this.step] = input.value; });
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                if (!this.answers[this.step].trim()) { new Notice("Please answer this question."); return; }
+                if (this.step === this.questions.length - 1) { this.close(); this.onSubmit(this.answers); }
+                else { this.step++; this.renderStep(); }
+            }
+        });
+        setTimeout(() => input.focus(), 50);
+
+        const btnC = contentEl.createDiv({ cls: "modal-button-container" });
+        if (this.step > 0) {
+            const back = btnC.createEl("button", { text: "Back" });
+            back.addEventListener("click", () => { this.step--; this.renderStep(); });
+        }
+        const isLast = this.step === this.questions.length - 1;
+        const next = btnC.createEl("button", { text: isLast ? "Submit" : "Next", cls: "mod-cta" });
+        next.addEventListener("click", () => {
+            if (!this.answers[this.step].trim()) { new Notice("Please answer this question."); return; }
+            if (isLast) { this.close(); this.onSubmit(this.answers); }
+            else { this.step++; this.renderStep(); }
+        });
+    }
+
+    onClose() { this.contentEl.empty(); }
+}
+
+class LoadingModal extends Modal {
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.style.cssText = "text-align:center;padding:24px;";
+        contentEl.createEl("p", { text: "Generating summary..." }).style.opacity = "0.7";
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+class DebugModal extends Modal {
+    constructor(app, debugData) { super(app); this.debugData = debugData; }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h2", { text: "Test Reflection" });
+        const sections = [
+            { label: "Provider", value: this.debugData.provider },
+            { label: "Model", value: this.debugData.model },
+            { label: "System Prompt Prepend", value: this.debugData.prepend || "(empty)" },
+            { label: "System Prompt (from file)", value: this.debugData.systemPrompt || "(none)" },
+            { label: "Structured Reflection", value: this.debugData.structured },
+            { label: "Full Prompt", value: this.debugData.fullPrompt, mono: true },
+        ];
+        if (this.debugData.response) sections.push({ label: "LLM Response", value: this.debugData.response });
+        if (this.debugData.error) sections.push({ label: "Error", value: this.debugData.error });
+        for (const s of sections) {
+            const g = contentEl.createDiv();
+            g.style.cssText = "margin-bottom:16px;border-bottom:1px solid var(--background-modifier-border);padding-bottom:8px;";
+            g.createEl("h4", { text: s.label });
+            const c = g.createEl(s.mono ? "pre" : "p", { text: s.value });
+            c.style.cssText = "white-space:pre-wrap;word-break:break-word;";
+            if (s.mono) c.style.cssText += "font-size:0.85em;background:var(--background-secondary);padding:8px;border-radius:4px;";
+        }
+        const btn = contentEl.createDiv({ cls: "modal-button-container" }).createEl("button", { text: "Copy All", cls: "mod-cta" });
+        btn.addEventListener("click", () => {
+            navigator.clipboard.writeText(sections.map(s => `## ${s.label}\n${s.value}`).join("\n\n---\n\n")).then(() => new Notice("Copied to clipboard"));
+        });
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MAIN PLUGIN
+// ═══════════════════════════════════════════════════════════════
+
+class MonthlyRitualPlugin extends Plugin {
+
+    // ─── Lifecycle ───
+
+    async onload() {
+        await this.loadSettings();
+        this.addSettingTab(new MonthlyRitualSettingTab(this.app, this));
+        this.registerCommands();
+    }
+
+    async loadSettings() {
+        const saved = await this.loadData();
+        this.settings = Object.assign({}, JSON.parse(JSON.stringify(DEFAULT_SETTINGS)), saved);
+        if (!this.settings.containerReflection || typeof this.settings.containerReflection !== "object") {
+            this.settings.containerReflection = makeReflectionConfig();
+        }
+        if (!this.settings.subdivisionReflection || typeof this.settings.subdivisionReflection !== "object") {
+            this.settings.subdivisionReflection = makeReflectionConfig();
+        }
+    }
+
+    async saveSettings() { await this.saveData(this.settings); }
+
+    // ─── Mode helpers ───
+
+    getModeLabels() {
+        const m = this.settings.mode;
+        if (m === "moon") return MODE_LABELS.moon;
+        if (m === "solar") {
+            const labels = { ...MODE_LABELS.solar };
+            if (this.settings.solarSubdivision === "phases") {
+                labels.subdivision = "Phase";
+                labels.subdivisionNote = "Phase Note";
+            }
+            return labels;
+        }
+        return MODE_LABELS.calendar;
+    }
+
+    hasMoonPlugin() {
+        return !!this.app.plugins?.plugins?.["obsidian-moon"];
+    }
+
+    getMoonPlugin() {
+        return this.app.plugins?.plugins?.["obsidian-moon"] || null;
+    }
+
+    getHeliosUrl() {
+        const mp = this.getMoonPlugin();
+        return mp?.settings?.serverUrl || null;
+    }
+
+    getEffectiveNaming(type) {
+        const key = type === "container" ? "containerNaming" : "subdivisionNaming";
+        if (this.settings[key]) return this.settings[key];
+        return DEFAULT_NAMING[this.settings.mode]?.[type] || "{{date}}";
+    }
+
+    // ─── Helios API ───
+
+    async fetchJson(url) {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`Helios ${r.status}: ${await r.text()}`);
+        return r.json();
+    }
+
+    async fetchMoonNow() {
+        const url = this.getHeliosUrl();
+        if (!url) throw new Error("Moon Phase plugin not configured or missing serverUrl");
+        return this.fetchJson(`${url}/moon-now`);
+    }
+
+    async fetchPlanetsNow() {
+        const url = this.getHeliosUrl();
+        if (!url) throw new Error("Moon Phase plugin not configured");
+        return this.fetchJson(`${url}/planets-now`);
+    }
+
+    async fetchSunIngresses(start, end) {
+        const url = this.getHeliosUrl();
+        if (!url) throw new Error("Moon Phase plugin not configured");
+        return this.fetchJson(`${url}/planetary-ingresses?planet=Sun&start=${formatDate(start)}&end=${formatDate(end)}`);
+    }
+
+    // ─── Calendar boundaries ───
+
+    getCalendarContainerData(date) {
+        const d = date || new Date();
+        const start = getMonthStart(d);
+        const end = getMonthEnd(d);
+        const cycleNum = String(d.getMonth() + 1).padStart(2, "0");
+        return {
+            start, end,
+            tokens: {
+                year: String(d.getFullYear()),
+                month: cycleNum,
+                "month-name": monthName(d),
+                day: String(d.getDate()).padStart(2, "0"),
+                date: formatDate(start),
+                cycle: cycleNum,
+            },
+        };
+    }
+
+    getCalendarSubdivisions(containerStart, containerEnd) {
+        const subs = [];
+        let d = new Date(containerStart);
+        const seen = new Set();
+        while (d <= containerEnd) {
+            const ws = getWeekStart(d);
+            const we = getWeekEnd(d);
+            const wk = getISOWeek(d);
+            const key = `${wk}-${ws.getFullYear()}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                // Clamp week boundaries to the month
+                const clampedStart = ws < containerStart ? containerStart : ws;
+                const clampedEnd = we > containerEnd ? containerEnd : we;
+                subs.push({
+                    start: clampedStart,
+                    end: clampedEnd,
+                    tokens: {
+                        year: String(clampedStart.getFullYear()),
+                        month: String(clampedStart.getMonth() + 1).padStart(2, "0"),
+                        "month-name": monthName(clampedStart),
+                        day: String(clampedStart.getDate()).padStart(2, "0"),
+                        date: formatDate(clampedStart),
+                        week: String(wk),
+                        "week-start": formatDate(clampedStart),
+                        "week-end": formatDate(clampedEnd),
+                    },
+                });
+            }
+            d = addDays(d, 7);
+        }
+        return subs;
+    }
+
+    getCurrentWeekData(date) {
+        const d = date || new Date();
+        const ws = getWeekStart(d);
+        const we = getWeekEnd(d);
+        const wk = getISOWeek(d);
+        return {
+            start: ws, end: we,
+            tokens: {
+                year: String(d.getFullYear()),
+                month: String(d.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(d),
+                day: String(d.getDate()).padStart(2, "0"),
+                date: formatDate(ws),
+                week: String(wk),
+                "week-start": formatDate(ws),
+                "week-end": formatDate(we),
+            },
+        };
+    }
+
+    // ─── Lunar boundaries ───
+
+    async getLunarContainerData(date) {
+        const moonData = await this.fetchMoonNow();
+        const now = date || new Date();
+        const moonAge = moonData.moonAge || 0;
+
+        const lastNew = startOfDay(addDays(now, -Math.floor(moonAge)));
+        const nextNew = startOfDay(addDays(lastNew, Math.round(SYNODIC_PERIOD)));
+
+        const sign = moonData.moonSign || "";
+        let sunSign = "";
+        try {
+            const planets = await this.fetchPlanetsNow();
+            const sun = (planets.planets || planets || []).find(p => p.name === "Sun");
+            if (sun) sunSign = sun.sign || "";
+        } catch (_) { /* ignore */ }
+
+        return {
+            start: lastNew, end: nextNew,
+            moonAge,
+            moonSign: moonData.moonSign || "",
+            sunSign,
+            tokens: {
+                year: String(lastNew.getFullYear()),
+                month: String(lastNew.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(lastNew),
+                day: String(lastNew.getDate()).padStart(2, "0"),
+                date: formatDate(lastNew),
+                cycle: this.getLunarCycleNumber(lastNew),
+                phase: "New Moon",
+                "phase-short": "new",
+                sign: this.settings.includeSignGlyphs ? sign : "",
+                "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+                eclipse: "",
+            },
+        };
+    }
+
+    getLunarCycleNumber(newMoonDate) {
+        const y = newMoonDate.getFullYear();
+        const jan1 = new Date(y, 0, 1);
+        const dayOfYear = Math.floor((newMoonDate - jan1) / 86400000);
+        return String(Math.floor(dayOfYear / SYNODIC_PERIOD) + 1).padStart(2, "0");
+    }
+
+    getLunarPhaseFromAge(moonAge) {
+        const q = SYNODIC_PERIOD / 4;
+        if (moonAge < q) return "New Moon";
+        if (moonAge < 2 * q) return "First Quarter";
+        if (moonAge < 3 * q) return "Full Moon";
+        return "Last Quarter";
+    }
+
+    getLunarSubdivisions(containerStart) {
+        const q = SYNODIC_PERIOD / 4;
+        return MOON_PHASES.map((phase, i) => {
+            const start = startOfDay(addDays(containerStart, Math.round(i * q)));
+            const end = i < 3
+                ? startOfDay(addDays(containerStart, Math.round((i + 1) * q) - 1))
+                : startOfDay(addDays(containerStart, Math.round(SYNODIC_PERIOD) - 1));
+            return {
+                start, end, phase,
+                tokens: {
+                    year: String(start.getFullYear()),
+                    month: String(start.getMonth() + 1).padStart(2, "0"),
+                    "month-name": monthName(start),
+                    day: String(start.getDate()).padStart(2, "0"),
+                    date: formatDate(start),
+                    phase: phase,
+                    "phase-short": MOON_PHASE_SHORT[phase],
+                    sign: "",
+                    "sign-glyph": "",
+                    eclipse: "",
+                },
+            };
+        });
+    }
+
+    async getCurrentPhaseData(date) {
+        const moonData = await this.fetchMoonNow();
+        const now = date || new Date();
+        const moonAge = moonData.moonAge || 0;
+        const phase = this.getLunarPhaseFromAge(moonAge);
+        const q = SYNODIC_PERIOD / 4;
+        const phaseIdx = MOON_PHASES.indexOf(phase);
+        const lastNew = startOfDay(addDays(now, -Math.floor(moonAge)));
+        const phaseStart = startOfDay(addDays(lastNew, Math.round(phaseIdx * q)));
+        const phaseEnd = phaseIdx < 3
+            ? startOfDay(addDays(lastNew, Math.round((phaseIdx + 1) * q) - 1))
+            : startOfDay(addDays(lastNew, Math.round(SYNODIC_PERIOD) - 1));
+
+        const sign = moonData.moonSign || "";
+        return {
+            start: phaseStart, end: phaseEnd, phase,
+            tokens: {
+                year: String(phaseStart.getFullYear()),
+                month: String(phaseStart.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(phaseStart),
+                day: String(phaseStart.getDate()).padStart(2, "0"),
+                date: formatDate(phaseStart),
+                phase: phase,
+                "phase-short": MOON_PHASE_SHORT[phase],
+                sign: this.settings.includeSignGlyphs ? sign : "",
+                "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+                eclipse: "",
+            },
+        };
+    }
+
+    // ─── Solar boundaries ───
+
+    async getSolarContainerData(date) {
+        const d = date || new Date();
+        // Fetch Sun ingresses for a wide window around today
+        const searchStart = addDays(d, -45);
+        const searchEnd = addDays(d, 45);
+        const ingresses = await this.fetchSunIngresses(searchStart, searchEnd);
+
+        // Find the ingress before today and the one after
+        const sorted = (Array.isArray(ingresses) ? ingresses : ingresses.ingresses || [])
+            .map(ing => ({ ...ing, dateObj: new Date(ing.date || ing.exactDate || ing.timestamp) }))
+            .sort((a, b) => a.dateObj - b.dateObj);
+
+        let prevIng = null, nextIng = null;
+        for (const ing of sorted) {
+            if (ing.dateObj <= d) prevIng = ing;
+            else if (!nextIng) nextIng = ing;
+        }
+
+        if (!prevIng) throw new Error("Could not determine current solar term from Helios data");
+        const sign = prevIng.sign || prevIng.toSign || "";
+        const term = SOLAR_TERMS[sign];
+        const start = startOfDay(prevIng.dateObj);
+        const end = nextIng ? startOfDay(addDays(nextIng.dateObj, -1)) : addDays(start, 29);
+
+        return {
+            start, end, sign,
+            tokens: {
+                year: String(start.getFullYear()),
+                month: String(start.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(start),
+                day: String(start.getDate()).padStart(2, "0"),
+                date: formatDate(start),
+                cycle: String(Object.keys(SIGN_GLYPHS).indexOf(sign) + 1).padStart(2, "0"),
+                term: term ? term.major.en : sign,
+                "term-cn": term ? term.major.cn : "",
+                sign: this.settings.includeSignGlyphs ? sign : "",
+                "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+            },
+        };
+    }
+
+    async getSolarSubdivisions(containerStart, containerEnd, sign) {
+        if (this.settings.solarSubdivision === "phases") {
+            // Subdivide by lunar phases within this solar period
+            try {
+                const moonData = await this.fetchMoonNow();
+                const moonAge = moonData.moonAge || 0;
+                const now = new Date();
+                const lastNew = startOfDay(addDays(now, -Math.floor(moonAge)));
+                const subs = [];
+                // Find all phase boundaries that fall within container range
+                let cycleStart = lastNew;
+                // Go back enough cycles to cover the container start
+                while (cycleStart > containerStart) cycleStart = addDays(cycleStart, -Math.round(SYNODIC_PERIOD));
+                // Now scan forward
+                while (cycleStart < containerEnd) {
+                    const q = SYNODIC_PERIOD / 4;
+                    for (let i = 0; i < 4; i++) {
+                        const phaseStart = startOfDay(addDays(cycleStart, Math.round(i * q)));
+                        const phaseEnd = i < 3
+                            ? startOfDay(addDays(cycleStart, Math.round((i + 1) * q) - 1))
+                            : startOfDay(addDays(cycleStart, Math.round(SYNODIC_PERIOD) - 1));
+                        if (phaseStart >= containerStart && phaseStart <= containerEnd) {
+                            const phase = MOON_PHASES[i];
+                            subs.push({
+                                start: phaseStart, end: phaseEnd > containerEnd ? containerEnd : phaseEnd, phase,
+                                tokens: {
+                                    year: String(phaseStart.getFullYear()),
+                                    month: String(phaseStart.getMonth() + 1).padStart(2, "0"),
+                                    "month-name": monthName(phaseStart),
+                                    day: String(phaseStart.getDate()).padStart(2, "0"),
+                                    date: formatDate(phaseStart),
+                                    phase, "phase-short": MOON_PHASE_SHORT[phase],
+                                    sign: "", "sign-glyph": "", eclipse: "",
+                                },
+                            });
+                        }
+                    }
+                    cycleStart = addDays(cycleStart, Math.round(SYNODIC_PERIOD));
+                }
+                return subs;
+            } catch (e) {
+                new Notice("Error calculating lunar phases: " + e.message);
+                return [];
+            }
+        }
+
+        // Default: subdivide by solar terms (major at start, minor at midpoint)
+        const term = SOLAR_TERMS[sign];
+        if (!term) return [];
+        const mid = startOfDay(addDays(containerStart, Math.round((containerEnd - containerStart) / 86400000 / 2)));
+        return [
+            {
+                start: containerStart, end: addDays(mid, -1),
+                tokens: {
+                    year: String(containerStart.getFullYear()),
+                    month: String(containerStart.getMonth() + 1).padStart(2, "0"),
+                    "month-name": monthName(containerStart),
+                    day: String(containerStart.getDate()).padStart(2, "0"),
+                    date: formatDate(containerStart),
+                    term: term.major.en, "term-cn": term.major.cn,
+                    sign: this.settings.includeSignGlyphs ? sign : "",
+                    "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+                },
+            },
+            {
+                start: mid, end: containerEnd,
+                tokens: {
+                    year: String(mid.getFullYear()),
+                    month: String(mid.getMonth() + 1).padStart(2, "0"),
+                    "month-name": monthName(mid),
+                    day: String(mid.getDate()).padStart(2, "0"),
+                    date: formatDate(mid),
+                    term: term.minor.en, "term-cn": term.minor.cn,
+                    sign: this.settings.includeSignGlyphs ? sign : "",
+                    "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+                },
+            },
+        ];
+    }
+
+    // ─── Token resolution ───
+
+    resolveTokens(str, tokens) {
+        return str.replace(/\{\{([\w-]+)\}\}/g, (_, key) => {
+            return tokens[key] !== undefined ? tokens[key] : "";
+        });
+    }
+
+    // ─── Template loading ───
+
+    async loadTemplate(templatePath) {
+        if (!templatePath) return "";
+        const file = this.app.vault.getAbstractFileByPath(templatePath);
+        if (!file || !(file instanceof TFile)) {
+            new Notice(`Template not found: ${templatePath}`);
+            return "";
+        }
+        return await this.app.vault.read(file);
+    }
+
+    // ─── Note generation ───
+
+    async generateNote(type, tokens, meta) {
+        const isContainer = type === "container";
+        const templatePath = isContainer ? this.settings.containerTemplate : this.settings.subdivisionTemplate;
+        const folder = isContainer ? this.settings.containerFolder : this.settings.subdivisionFolder;
+        const naming = this.getEffectiveNaming(type);
+
+        const fileName = this.resolveTokens(naming, tokens);
+        const folderPath = folder || "";
+        const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
+
+        // Check if exists
+        const existing = this.app.vault.getAbstractFileByPath(filePath);
+        if (existing) {
+            new Notice(`Note already exists: ${filePath}`);
+            return existing;
+        }
+
+        // Ensure folder exists
+        if (folderPath) {
+            const folderFile = this.app.vault.getAbstractFileByPath(folderPath);
+            if (!folderFile) {
+                await this.app.vault.createFolder(folderPath);
+            }
+        }
+
+        // Load and resolve template
+        let content = await this.loadTemplate(templatePath);
+        content = this.resolveTokens(content, tokens);
+
+        // Add frontmatter metadata
+        const fmFields = {
+            "mr-type": type,
+            "mr-mode": this.settings.mode,
+            "mr-start": meta.start,
+            "mr-end": meta.end,
+        };
+        content = mergeFrontmatter(content, fmFields);
+
+        const file = await this.app.vault.create(filePath, content);
+        new Notice(`Created: ${fileName}`);
+        return file;
+    }
+
+    async generateContainer() {
+        const mode = this.settings.mode;
+        try {
+            let data;
+            if (mode === "calendar") {
+                data = this.getCalendarContainerData();
+            } else if (mode === "moon") {
+                if (!this.hasMoonPlugin()) { new Notice("Requires Moon Phase plugin."); return; }
+                data = await this.getLunarContainerData();
+            } else {
+                if (!this.hasMoonPlugin()) { new Notice("Requires Moon Phase plugin."); return; }
+                data = await this.getSolarContainerData();
+            }
+            await this.generateNote("container", data.tokens, {
+                start: formatDate(data.start),
+                end: formatDate(data.end),
+            });
+        } catch (e) {
+            new Notice("Error generating container note: " + e.message);
+            console.error("Monthly Ritual:", e);
+        }
+    }
+
+    async generateSubdivision() {
+        const mode = this.settings.mode;
+        try {
+            let data;
+            if (mode === "calendar") {
+                data = this.getCurrentWeekData();
+            } else if (mode === "moon") {
+                if (!this.hasMoonPlugin()) { new Notice("Requires Moon Phase plugin."); return; }
+                data = await this.getCurrentPhaseData();
+            } else {
+                if (!this.hasMoonPlugin()) { new Notice("Requires Moon Phase plugin."); return; }
+                // For solar, determine which term we're in
+                const container = await this.getSolarContainerData();
+                const subs = await this.getSolarSubdivisions(container.start, container.end, container.sign);
+                const now = new Date();
+                data = subs.find(s => now >= s.start && now <= s.end) || subs[0];
+                if (!data) { new Notice("Could not determine current solar term."); return; }
+            }
+            await this.generateNote("subdivision", data.tokens, {
+                start: formatDate(data.start),
+                end: formatDate(data.end),
+            });
+        } catch (e) {
+            new Notice("Error generating subdivision note: " + e.message);
+            console.error("Monthly Ritual:", e);
+        }
+    }
+
+    // ─── Field pipeline ───
+
+    findDailyNotesInRange(start, end) {
+        const folder = this.settings.dailyNotesFolder || "";
+        return this.app.vault.getMarkdownFiles()
+            .filter(f => {
+                if (folder && !f.path.startsWith(folder + "/") && f.parent?.path !== folder) return false;
+                const d = parseDateFromFilename(f.name);
+                if (!d) return false;
+                return d >= start && d <= end;
+            })
+            .sort((a, b) => parseDateFromFilename(a.name) - parseDateFromFilename(b.name));
+    }
+
+    findNotesOfType(type) {
+        return this.app.vault.getMarkdownFiles().filter(f => {
+            const cache = this.app.metadataCache.getFileCache(f);
+            return cache?.frontmatter?.["mr-type"] === type && cache?.frontmatter?.["mr-mode"] === this.settings.mode;
+        });
+    }
+
+    findSubdivisionNotesInRange(start, end) {
+        const folder = this.settings.subdivisionFolder || "";
+        return this.app.vault.getMarkdownFiles()
+            .filter(f => {
+                if (folder && !f.path.startsWith(folder + "/") && f.parent?.path !== folder) return false;
+                const cache = this.app.metadataCache.getFileCache(f);
+                const fm = cache?.frontmatter;
+                if (fm?.["mr-type"] !== "subdivision" || fm?.["mr-mode"] !== this.settings.mode) return false;
+                const noteStart = new Date(fm["mr-start"]);
+                return noteStart >= start && noteStart <= end;
+            })
+            .sort((a, b) => {
+                const fmA = this.app.metadataCache.getFileCache(a)?.frontmatter;
+                const fmB = this.app.metadataCache.getFileCache(b)?.frontmatter;
+                return new Date(fmA?.["mr-start"] || 0) - new Date(fmB?.["mr-start"] || 0);
+            });
+    }
+
+    async readField(file, fieldName, fieldType) {
+        if (fieldType === "frontmatter") {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const val = cache?.frontmatter?.[fieldName];
+            return val !== undefined ? String(val) : "";
+        }
+        const content = await this.app.vault.read(file);
+        const regex = new RegExp(`\\b${escapeRegex(fieldName)}::(.*)`, "m");
+        const match = content.match(regex);
+        return match ? match[1].trim() : "";
+    }
+
+    async writeCollectedField(file, fieldName, values, fieldType) {
+        const collected = values.filter(v => v).join(" | ");
+        if (!collected) return;
+
+        let content = await this.app.vault.read(file);
+
+        if (fieldType === "frontmatter") {
+            const fmRegex = new RegExp(`(^${escapeRegex(fieldName)}:\\s*)(.*)`, "m");
+            if (fmRegex.test(content)) {
+                content = content.replace(fmRegex, `$1${collected}`);
+            } else {
+                const fmEnd = content.indexOf("\n---", content.indexOf("---") + 3);
+                if (fmEnd !== -1) {
+                    content = content.slice(0, fmEnd) + `\n${fieldName}: ${collected}` + content.slice(fmEnd);
+                } else {
+                    content = content.trimEnd() + `\n${fieldName}:: ${collected}\n`;
+                }
+            }
+        } else {
+            const regex = new RegExp(`(\\b${escapeRegex(fieldName)}::)(.*)`, "m");
+            if (regex.test(content)) {
+                content = content.replace(regex, `$1 ${collected}`);
+            } else {
+                content = content.trimEnd() + `\n${fieldName}:: ${collected}\n`;
+            }
+        }
+
+        await this.app.vault.modify(file, content);
+    }
+
+    async collectFields() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice("No active file."); return; }
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter;
+        if (!fm?.["mr-type"]) {
+            new Notice("This doesn't appear to be a Monthly Ritual note.");
+            return;
+        }
+
+        const noteType = fm["mr-type"];
+        const start = new Date(fm["mr-start"]);
+        const end = new Date(fm["mr-end"]);
+        // Extend end to end of day for inclusive matching
+        end.setHours(23, 59, 59, 999);
+
+        if (noteType === "subdivision") {
+            const mappings = this.settings.dailyToSubFields || [];
+            if (mappings.length === 0) { new Notice("No daily-to-subdivision field mappings configured."); return; }
+
+            const dailyNotes = this.findDailyNotesInRange(start, end);
+            if (dailyNotes.length === 0) { new Notice("No daily notes found in this date range."); return; }
+
+            for (const mapping of mappings) {
+                const values = [];
+                for (const dn of dailyNotes) {
+                    const val = await this.readField(dn, mapping.source, mapping.type || "inline");
+                    if (val) values.push(val);
+                }
+                await this.writeCollectedField(file, mapping.source, values, mapping.type || "inline");
+            }
+            new Notice(`Collected fields from ${dailyNotes.length} daily notes.`);
+
+        } else if (noteType === "container") {
+            const mappings = this.settings.subToContainerFields || [];
+            if (mappings.length === 0) { new Notice("No subdivision-to-container field mappings configured."); return; }
+
+            const subNotes = this.findSubdivisionNotesInRange(start, end);
+            if (subNotes.length === 0) { new Notice("No subdivision notes found in this date range."); return; }
+
+            for (const mapping of mappings) {
+                const values = [];
+                for (const sn of subNotes) {
+                    const val = await this.readField(sn, mapping.source, mapping.type || "inline");
+                    if (val) values.push(val);
+                }
+                await this.writeCollectedField(file, mapping.source, values, mapping.type || "inline");
+            }
+            new Notice(`Collected fields from ${subNotes.length} subdivision notes.`);
+        }
+    }
+
+    // ─── Reflection ───
+
+    findPreviousNote(type) {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) return null;
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter;
+        if (!fm?.["mr-start"]) return null;
+
+        const currentStart = new Date(fm["mr-start"]);
+        const notes = this.findNotesOfType(type);
+
+        let closest = null;
+        let closestDate = null;
+
+        for (const n of notes) {
+            if (n.path === file.path) continue;
+            const nCache = this.app.metadataCache.getFileCache(n);
+            const nStart = new Date(nCache?.frontmatter?.["mr-start"]);
+            if (nStart < currentStart && (!closestDate || nStart > closestDate)) {
+                closest = n;
+                closestDate = nStart;
+            }
+        }
+
+        return closest;
+    }
+
+    async loadInjectedVars(questions, noteType) {
+        const vars = [];
+        for (const q of questions) {
+            if (!q.injectVar || !q.varField) { vars.push(""); continue; }
+            let sourceFile = null;
+            if (q.varSource === "previous") {
+                sourceFile = this.findPreviousNote(noteType);
+            } else if (q.varSource === "note" && q.varNotePath) {
+                sourceFile = this.app.vault.getAbstractFileByPath(q.varNotePath);
+            }
+            if (sourceFile && sourceFile instanceof TFile) {
+                vars.push(await this.readField(sourceFile, q.varField, "inline"));
+            } else {
+                vars.push("");
+            }
+        }
+        return vars;
+    }
+
+    buildStructuredReflection(questions, answers) {
+        return questions.map((q, i) => `**Q${i + 1}: ${q.text}**\n${answers[i].trim()}`).join("\n\n");
+    }
+
+    async getSystemPromptContent(config) {
+        if (config.systemPromptFile) {
+            const file = this.app.vault.getAbstractFileByPath(config.systemPromptFile);
+            if (file && file instanceof TFile) return await this.app.vault.read(file);
+            new Notice(`System prompt file not found: ${config.systemPromptFile}`);
+        }
+        return "";
+    }
+
+    async buildContextData(config, file) {
+        if (config.dataPassThrough === "whole-note") {
+            return await this.app.vault.read(file);
+        }
+        if (config.dataPassThrough === "selected-fields") {
+            const fields = config.selectedFields || [];
+            const parts = [];
+            for (const f of fields) {
+                const val = await this.readField(file, f, "inline");
+                if (val) parts.push(`${f}:: ${val}`);
+            }
+            return parts.join("\n");
+        }
+        return "";
+    }
+
+    async buildPromptParts(structured, config, contextData) {
+        const provider = PROVIDERS[this.settings.provider];
+        if (!provider) throw new Error(`Unknown provider: ${this.settings.provider}`);
+
+        const modelContext = await this.getSystemPromptContent(config);
+        const systemInstructions = config.systemPromptPrepend?.trim() || "Summarize this reflection concisely, capturing the core insights.";
+
+        const promptParts = [
+            "## Mental Model (apply this lens to the reflection below)",
+            modelContext || "(no system prompt file selected)",
+            "---",
+            "## My Reflection",
+            structured,
+        ];
+
+        if (contextData) {
+            promptParts.push("---", "## Context Data", contextData);
+        }
+
+        promptParts.push("---", "Now follow the system instructions above precisely. Produce only the final output, nothing else.");
+
+        const userPrompt = promptParts.join("\n\n");
+        const url = provider.buildUrl(this.settings);
+        const body = provider.buildBody(userPrompt, this.settings, systemInstructions);
+        const headers = { "Content-Type": "application/json", ...(provider.headers ? provider.headers(this.settings) : {}) };
+
+        return { provider, url, body, headers, systemPrompt: modelContext, prepend: systemInstructions, userPrompt };
+    }
+
+    async callLLM(structured, config, contextData) {
+        const parts = await this.buildPromptParts(structured, config, contextData);
+        const response = await fetch(parts.url, {
+            method: "POST",
+            headers: parts.headers,
+            body: JSON.stringify(parts.body),
+        });
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`${response.status}: ${errText}`);
+        }
+        const data = await response.json();
+        return parts.provider.extractText(data);
+    }
+
+    async writeFieldToFile(file, fieldName, value, fieldType) {
+        let content = await this.app.vault.read(file);
+
+        if (fieldType === "frontmatter") {
+            const fmRegex = new RegExp(`(^${escapeRegex(fieldName)}:\\s*)(.*)`, "m");
+            if (fmRegex.test(content)) {
+                content = content.replace(fmRegex, `$1${value}`);
+            } else {
+                const fmEnd = content.indexOf("\n---", content.indexOf("---") + 3);
+                if (fmEnd !== -1) {
+                    content = content.slice(0, fmEnd) + `\n${fieldName}: ${value}` + content.slice(fmEnd);
+                } else {
+                    content = `---\n${fieldName}: ${value}\n---\n` + content;
+                }
+            }
+        } else {
+            const regex = new RegExp(`(\\b${escapeRegex(fieldName)}::)(.*)`, "m");
+            if (regex.test(content)) {
+                content = content.replace(regex, `$1 ${value}`);
+            } else {
+                content = content.trimEnd() + `\n${fieldName}:: ${value}\n`;
+            }
+        }
+
+        await this.app.vault.modify(file, content);
+    }
+
+    async runReflection(reflectionType) {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice("No active file."); return; }
+
+        const isContainer = reflectionType === "container";
+        const config = isContainer ? this.settings.containerReflection : this.settings.subdivisionReflection;
+        const questions = config.questions || [];
+
+        if (questions.length === 0) {
+            new Notice(`No ${reflectionType} reflection questions configured.`);
+            return;
+        }
+
+        // Verify the active file is the right type
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter;
+        if (fm?.["mr-type"] && fm["mr-type"] !== reflectionType) {
+            new Notice(`This note is a ${fm["mr-type"]}, not a ${reflectionType}. Open the correct note type.`);
+            return;
+        }
+
+        const injectedVars = await this.loadInjectedVars(questions, reflectionType);
+
+        new ReflectionModal(this.app, questions, injectedVars, async (answers) => {
+            // Write individual answers to their configured fields
+            for (let i = 0; i < questions.length; i++) {
+                const q = questions[i];
+                if (!q.outputToField || !q.outputFieldName) continue;
+                await this.writeFieldToFile(file, q.outputFieldName, answers[i].trim(), q.outputFieldType || "inline");
+            }
+
+            // LLM summary
+            if (this.settings.llmEnabled && config.outputFieldName) {
+                const structured = this.buildStructuredReflection(questions, answers);
+                const contextData = await this.buildContextData(config, file);
+                const loading = new LoadingModal(this.app);
+                loading.open();
+                try {
+                    const summary = await this.callLLM(structured, config, contextData);
+                    loading.close();
+                    if (summary) {
+                        await this.writeFieldToFile(file, config.outputFieldName, summary, config.outputFieldType || "inline");
+                        new Notice("Reflection logged + summary written.");
+                    } else {
+                        new Notice("LLM returned empty. Reflection logged without summary.");
+                    }
+                } catch (e) {
+                    loading.close();
+                    new Notice("LLM error: " + e.message);
+                    console.error("Monthly Ritual LLM:", e);
+                }
+            } else {
+                new Notice("Reflection logged.");
+            }
+        }).open();
+    }
+
+    async runTestReflection(reflectionType) {
+        if (!this.settings.llmEnabled) { new Notice("LLM is disabled. Enable it in settings."); return; }
+
+        const isContainer = reflectionType === "container";
+        const config = isContainer ? this.settings.containerReflection : this.settings.subdivisionReflection;
+        const questions = config.questions || [];
+        if (questions.length === 0) { new Notice("No questions configured."); return; }
+
+        const injectedVars = await this.loadInjectedVars(questions, reflectionType);
+
+        new ReflectionModal(this.app, questions, injectedVars, async (answers) => {
+            const structured = this.buildStructuredReflection(questions, answers);
+            const loading = new LoadingModal(this.app);
+            loading.open();
+
+            const debugData = {
+                provider: `${PROVIDERS[this.settings.provider].name} (${this.settings.provider})`,
+                model: this.settings.model,
+                prepend: config.systemPromptPrepend?.trim() || "",
+                structured,
+            };
+
+            try {
+                const file = this.app.workspace.getActiveFile();
+                const contextData = file ? await this.buildContextData(config, file) : "";
+                const parts = await this.buildPromptParts(structured, config, contextData);
+                debugData.systemPrompt = parts.systemPrompt;
+                debugData.fullPrompt = JSON.stringify(parts.body, null, 2);
+                const response = await fetch(parts.url, { method: "POST", headers: parts.headers, body: JSON.stringify(parts.body) });
+                if (!response.ok) { debugData.error = `${response.status}: ${await response.text()}`; }
+                else { const data = await response.json(); debugData.response = parts.provider.extractText(data) || "(empty response)"; }
+            } catch (e) { debugData.error = e.message; }
+
+            loading.close();
+            new DebugModal(this.app, debugData).open();
+        }).open();
+    }
+
+    // ─── Commands ───
+
+    registerCommands() {
+        const labels = this.getModeLabels();
+
+        this.cmdGenerateContainer = this.addCommand({
+            id: "generate-container",
+            name: `Generate ${labels.containerNote}`,
+            callback: () => this.generateContainer(),
+        });
+
+        this.cmdGenerateSubdivision = this.addCommand({
+            id: "generate-subdivision",
+            name: `Generate ${labels.subdivisionNote}`,
+            callback: () => this.generateSubdivision(),
+        });
+
+        this.cmdContainerReflection = this.addCommand({
+            id: "container-reflection",
+            name: `${labels.container} Reflection`,
+            callback: () => this.runReflection("container"),
+        });
+
+        this.cmdSubdivisionReflection = this.addCommand({
+            id: "subdivision-reflection",
+            name: `${labels.subdivision} Reflection`,
+            callback: () => this.runReflection("subdivision"),
+        });
+
+        this.addCommand({
+            id: "collect-fields",
+            name: "Collect Fields",
+            callback: () => this.collectFields(),
+        });
+
+        this.cmdTestContainer = this.addCommand({
+            id: "test-container-reflection",
+            name: `Test ${labels.container} Reflection`,
+            callback: () => this.runTestReflection("container"),
+        });
+
+        this.cmdTestSubdivision = this.addCommand({
+            id: "test-subdivision-reflection",
+            name: `Test ${labels.subdivision} Reflection`,
+            callback: () => this.runTestReflection("subdivision"),
+        });
+    }
+
+    updateCommandNames() {
+        const labels = this.getModeLabels();
+        const cmds = this.app.commands?.commands;
+        if (!cmds) return;
+        const prefix = this.manifest.id + ":";
+        const updates = {
+            "generate-container": `Generate ${labels.containerNote}`,
+            "generate-subdivision": `Generate ${labels.subdivisionNote}`,
+            "container-reflection": `${labels.container} Reflection`,
+            "subdivision-reflection": `${labels.subdivision} Reflection`,
+            "test-container-reflection": `Test ${labels.container} Reflection`,
+            "test-subdivision-reflection": `Test ${labels.subdivision} Reflection`,
+        };
+        for (const [id, name] of Object.entries(updates)) {
+            const cmd = cmds[prefix + id];
+            if (cmd) cmd.name = name;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SETTINGS TAB
+// ═══════════════════════════════════════════════════════════════
+
+class MonthlyRitualSettingTab extends PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+        this.reflectionTab = "container";
+        this.expandedInput = {};
+        this.expandedOutput = {};
+    }
+
+    display() {
+        const { containerEl } = this;
+        containerEl.empty();
+        const s = this.plugin.settings;
+        const mode = s.mode;
+        const hasMoon = this.plugin.hasMoonPlugin();
+
+        // ═══ MODE ═══
+        containerEl.createEl("h2", { text: "Mode" });
+
+        const modeRow = new Setting(containerEl).setName("Cycle mode").setDesc("Controls which settings appear below");
+        const modeEl = modeRow.controlEl;
+        modeEl.style.cssText = "display:flex;gap:4px;";
+
+        const modes = [
+            { id: "calendar", icon: "\uD83D\uDCC5", tip: "Calendar (months + weeks)" },
+            { id: "moon", icon: "\uD83C\uDF19", tip: "Moon (lunar cycles + phases)" },
+            { id: "solar", icon: "\u2600\uFE0F", tip: "Solar (solar terms)" },
+        ];
+
+        for (const m of modes) {
+            const btn = modeEl.createEl("button", { text: m.icon });
+            btn.title = m.tip;
+            btn.className = "mr-mode-btn" + (mode === m.id ? " mr-mode-active" : "");
+            const needsMoon = m.id === "moon" || m.id === "solar";
+            if (needsMoon && !hasMoon) {
+                btn.disabled = true;
+                btn.title = "Requires Moon Phase plugin";
+                btn.style.opacity = "0.4";
+            }
+            btn.addEventListener("click", async () => {
+                if (needsMoon && !hasMoon) return;
+                s.mode = m.id;
+                await this.plugin.saveSettings();
+                this.plugin.updateCommandNames();
+                this.display();
+            });
+        }
+
+        // ═══ NOTES ═══
+        containerEl.createEl("h2", { text: "Notes" });
+
+        // Container
+        containerEl.createEl("h4", { text: "Container" });
+
+        new Setting(containerEl)
+            .setName("Template")
+            .setDesc(s.containerTemplate || "None selected")
+            .addButton(btn => {
+                btn.setButtonText(s.containerTemplate ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        s.containerTemplate = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.containerTemplate = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Save location")
+            .setDesc(s.containerFolder || "Vault root")
+            .addButton(btn => {
+                btn.setButtonText(s.containerFolder ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        s.containerFolder = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.containerFolder = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Naming convention")
+            .setDesc("Available tokens: {{year}}, {{month}}, {{month-name}}, {{date}}, {{cycle}}, {{phase}}, {{sign}}, {{term}}, etc.")
+            .addText(text => {
+                text.setPlaceholder(DEFAULT_NAMING[mode]?.container || "{{date}}")
+                    .setValue(s.containerNaming)
+                    .onChange(async v => { s.containerNaming = v; await this.plugin.saveSettings(); });
+                text.inputEl.style.width = "100%";
+            });
+
+        new Setting(containerEl)
+            .setName("Generate at")
+            .addDropdown(dd => {
+                dd.addOption("start", "Cycle start");
+                dd.addOption("end", "Cycle end");
+                dd.setValue(s.generateAt).onChange(async v => { s.generateAt = v; await this.plugin.saveSettings(); });
+            });
+
+        // Subdivision
+        containerEl.createEl("h4", { text: "Subdivision" });
+
+        new Setting(containerEl)
+            .setName("Template")
+            .setDesc(s.subdivisionTemplate || "None selected")
+            .addButton(btn => {
+                btn.setButtonText(s.subdivisionTemplate ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        s.subdivisionTemplate = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.subdivisionTemplate = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Save location")
+            .setDesc(s.subdivisionFolder || "Vault root")
+            .addButton(btn => {
+                btn.setButtonText(s.subdivisionFolder ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        s.subdivisionFolder = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.subdivisionFolder = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Naming convention")
+            .addText(text => {
+                text.setPlaceholder(DEFAULT_NAMING[mode]?.subdivision || "{{date}}")
+                    .setValue(s.subdivisionNaming)
+                    .onChange(async v => { s.subdivisionNaming = v; await this.plugin.saveSettings(); });
+                text.inputEl.style.width = "100%";
+            });
+
+        // Astrology (moon/solar only, requires Moon Phase)
+        if ((mode === "moon" || mode === "solar") && hasMoon) {
+            containerEl.createEl("h4", { text: "Astrology" });
+
+            new Setting(containerEl)
+                .setName("Include sign glyphs")
+                .setDesc("Resolve {{sign}} and {{sign-glyph}} tokens")
+                .addToggle(t => {
+                    t.setValue(s.includeSignGlyphs).onChange(async v => { s.includeSignGlyphs = v; await this.plugin.saveSettings(); });
+                });
+
+            new Setting(containerEl)
+                .setName("Include eclipse flags")
+                .setDesc("Resolve {{eclipse}} token when eclipse detected")
+                .addToggle(t => {
+                    t.setValue(s.includeEclipseFlags).onChange(async v => { s.includeEclipseFlags = v; await this.plugin.saveSettings(); });
+                });
+        }
+
+        // Solar subdivision type
+        if (mode === "solar") {
+            containerEl.createEl("h4", { text: "Solar Subdivision" });
+            new Setting(containerEl)
+                .setName("Subdivide by")
+                .addDropdown(dd => {
+                    dd.addOption("terms", "Solar terms");
+                    dd.addOption("phases", "Lunar phases");
+                    dd.setValue(s.solarSubdivision).onChange(async v => {
+                        s.solarSubdivision = v;
+                        await this.plugin.saveSettings();
+                        this.plugin.updateCommandNames();
+                        this.display();
+                    });
+                });
+        }
+
+        // Daily notes folder
+        containerEl.createEl("h4", { text: "Daily Notes" });
+        new Setting(containerEl)
+            .setName("Daily notes folder")
+            .setDesc("Where your daily notes are stored (for field collection)")
+            .addText(text => {
+                text.setPlaceholder("Vault root")
+                    .setValue(s.dailyNotesFolder)
+                    .onChange(async v => { s.dailyNotesFolder = v; await this.plugin.saveSettings(); });
+            });
+
+        // ═══ FIELD MAPPING ═══
+        containerEl.createEl("h2", { text: "Field Mapping" });
+
+        containerEl.createEl("h4", { text: "Daily \u2192 Subdivision" });
+        this.renderFieldMappings(containerEl, s.dailyToSubFields, "dailyToSubFields");
+
+        containerEl.createEl("h4", { text: "Subdivision \u2192 Container" });
+        this.renderFieldMappings(containerEl, s.subToContainerFields, "subToContainerFields");
+
+        // ═══ LLM ═══
+        containerEl.createEl("h2", { text: "LLM" });
+
+        new Setting(containerEl)
+            .setName("Enable LLM")
+            .setDesc("Generate AI summaries after reflection")
+            .addToggle(t => {
+                t.setValue(s.llmEnabled).onChange(async v => { s.llmEnabled = v; await this.plugin.saveSettings(); this.display(); });
+            });
+
+        if (s.llmEnabled) {
+            new Setting(containerEl)
+                .setName("Provider")
+                .addDropdown(dd => {
+                    Object.entries(PROVIDERS).forEach(([k, v]) => dd.addOption(k, v.name));
+                    dd.setValue(s.provider).onChange(async v => { s.provider = v; await this.plugin.saveSettings(); });
+                });
+
+            new Setting(containerEl)
+                .setName("API Key")
+                .addText(text => {
+                    text.setPlaceholder("Enter API key").setValue(s.apiKey)
+                        .onChange(async v => { s.apiKey = v; await this.plugin.saveSettings(); });
+                    text.inputEl.type = "password";
+                });
+
+            const modelSetting = new Setting(containerEl).setName("Model");
+            const modelCtrl = modelSetting.controlEl;
+            let modelSelect = null;
+
+            const buildModelDropdown = (models) => {
+                if (modelSelect) modelSelect.remove();
+                const sel = document.createElement("select");
+                sel.className = "dropdown";
+                if (models.length === 0) {
+                    const o = document.createElement("option");
+                    o.value = s.model; o.textContent = s.model || "Click Fetch Models";
+                    sel.appendChild(o);
+                } else {
+                    if (s.model && !models.includes(s.model)) {
+                        const o = document.createElement("option");
+                        o.value = s.model; o.textContent = `${s.model} (current)`;
+                        sel.appendChild(o);
+                    }
+                    models.forEach(m => { const o = document.createElement("option"); o.value = m; o.textContent = m; sel.appendChild(o); });
+                }
+                sel.value = s.model;
+                sel.addEventListener("change", async () => { s.model = sel.value; await this.plugin.saveSettings(); });
+                modelSelect = sel;
+                modelCtrl.insertBefore(sel, modelCtrl.firstChild);
+            };
+            buildModelDropdown([]);
+
+            const fetchBtn = document.createElement("button");
+            fetchBtn.textContent = "Fetch Models"; fetchBtn.className = "mod-cta"; fetchBtn.style.marginLeft = "8px";
+            fetchBtn.addEventListener("click", async () => {
+                const prov = PROVIDERS[s.provider];
+                if (!s.apiKey) { new Notice("Enter an API key first."); return; }
+                fetchBtn.textContent = "Fetching..."; fetchBtn.disabled = true;
+                try {
+                    const m = await prov.listModels(s.apiKey);
+                    buildModelDropdown(m);
+                    new Notice(`Found ${m.length} models.`);
+                } catch (e) { new Notice("Failed: " + e.message); }
+                finally { fetchBtn.textContent = "Fetch Models"; fetchBtn.disabled = false; }
+            });
+            modelCtrl.appendChild(fetchBtn);
+        }
+
+        // ═══ REFLECTION ═══
+        containerEl.createEl("h2", { text: "Reflection" });
+
+        // Tab bar
+        const tabBar = containerEl.createDiv({ cls: "mr-tab-bar" });
+        const labels = this.plugin.getModeLabels();
+
+        const containerTab = tabBar.createEl("button", { text: labels.container, cls: "mr-tab" + (this.reflectionTab === "container" ? " mr-tab-active" : "") });
+        const subTab = tabBar.createEl("button", { text: labels.subdivision, cls: "mr-tab" + (this.reflectionTab === "subdivision" ? " mr-tab-active" : "") });
+
+        containerTab.addEventListener("click", () => { this.reflectionTab = "container"; this.display(); });
+        subTab.addEventListener("click", () => { this.reflectionTab = "subdivision"; this.display(); });
+
+        const tabContent = containerEl.createDiv({ cls: "mr-tab-content" });
+        const config = this.reflectionTab === "container" ? s.containerReflection : s.subdivisionReflection;
+
+        this.renderReflectionConfig(tabContent, config, this.reflectionTab);
+    }
+
+    renderFieldMappings(containerEl, mappings, settingsKey) {
+        const list = containerEl.createDiv();
+        mappings.forEach((mapping, i) => {
+            const row = new Setting(list).setName(`Field ${i + 1}`);
+            row.addText(text => {
+                text.setPlaceholder("Field name").setValue(mapping.source)
+                    .onChange(async v => { mapping.source = v; await this.plugin.saveSettings(); });
+            });
+            row.addDropdown(dd => {
+                dd.addOption("inline", "Inline");
+                dd.addOption("frontmatter", "Frontmatter");
+                dd.setValue(mapping.type || "inline").onChange(async v => { mapping.type = v; await this.plugin.saveSettings(); });
+            });
+            row.addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
+                    mappings.splice(i, 1);
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+        });
+
+        new Setting(containerEl).addButton(btn => {
+            btn.setButtonText("+ Add Field").setCta().onClick(async () => {
+                mappings.push({ source: "", type: "inline" });
+                await this.plugin.saveSettings();
+                this.display();
+            });
+        });
+    }
+
+    renderReflectionConfig(container, config, type) {
+        // Questions
+        container.createEl("h4", { text: "Questions" });
+        const qContainer = container.createDiv({ cls: "mr-questions-list" });
+        this.renderQuestions(qContainer, config, type);
+
+        new Setting(container).addButton(btn => {
+            btn.setButtonText("+ Add Question").setCta().onClick(async () => {
+                config.questions.push(makeQuestion(""));
+                await this.plugin.saveSettings();
+                this.renderQuestions(qContainer, config, type);
+            });
+        });
+
+        // Summary config
+        container.createEl("h4", { text: "Summary" });
+
+        new Setting(container)
+            .setName("System prompt prepend")
+            .setDesc("Behavioral directives sent as the system role")
+            .addTextArea(text => {
+                text.setPlaceholder("e.g. Summarize in 2 sentences...")
+                    .setValue(config.systemPromptPrepend)
+                    .onChange(async v => { config.systemPromptPrepend = v; await this.plugin.saveSettings(); });
+                text.inputEl.rows = 3; text.inputEl.style.width = "100%";
+            });
+
+        new Setting(container)
+            .setName("System prompt file")
+            .setDesc(config.systemPromptFile || "None selected")
+            .addButton(btn => {
+                btn.setButtonText(config.systemPromptFile ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        config.systemPromptFile = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    config.systemPromptFile = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(container)
+            .setName("Pass to LLM")
+            .addDropdown(dd => {
+                dd.addOption("answers-only", "Answers only");
+                dd.addOption("selected-fields", "+ Selected fields");
+                dd.addOption("whole-note", "+ Whole note");
+                dd.setValue(config.dataPassThrough).onChange(async v => {
+                    config.dataPassThrough = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        if (config.dataPassThrough === "selected-fields") {
+            new Setting(container)
+                .setName("Fields to include")
+                .setDesc("Comma-separated field names")
+                .addText(text => {
+                    text.setPlaceholder("field1, field2")
+                        .setValue((config.selectedFields || []).join(", "))
+                        .onChange(async v => {
+                            config.selectedFields = v.split(",").map(f => f.trim()).filter(f => f);
+                            await this.plugin.saveSettings();
+                        });
+                    text.inputEl.style.width = "100%";
+                });
+        }
+
+        new Setting(container)
+            .setName("Output field name")
+            .setDesc("Where the LLM summary is written")
+            .addText(text => {
+                text.setPlaceholder("e.g. summary").setValue(config.outputFieldName)
+                    .onChange(async v => { config.outputFieldName = v; await this.plugin.saveSettings(); });
+            });
+
+        new Setting(container)
+            .setName("Output field type")
+            .addDropdown(dd => {
+                dd.addOption("inline", "Inline field (field::)");
+                dd.addOption("frontmatter", "Frontmatter (field:)");
+                dd.setValue(config.outputFieldType).onChange(async v => {
+                    config.outputFieldType = v; await this.plugin.saveSettings();
+                });
+            });
+    }
+
+    renderQuestions(container, config, type) {
+        container.empty();
+        const questions = config.questions;
+
+        questions.forEach((q, i) => {
+            const setting = new Setting(container).setName(`Q${i + 1}`);
+
+            // ← inject variable
+            setting.addExtraButton(btn => {
+                btn.setIcon("arrow-left").setTooltip("Load variable into this question").onClick(() => {
+                    const key = `${type}-${i}-in`;
+                    this.expandedInput[key] = !this.expandedInput[key];
+                    this.renderQuestions(container, config, type);
+                });
+            });
+
+            // Question text
+            setting.addText(text => {
+                text.setPlaceholder("Enter a question...").setValue(q.text)
+                    .onChange(async v => { q.text = v; await this.plugin.saveSettings(); });
+                text.inputEl.style.width = "100%";
+            });
+
+            // → output to field
+            setting.addExtraButton(btn => {
+                btn.setIcon("arrow-right").setTooltip("Output this answer to its own field").onClick(() => {
+                    const key = `${type}-${i}-out`;
+                    this.expandedOutput[key] = !this.expandedOutput[key];
+                    this.renderQuestions(container, config, type);
+                });
+            });
+
+            // Move up
+            if (i > 0) {
+                setting.addExtraButton(btn => {
+                    btn.setIcon("up-chevron-glyph").setTooltip("Move up").onClick(async () => {
+                        [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]];
+                        await this.plugin.saveSettings();
+                        this.renderQuestions(container, config, type);
+                    });
+                });
+            }
+
+            // Move down
+            if (i < questions.length - 1) {
+                setting.addExtraButton(btn => {
+                    btn.setIcon("down-chevron-glyph").setTooltip("Move down").onClick(async () => {
+                        [questions[i], questions[i + 1]] = [questions[i + 1], questions[i]];
+                        await this.plugin.saveSettings();
+                        this.renderQuestions(container, config, type);
+                    });
+                });
+            }
+
+            // Remove
+            if (questions.length > 1) {
+                setting.addExtraButton(btn => {
+                    btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
+                        questions.splice(i, 1);
+                        await this.plugin.saveSettings();
+                        this.renderQuestions(container, config, type);
+                    });
+                });
+            }
+
+            // ← Expanded: inject variable config
+            const inKey = `${type}-${i}-in`;
+            if (this.expandedInput[inKey]) {
+                const group = container.createDiv();
+                group.style.cssText = "padding-left:24px;border-left:2px solid var(--interactive-accent);margin-bottom:12px;";
+
+                new Setting(group)
+                    .setName("Inject variable")
+                    .setDesc("Show a value from another note above this question")
+                    .addToggle(t => {
+                        t.setValue(q.injectVar).onChange(async v => {
+                            q.injectVar = v; await this.plugin.saveSettings();
+                            this.renderQuestions(container, config, type);
+                        });
+                    });
+
+                if (q.injectVar) {
+                    new Setting(group)
+                        .setName("Field name")
+                        .setDesc("The inline field to read")
+                        .addText(t => {
+                            t.setPlaceholder("e.g. summary").setValue(q.varField)
+                                .onChange(async v => { q.varField = v; await this.plugin.saveSettings(); });
+                        });
+
+                    new Setting(group)
+                        .setName("Source")
+                        .addDropdown(dd => {
+                            dd.addOption("previous", `Previous ${type} note`);
+                            dd.addOption("note", "Specific note");
+                            dd.setValue(q.varSource).onChange(async v => {
+                                q.varSource = v; await this.plugin.saveSettings();
+                                this.renderQuestions(container, config, type);
+                            });
+                        });
+
+                    if (q.varSource === "note") {
+                        new Setting(group)
+                            .setName("Note")
+                            .setDesc(q.varNotePath || "No note selected")
+                            .addButton(btn => {
+                                btn.setButtonText("Choose Note").onClick(() => {
+                                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                                        q.varNotePath = file.path; await this.plugin.saveSettings();
+                                        this.renderQuestions(container, config, type);
+                                    }).open();
+                                });
+                            });
+                    }
+                }
+            }
+
+            // → Expanded: output to field config
+            const outKey = `${type}-${i}-out`;
+            if (this.expandedOutput[outKey]) {
+                const group = container.createDiv();
+                group.style.cssText = "padding-left:24px;border-left:2px solid var(--interactive-accent);margin-bottom:12px;";
+
+                new Setting(group)
+                    .setName("Output to own field")
+                    .setDesc("Write this answer to a separate field")
+                    .addToggle(t => {
+                        t.setValue(q.outputToField).onChange(async v => {
+                            q.outputToField = v; await this.plugin.saveSettings();
+                            this.renderQuestions(container, config, type);
+                        });
+                    });
+
+                if (q.outputToField) {
+                    new Setting(group)
+                        .setName("Field name")
+                        .addText(t => {
+                            t.setPlaceholder("e.g. commitment").setValue(q.outputFieldName)
+                                .onChange(async v => { q.outputFieldName = v; await this.plugin.saveSettings(); });
+                        });
+
+                    new Setting(group)
+                        .setName("Field type")
+                        .addDropdown(dd => {
+                            dd.addOption("inline", "Inline field (field::)");
+                            dd.addOption("frontmatter", "Frontmatter (field:)");
+                            dd.setValue(q.outputFieldType).onChange(async v => {
+                                q.outputFieldType = v; await this.plugin.saveSettings();
+                            });
+                        });
+                }
+            }
+        });
+    }
+}
+
+module.exports = MonthlyRitualPlugin;

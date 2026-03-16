@@ -1,0 +1,62 @@
+/* Monthly Ritual — minimal styling */
+
+.mr-mode-btn {
+    font-size: 1.4em;
+    padding: 4px 12px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    background: var(--background-secondary);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.mr-mode-btn:hover:not(:disabled) {
+    background: var(--background-modifier-hover);
+}
+
+.mr-mode-btn.mr-mode-active {
+    background: var(--interactive-accent);
+    border-color: var(--interactive-accent);
+}
+
+.mr-mode-btn:disabled {
+    cursor: not-allowed;
+}
+
+/* Reflection tabs */
+.mr-tab-bar {
+    display: flex;
+    gap: 0;
+    margin-bottom: 16px;
+    border-bottom: 2px solid var(--background-modifier-border);
+}
+
+.mr-tab {
+    padding: 8px 20px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    background: none;
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--text-muted);
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.mr-tab:hover {
+    color: var(--text-normal);
+}
+
+.mr-tab.mr-tab-active {
+    color: var(--text-normal);
+    border-bottom-color: var(--interactive-accent);
+}
+
+.mr-tab-content {
+    padding-top: 8px;
+}
+
+.mr-questions-list .setting-item {
+    border-bottom: none;
+    padding: 4px 0;
+}
