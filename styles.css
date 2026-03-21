@@ -60,3 +60,198 @@
     border-bottom: none;
     padding: 4px 0;
 }
+
+/* ═══════════════════════════════════════
+   CALENDAR VIEW
+   ═══════════════════════════════════════ */
+
+.mr-calendar {
+    padding: 12px;
+    font-family: var(--font-interface);
+    user-select: none;
+}
+
+/* ─── Header ─── */
+.mr-cal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding: 0 4px;
+}
+
+.mr-cal-title {
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.mr-cal-title-link {
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 2px 4px;
+    transition: background 0.15s;
+}
+
+.mr-cal-title-link:hover {
+    background: var(--background-modifier-hover);
+}
+
+.mr-cal-term {
+    color: var(--text-normal);
+}
+
+.mr-cal-year {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.mr-cal-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.mr-cal-nav-btn {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    padding: 2px 4px;
+    border-radius: 4px;
+    transition: color 0.15s;
+}
+
+.mr-cal-nav-btn:hover {
+    color: var(--text-normal);
+}
+
+.mr-cal-nav-today {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 0.7em;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: color 0.15s;
+}
+
+.mr-cal-nav-today:hover {
+    color: var(--text-normal);
+}
+
+/* ─── Phase rows container ─── */
+.mr-cal-phases {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border-top: 1px solid var(--background-modifier-border);
+}
+
+/* ─── Phase row ─── */
+.mr-cal-phase-row {
+    display: flex;
+    border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* ─── Moon phase column ─── */
+.mr-cal-moon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    width: 36px;
+    min-width: 36px;
+    flex-shrink: 0;
+    font-size: 0.75em;
+    border-right: 1px solid var(--background-modifier-border);
+}
+
+.mr-cal-moon-link {
+    opacity: 0.7;
+}
+
+.mr-cal-moon-link {
+    cursor: pointer;
+    padding: 2px;
+    transition: opacity 0.15s;
+}
+
+.mr-cal-moon-link:hover {
+    opacity: 1;
+}
+
+.mr-cal-tooltip {
+    position: absolute;
+    left: 40px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 1.4em;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 10;
+}
+
+.mr-cal-tooltip-visible {
+    opacity: 1 !important;
+}
+
+
+/* ─── Days row ─── */
+.mr-cal-days {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: stretch;
+}
+
+/* ─── Day-of-week label (inside each cell) ─── */
+.mr-cal-dow {
+    font-size: 0.5em;
+    font-weight: 400;
+    color: var(--text-faint);
+    opacity: 0.5;
+    margin-bottom: 1px;
+}
+
+/* ─── Day cells ─── */
+.mr-cal-day {
+    width: 36px;
+    min-width: 36px;
+    text-align: center;
+    padding: 6px 0;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+
+.mr-cal-day:hover {
+    background: var(--background-modifier-hover);
+}
+
+.mr-cal-day-num {
+    font-size: 0.85em;
+    color: var(--text-normal);
+}
+
+.mr-cal-dim .mr-cal-day-num {
+    color: var(--text-faint);
+}
+
+.mr-cal-dim .mr-cal-dow {
+    opacity: 0.4;
+}
+
+.mr-cal-today {
+    border: 1px solid var(--text-muted);
+    border-radius: 4px;
+}
+
+.mr-cal-minor-term {
+    color: #66ab9e;
+}

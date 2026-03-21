@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView } = require("obsidian");
 
 // ═══════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -210,6 +210,16 @@ const DEFAULT_SETTINGS = {
 
     dailyNotesFolder: "",
 
+    calendarTimezone: "America/New_York",
+    calendarNoteFolder: "",
+    calendarNoteNaming: "\u2600\uFE0F Sun in {{sign}}",
+    lunarNoteNaming: {
+        "New Moon": "\uD83C\uDF11 {{phase-name}} Moon in {{moon-sign}}",
+        "First Quarter": "\uD83C\uDF13 {{phase-name}} Moon in {{moon-sign}}",
+        "Full Moon": "\uD83C\uDF15 {{phase-name}} Moon in {{moon-sign}}",
+        "Last Quarter": "\uD83C\uDF17 {{phase-name}} Moon in {{moon-sign}}",
+    },
+
     dailyToSubFields: [],
     subToContainerFields: [],
 
@@ -366,6 +376,20 @@ class MonthlyRitualPlugin extends Plugin {
         await this.loadSettings();
         this.addSettingTab(new MonthlyRitualSettingTab(this.app, this));
         this.registerCommands();
+
+        this.registerView(CALENDAR_VIEW_TYPE, (leaf) => new RitualCalendarView(leaf, this));
+        this.addRibbonIcon("calendar-days", "Ritual Calendar", () => this.activateCalendarView());
+    }
+
+    async activateCalendarView() {
+        const existing = this.app.workspace.getLeavesOfType(CALENDAR_VIEW_TYPE);
+        if (existing.length) {
+            this.app.workspace.revealLeaf(existing[0]);
+            return;
+        }
+        const leaf = this.app.workspace.getRightLeaf(false);
+        await leaf.setViewState({ type: CALENDAR_VIEW_TYPE, active: true });
+        this.app.workspace.revealLeaf(leaf);
     }
 
     async loadSettings() {
@@ -1277,6 +1301,12 @@ class MonthlyRitualPlugin extends Plugin {
             callback: () => this.collectFields(),
         });
 
+        this.addCommand({
+            id: "open-calendar",
+            name: "Open Ritual Calendar",
+            callback: () => this.activateCalendarView(),
+        });
+
         this.cmdTestContainer = this.addCommand({
             id: "test-container-reflection",
             name: `Test ${labels.container} Reflection`,
@@ -1307,6 +1337,375 @@ class MonthlyRitualPlugin extends Plugin {
             const cmd = cmds[prefix + id];
             if (cmd) cmd.name = name;
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CALENDAR VIEW
+// ═══════════════════════════════════════════════════════════════
+
+const CALENDAR_VIEW_TYPE = "monthly-ritual-calendar";
+
+const MOON_PHASE_EMOJI = { "New Moon": "\u{1F311}", "First Quarter": "\u{1F313}", "Full Moon": "\u{1F315}", "Last Quarter": "\u{1F317}" };
+
+// Approximate zodiac date ranges for solar term lookup without Helios
+const ZODIAC_DATES = [
+    { sign: "Aries",       start: [3, 20] },
+    { sign: "Taurus",      start: [4, 19] },
+    { sign: "Gemini",      start: [5, 20] },
+    { sign: "Cancer",      start: [6, 21] },
+    { sign: "Leo",         start: [7, 22] },
+    { sign: "Virgo",       start: [8, 22] },
+    { sign: "Libra",       start: [9, 22] },
+    { sign: "Scorpio",     start: [10, 23] },
+    { sign: "Sagittarius", start: [11, 21] },
+    { sign: "Capricorn",   start: [12, 21] },
+    { sign: "Aquarius",    start: [1, 19] },
+    { sign: "Pisces",      start: [2, 18] },
+];
+
+function getWordCount(text) {
+    const pattern = /(?:[0-9]+(?:(?:,|\.)[0-9]+)*|[\-A-Za-z\u00C0-\u024F\u0400-\u04FF])+|[\u3041-\u9FFF\uF900-\uFAFF]/g;
+    return (text.match(pattern) || []).length;
+}
+
+// Build zodiac sign boundaries for a given year (and neighbours)
+function getZodiacSignDates(year) {
+    const signs = [];
+    for (let y = year - 1; y <= year + 1; y++) {
+        for (const z of ZODIAC_DATES) {
+            const [zm, zd] = z.start;
+            signs.push({ date: new Date(y, zm - 1, zd), sign: z.sign });
+        }
+    }
+    signs.sort((a, b) => a.date - b.date);
+    return signs;
+}
+
+// Get the zodiac sign period (start, end, sign, terms) that covers a given date
+function getZodiacSignPeriod(d) {
+    const signs = getZodiacSignDates(d.getFullYear());
+    for (let i = 0; i < signs.length - 1; i++) {
+        if (d >= signs[i].date && d < signs[i + 1].date) {
+            const sign = signs[i].sign;
+            const term = SOLAR_TERMS[sign];
+            return {
+                sign,
+                glyph: SIGN_GLYPHS[sign] || "",
+                major: term ? term.major : null,
+                minor: term ? term.minor : null,
+                start: startOfDay(signs[i].date),
+                end: startOfDay(addDays(signs[i + 1].date, -1)),
+            };
+        }
+    }
+    return null;
+}
+
+// Navigate to the next or previous zodiac sign from a reference date
+function navigateZodiacSign(d, delta) {
+    const signs = getZodiacSignDates(d.getFullYear());
+    let idx = -1;
+    for (let i = 0; i < signs.length - 1; i++) {
+        if (d >= signs[i].date && d < signs[i + 1].date) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx === -1) return d;
+    const target = idx + delta;
+    if (target >= 0 && target < signs.length) {
+        return signs[target].date;
+    }
+    return d;
+}
+
+// Reference new moon for synodic calculation: Jan 6, 2000 18:14 UTC
+const REF_NEW_MOON = new Date(Date.UTC(2000, 0, 6, 18, 14, 0));
+
+function getMoonAgeForDate(d) {
+    const diff = (d.getTime() - REF_NEW_MOON.getTime()) / 86400000;
+    const age = diff % SYNODIC_PERIOD;
+    return age < 0 ? age + SYNODIC_PERIOD : age;
+}
+
+function getMoonPhaseFromAge(age) {
+    const q = SYNODIC_PERIOD / 4;
+    if (age < q) return "New Moon";
+    if (age < 2 * q) return "First Quarter";
+    if (age < 3 * q) return "Full Moon";
+    return "Last Quarter";
+}
+
+// Build a sign lookup from Helios moon ingresses: returns function(date) → sign name
+async function buildMoonSignLookup(plugin, rangeStart, rangeEnd) {
+    const url = plugin.getHeliosUrl();
+    if (!url) return () => null;
+    try {
+        const start = formatDate(addDays(rangeStart, -3));
+        const end = formatDate(addDays(rangeEnd, 3));
+        const data = await plugin.fetchJson(`${url}/planetary-ingresses?planet=Moon&start=${start}&end=${end}`);
+        const ingresses = (Array.isArray(data) ? data : data.ingresses || [])
+            .map(ing => ({ date: new Date(ing.date || ing.exactDate || ing.timestamp), sign: ing.sign || ing.toSign || "" }))
+            .sort((a, b) => a.date - b.date);
+
+        return function(d) {
+            let sign = ingresses.length > 0 ? ingresses[0].sign : null;
+            for (const ing of ingresses) {
+                if (ing.date <= d) sign = ing.sign;
+                else break;
+            }
+            return sign;
+        };
+    } catch (_) {
+        return () => null;
+    }
+}
+
+// Get exact phase periods from Helios /moon-phases endpoint
+async function getPhasePeriodsFromHelios(plugin, rangeStart, rangeEnd) {
+    const url = plugin.getHeliosUrl();
+    if (!url) return [];
+
+    // Extend range to catch phases that start before/after
+    const start = formatDate(addDays(rangeStart, -10));
+    const end = formatDate(addDays(rangeEnd, 10));
+
+    try {
+        const data = await plugin.fetchJson(`${url}/moon-phases?start=${start}&end=${end}`);
+        const phaseList = data.phases || [];
+
+        if (phaseList.length === 0) return [];
+
+        // Build phase starts with their sign data
+        const starts = phaseList.map(p => ({
+            phase: p.phase,
+            start: startOfDay(new Date(p.date)),
+            moonSign: p.moonSign,
+        }));
+        starts.sort((a, b) => a.start - b.start);
+
+        // Each phase ends the day before the next phase starts
+        const periods = [];
+        for (let i = 0; i < starts.length - 1; i++) {
+            periods.push({
+                phase: starts[i].phase,
+                start: starts[i].start,
+                end: addDays(starts[i + 1].start, -1),
+                moonSign: starts[i].moonSign,
+            });
+        }
+
+        return periods;
+    } catch (e) {
+        console.error("Monthly Ritual: /moon-phases failed:", e.message);
+        new Notice("Could not fetch moon phases from Helios. Is /moon-phases endpoint available?");
+        return [];
+    }
+}
+
+class RitualCalendarView extends ItemView {
+    constructor(leaf, plugin) {
+        super(leaf);
+        this.plugin = plugin;
+        this.displayDate = new Date();
+    }
+
+    getViewType() { return CALENDAR_VIEW_TYPE; }
+    getDisplayText() { return "Ritual Calendar"; }
+    getIcon() { return "calendar-days"; }
+
+    async onOpen() {
+        this.containerEl.children[1].empty();
+        this.rootEl = this.containerEl.children[1].createDiv({ cls: "mr-calendar" });
+        await this.render();
+    }
+
+    onClose() { return Promise.resolve(); }
+
+    async render() {
+        const el = this.rootEl;
+        el.empty();
+
+        // ─── Require Moon Phase plugin ───
+        if (!this.plugin.hasMoonPlugin()) {
+            el.createEl("p", { text: "Requires Moon Phase plugin.", cls: "mr-cal-empty" });
+            return;
+        }
+
+        const today = new Date();
+
+        // ─── Zodiac sign as container ───
+        const signPeriod = getZodiacSignPeriod(this.displayDate);
+        if (!signPeriod) {
+            el.createEl("p", { text: "Could not determine zodiac sign." });
+            return;
+        }
+
+        // ─── Header ───
+        const header = el.createDiv({ cls: "mr-cal-header" });
+        const titleEl = header.createDiv({ cls: "mr-cal-title mr-cal-title-link" });
+        titleEl.createEl("span", { text: `${signPeriod.glyph} ${signPeriod.sign}`, cls: "mr-cal-term" });
+        titleEl.createEl("span", { text: ` ${signPeriod.start.getFullYear()}`, cls: "mr-cal-year" });
+        titleEl.addEventListener("click", () => this.openSignNote(signPeriod));
+
+        const nav = header.createDiv({ cls: "mr-cal-nav" });
+        const prevBtn = nav.createEl("span", { text: "\u276E", cls: "mr-cal-nav-btn" });
+        prevBtn.addEventListener("click", () => this.navigateSign(-1));
+        const todayBtn = nav.createEl("span", { text: "TODAY", cls: "mr-cal-nav-today" });
+        todayBtn.addEventListener("click", () => this.goToday());
+        const nextBtn = nav.createEl("span", { text: "\u276F", cls: "mr-cal-nav-btn" });
+        nextBtn.addEventListener("click", () => this.navigateSign(1));
+
+        // ─── Minor solar term (Sun at 15° of sign) ───
+        // Sun traverses ~30° per sign. The sign's total days / 30 gives days per degree.
+        // 15° falls at roughly (15/30) of the way through the sign period.
+        const signDays = Math.round((signPeriod.end - signPeriod.start) / 86400000) + 1;
+        const minorTermDate = formatDate(addDays(signPeriod.start, Math.round(signDays * 15 / 30)));
+
+        // ─── Phase periods from Helios (exact ephemeris) ───
+        const allPhases = await getPhasePeriodsFromHelios(this.plugin, signPeriod.start, signPeriod.end);
+
+        // Filter phases that overlap with zodiac sign — keep full phase days
+        const phases = allPhases.filter(p => p.end >= signPeriod.start && p.start <= signPeriod.end);
+
+        // ─── Render phase rows ───
+        const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const container = el.createDiv({ cls: "mr-cal-phases" });
+
+        for (const period of phases) {
+            const sign = period.moonSign || "";
+            const signGlyph = sign ? (SIGN_GLYPHS[sign] || "") : "";
+            const phaseEmoji = MOON_PHASE_EMOJI[period.phase] || "";
+
+            // Collect ALL days in this phase (not clamped)
+            const days = [];
+            for (let d = new Date(period.start); d <= period.end; d = addDays(d, 1)) {
+                days.push(new Date(d));
+            }
+
+            const row = container.createDiv({ cls: "mr-cal-phase-row" });
+
+            // Moon emoji cell
+            const moonCell = row.createDiv({ cls: "mr-cal-moon" });
+            const moonSpan = moonCell.createEl("span", {
+                text: phaseEmoji,
+                cls: "mr-cal-moon-link",
+            });
+            const tooltip = moonCell.createDiv({ cls: "mr-cal-tooltip", text: `${signGlyph} ${phaseEmoji}` });
+            moonSpan.addEventListener("mouseenter", () => { tooltip.classList.add("mr-cal-tooltip-visible"); });
+            moonSpan.addEventListener("mouseleave", () => { tooltip.classList.remove("mr-cal-tooltip-visible"); });
+            moonSpan.addEventListener("click", () => this.openLunarNote(period.phase, sign));
+
+            // Day cells in a single row
+            const dayRow = row.createDiv({ cls: "mr-cal-days" });
+            for (const d of days) {
+                const isToday = d.getDate() === today.getDate() &&
+                    d.getMonth() === today.getMonth() &&
+                    d.getFullYear() === today.getFullYear();
+                const outsideSign = d < signPeriod.start || d > signPeriod.end;
+
+                const cellCls = ["mr-cal-day"];
+                if (isToday) cellCls.push("mr-cal-today");
+                if (outsideSign) cellCls.push("mr-cal-dim");
+
+                const cell = dayRow.createDiv({ cls: cellCls.join(" ") });
+                cell.createDiv({ text: DOW_SHORT[d.getDay()], cls: "mr-cal-dow" });
+                const dateStr = formatDate(d);
+                const dayNumEl = cell.createDiv({ text: String(d.getDate()), cls: "mr-cal-day-num" });
+                if (dateStr === minorTermDate) dayNumEl.classList.add("mr-cal-minor-term");
+                cell.addEventListener("click", () => this.openDailyNote(dateStr));
+            }
+        }
+    }
+
+    async buildDailyNoteMap(rangeStart, rangeEnd) {
+        const map = new Map();
+        const folder = this.plugin.settings.dailyNotesFolder || "";
+        const wordsPerDot = this.plugin.settings.wordsPerDot || 1000;
+        const files = this.plugin.app.vault.getMarkdownFiles().filter(f => {
+            if (folder && !f.path.startsWith(folder + "/") && f.parent?.path !== folder) return false;
+            const d = parseDateFromFilename(f.name);
+            if (!d) return false;
+            return d >= startOfDay(rangeStart) && d <= startOfDay(addDays(rangeEnd, 1));
+        });
+
+        for (const file of files) {
+            const d = parseDateFromFilename(file.name);
+            if (!d) continue;
+            const dateStr = formatDate(d);
+            try {
+                const content = await this.plugin.app.vault.cachedRead(file);
+                const wc = getWordCount(content);
+                const dots = wc > 0 ? Math.min(Math.floor(wc / wordsPerDot), 5) : 0;
+                map.set(dateStr, { file, dots });
+            } catch (_) {
+                map.set(dateStr, { file, dots: 0 });
+            }
+        }
+        return map;
+    }
+
+    async openDailyNote(dateStr) {
+        const folder = this.plugin.settings.dailyNotesFolder || "";
+        const files = this.plugin.app.vault.getMarkdownFiles().filter(f => {
+            if (folder && !f.path.startsWith(folder + "/") && f.parent?.path !== folder) return false;
+            const d = parseDateFromFilename(f.name);
+            return d && formatDate(d) === dateStr;
+        });
+        if (files.length > 0) {
+            await this.plugin.app.workspace.getLeaf(false).openFile(files[0]);
+        } else {
+            new Notice(`No daily note found for ${dateStr}`);
+        }
+    }
+
+    resolveCalendarNoteName(naming, tokens) {
+        return naming.replace(/\{\{([\w-]+)\}\}/g, (_, key) => tokens[key] !== undefined ? tokens[key] : "");
+    }
+
+    async openSignNote(signPeriod) {
+        const naming = this.plugin.settings.calendarNoteNaming || "\u2600\uFE0F Sun in {{sign}}";
+        const fileName = this.resolveCalendarNoteName(naming, { sign: signPeriod.sign, glyph: signPeriod.glyph, year: String(signPeriod.start.getFullYear()) });
+        const folder = this.plugin.settings.calendarNoteFolder || "";
+        const filePath = folder ? `${folder}/${fileName}.md` : `${fileName}.md`;
+
+        const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
+        if (file && file instanceof TFile) {
+            await this.plugin.app.workspace.getLeaf(false).openFile(file);
+        } else {
+            new Notice(`No note found: ${filePath}`);
+        }
+    }
+
+    async openLunarNote(phase, moonSign) {
+        const namingMap = this.plugin.settings.lunarNoteNaming || {};
+        const naming = namingMap[phase] || `${MOON_PHASE_EMOJI[phase] || ""} {{phase-name}} Moon in {{moon-sign}}`;
+        const fileName = this.resolveCalendarNoteName(naming, {
+            "phase-name": phase.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" "),
+            "phase-emoji": MOON_PHASE_EMOJI[phase] || "",
+            "moon-sign": moonSign || "",
+            "moon-glyph": moonSign ? (SIGN_GLYPHS[moonSign] || "") : "",
+        });
+        const folder = this.plugin.settings.calendarNoteFolder || "";
+        const filePath = folder ? `${folder}/${fileName}.md` : `${fileName}.md`;
+
+        const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
+        if (file && file instanceof TFile) {
+            await this.plugin.app.workspace.getLeaf(false).openFile(file);
+        } else {
+            new Notice(`No note found: ${filePath}`);
+        }
+    }
+
+    navigateSign(delta) {
+        this.displayDate = navigateZodiacSign(this.displayDate, delta);
+        this.render();
+    }
+
+    goToday() {
+        this.displayDate = new Date();
+        this.render();
     }
 }
 
@@ -1524,6 +1923,78 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     .setValue(s.dailyNotesFolder)
                     .onChange(async v => { s.dailyNotesFolder = v; await this.plugin.saveSettings(); });
             });
+
+        // ═══ CALENDAR VIEW ═══
+        containerEl.createEl("h2", { text: "Calendar View" });
+
+        new Setting(containerEl)
+            .setName("Timezone")
+            .setDesc("Timezone for lunar phase calculations")
+            .addText(text => {
+                text.setPlaceholder("America/New_York")
+                    .setValue(s.calendarTimezone)
+                    .onChange(async v => { s.calendarTimezone = v; await this.plugin.saveSettings(); });
+            });
+
+        new Setting(containerEl)
+            .setName("Note folder")
+            .setDesc(s.calendarNoteFolder || "Vault root")
+            .addButton(btn => {
+                btn.setButtonText(s.calendarNoteFolder ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        s.calendarNoteFolder = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.calendarNoteFolder = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        containerEl.createEl("h4", { text: "Solar Note" });
+
+        new Setting(containerEl)
+            .setName("Naming convention")
+            .setDesc("Tokens: {{sign}}, {{glyph}}, {{year}}")
+            .addText(text => {
+                text.setPlaceholder("\u2600\uFE0F Sun in {{sign}}")
+                    .setValue(s.calendarNoteNaming)
+                    .onChange(async v => { s.calendarNoteNaming = v; await this.plugin.saveSettings(); });
+                text.inputEl.style.width = "100%";
+            });
+
+        containerEl.createEl("h4", { text: "Lunar Notes" });
+        containerEl.createEl("p", {
+            text: "Tokens: {{phase-name}}, {{phase-emoji}}, {{moon-sign}}, {{moon-glyph}}",
+            cls: "setting-item-description",
+        }).style.cssText = "margin: -8px 0 8px; font-size: 0.8em;";
+
+        const lunarNaming = s.lunarNoteNaming || {};
+        const phaseLabels = [
+            { key: "New Moon", icon: "\uD83C\uDF11" },
+            { key: "First Quarter", icon: "\uD83C\uDF13" },
+            { key: "Full Moon", icon: "\uD83C\uDF15" },
+            { key: "Last Quarter", icon: "\uD83C\uDF17" },
+        ];
+        for (const pl of phaseLabels) {
+            new Setting(containerEl)
+                .setName(`${pl.icon} ${pl.key}`)
+                .addText(text => {
+                    text.setPlaceholder(`${pl.icon} {{phase-name}} Moon in {{moon-sign}}`)
+                        .setValue(lunarNaming[pl.key] || "")
+                        .onChange(async v => {
+                            if (!s.lunarNoteNaming) s.lunarNoteNaming = {};
+                            s.lunarNoteNaming[pl.key] = v;
+                            await this.plugin.saveSettings();
+                        });
+                    text.inputEl.style.width = "100%";
+                });
+        }
 
         // ═══ FIELD MAPPING ═══
         containerEl.createEl("h2", { text: "Field Mapping" });
