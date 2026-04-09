@@ -1,9 +1,9 @@
 {
     "id": "monthly-ritual",
-    "name": "Monthly Ritual",
-    "version": "1.0.0",
+    "name": "Periodic Ritual",
+    "version": "1.1.0",
     "minAppVersion": "1.0.0",
-    "description": "Cyclical review notes: monthly/lunar/solar containers with subdivision notes, field pipelines, reflection modals, and LLM summaries.",
+    "description": "Periodic review notes: independent container types (calendar, lunar, solar) with auto-LLM aggregation, optional reflection modals, and an alignment module. Companion to Daily Ritual.",
     "author": "poweredbypugs",
     "authorUrl": "https://github.com/poweredbypugs",
     "isDesktopOnly": false

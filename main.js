@@ -230,6 +230,14 @@ const DEFAULT_SETTINGS = {
 
     containerReflection: makeReflectionConfig(),
     subdivisionReflection: makeReflectionConfig(),
+
+    // ─── Periodic Ritual additions (Phase 0+) ───
+    // New first-class primitives. Empty defaults; no behavior wired up yet.
+    // The legacy keys above continue to work — these are purely additive.
+    prContainers: [],          // Container[] — see PROJECT.md "Container config"
+    prAlignments: [],          // Alignment[] — see PROJECT.md "Alignment module"
+    prLLMServices: [],         // LLMService[] — { name, provider, apiKey, model }
+    prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -1720,11 +1728,99 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         this.reflectionTab = "container";
         this.expandedInput = {};
         this.expandedOutput = {};
+        // Outer tab for Periodic Ritual rebuild. Legacy is the default until
+        // the new Containers/Alignments/LLM tabs have content.
+        this.outerTab = "legacy";
     }
 
+    // ─── New outer-tab dispatcher (Phase 0) ───
+    // Wraps the existing settings UI under a "Legacy" tab without modifying it.
+    // New tabs (Containers / Alignments / LLM / General) are stubs for now.
     display() {
         const { containerEl } = this;
         containerEl.empty();
+
+        const tabs = [
+            { id: "containers", label: "Containers" },
+            { id: "alignments", label: "Alignments" },
+            { id: "llm",        label: "LLM" },
+            { id: "legacy",     label: "Legacy Settings" },
+            { id: "general",    label: "General" },
+        ];
+
+        const bar = containerEl.createDiv({ cls: "mr-tab-bar mr-outer-tab-bar" });
+        for (const t of tabs) {
+            const btn = bar.createEl("button", {
+                text: t.label,
+                cls: "mr-tab" + (this.outerTab === t.id ? " mr-tab-active" : ""),
+            });
+            btn.addEventListener("click", () => {
+                this.outerTab = t.id;
+                this.display();
+            });
+        }
+
+        const body = containerEl.createDiv({ cls: "mr-tab-content" });
+        switch (this.outerTab) {
+            case "containers":  this.displayContainersStub(body); break;
+            case "alignments":  this.displayAlignmentsStub(body); break;
+            case "llm":         this.displayLLMStub(body); break;
+            case "general":     this.displayGeneral(body); break;
+            case "legacy":
+            default:            this.displayLegacySettings(body); break;
+        }
+    }
+
+    // ─── Stubs for the new tabs (Phase 0) ───
+
+    displayContainersStub(containerEl) {
+        containerEl.createEl("h2", { text: "Containers" });
+        const p = containerEl.createEl("p");
+        p.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        p.setText("Independent container types (calendar week, calendar month, sun ingress, lunar phase, chapter, book) will live here. Each container will have its own template, save directory, system prompt MD file, LLM service, and optional reflection questions. Wired up in Phase 1.");
+    }
+
+    displayAlignmentsStub(containerEl) {
+        containerEl.createEl("h2", { text: "Alignments" });
+        const p = containerEl.createEl("p");
+        p.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        p.setText("Measurable anchors attached to a container. Each alignment names a daily field, a description of what is being measured, and the container level it lives in. Wired up in Phase 7.");
+    }
+
+    displayLLMStub(containerEl) {
+        containerEl.createEl("h2", { text: "LLM Services" });
+        const p = containerEl.createEl("p");
+        p.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        p.setText("Define one or more LLM services (provider + API key + model). Containers reference services by name and can use different services from each other. Wired up in Phase 2.");
+        const note = containerEl.createEl("p");
+        note.style.cssText = "color: var(--text-faint); max-width: 60ch; font-size: 0.9em;";
+        note.setText("The legacy single-LLM config (provider, API key, model) still lives under Legacy Settings and continues to work for the existing reflection flows.");
+    }
+
+    displayGeneral(containerEl) {
+        const s = this.plugin.settings;
+        containerEl.createEl("h2", { text: "General" });
+
+        new Setting(containerEl)
+            .setName("Auto-generate on load")
+            .setDesc("When on, the plugin checks every enabled Periodic Ritual container at startup and generates any notes whose boundaries have been crossed since the last run. Boundary-driven only — no timers, no polling. When off, you generate manually via command.")
+            .addToggle(t => t
+                .setValue(!!s.prAutoGenerateOnLoad)
+                .onChange(async v => {
+                    s.prAutoGenerateOnLoad = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        const note = containerEl.createEl("p");
+        note.style.cssText = "color: var(--text-faint); max-width: 60ch; font-size: 0.9em; margin-top: 16px;";
+        note.setText("Daily notes folder and filename format are still configured under Legacy Settings until the new Containers tab is wired up.");
+    }
+
+    // ─── Legacy settings UI (existing functionality, untouched) ───
+    // The original display() body. Renders modes, container/subdivision config,
+    // astrology toggles, field pipelines, single-LLM config, calendar view config,
+    // and reflection tabs — all exactly as before.
+    displayLegacySettings(containerEl) {
         const s = this.plugin.settings;
         const mode = s.mode;
         const hasMoon = this.plugin.hasMoonPlugin();
