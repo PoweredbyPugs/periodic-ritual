@@ -1,472 +1,357 @@
-# Monthly Ritual — Project Document
+# Periodic Ritual — Project Document
+
+> **Rebrand in progress.** Plugin id stays `monthly-ritual` for now (zero migration friction). User-facing name in `manifest.json` becomes **Periodic Ritual**. Repo rename optional, deferred. This document supersedes the prior architecture which was built around mutually-exclusive modes and a hand-rolled field pipeline.
+
+---
 
 ## Overview
-Obsidian plugin for cyclical review notes. Generates container notes (monthly/lunar/solar cycles) and subdivision notes (weekly/phase/term) from templates, pulls inline fields and frontmatter from the layer below, runs reflection modals, and optionally summarizes via LLM. Companion to **Daily Ritual**.
 
-## Repo
-- GitHub: `PoweredbyPugs/monthly-ritual` (to be created)
-- Plugin location: `KAI/.obsidian/plugins/monthly-ritual/`
-- **Plain JS — no build step, no TypeScript** (matches Daily Ritual)
+Obsidian plugin for **periodic review notes**. Companion to Daily Ritual. Maintains an arbitrary number of independent, parallel **container types** (calendar week, calendar month, sun ingress, lunar phase, chapter, book, …) — each one optional, each one configured the same way: a template, a save directory, an LLM service, and a system-prompt markdown file that tells the LLM how to summarize the container's daily data into the container's frontmatter.
 
-## Architecture
+The plugin's job is narrow: **detect a container's boundary, create the container note from a template, gather the daily notes in range, hand them to an LLM with a system-prompt MD file, and write the LLM's output to the container's frontmatter.** Templater scripts in the user's vault render the body afterward via Dataview, untouched by the plugin.
 
-### Files
+A separate first-class module, **Alignment**, lets the user attach measurable anchors to a container — each alignment names a daily field, a description of what's being measured, and the container level it lives in. The plugin gathers the matching daily data and surfaces patterns against the description (via another LLM pass).
+
+## Design principles
+
+1. **The system-prompt MD file is the customization layer.** Settings stay tiny. Behavior changes by editing markdown, not code.
+2. **Containers are independent.** No mutually-exclusive modes. Enable any combination. Each has its own LLM service if desired.
+3. **The LLM does aggregation.** No hand-rolled field pipeline. The plugin shovels daily data and a prompt at an LLM and writes the result.
+4. **Anti-fragile.** Skip a week, nothing breaks. The LLM aggregates whatever data exists.
+5. **Goals are anchors, not prisons.** Alignments surface patterns. They do not produce shame, compliance scores, or red/green dashboards.
+6. **Templater stays.** It renders bodies via Dataview. The plugin owns frontmatter; templater owns presentation. Complementary.
+7. **Daily Ritual is upstream of everything.** Periodic Ritual reads what Daily Ritual already writes (inline fields and frontmatter). It does not modify daily notes.
+
+## Repo and build
+
+- GitHub: `poweredbypugs/monthly-ritual`
+- Plugin id: `monthly-ritual` (unchanged)
+- User-facing name: **Periodic Ritual** (in `manifest.json`)
+- Plugin install path: `KAI/.obsidian/plugins/monthly-ritual/`
+- Working clone: `~/Documents/Plugin Project/monthly-ritual/`
+- **Plain JS, no build step, no TypeScript.** `main.js` is the source of truth — same as Daily Ritual.
+
 ```
 monthly-ritual/
 ├── main.js          — all plugin code
-├── manifest.json    — plugin metadata (id: "monthly-ritual")
-├── styles.css       — minimal styling
+├── manifest.json    — name: "Periodic Ritual", id: "monthly-ritual"
+├── styles.css
 ├── data.json        — settings (gitignored)
 ├── PROJECT.md       — this file
 └── README.md        — user-facing docs
 ```
 
-### Dependencies
-- Obsidian API only (no npm packages)
-- **Moon Phase plugin** (optional) — required for 🌙 and ☀️ modes to resolve cycle/phase boundaries
-
 ---
 
-## Modes
+## Core primitive: the Container
 
-Three modes, one active at a time. Faint icon toggle in upper-right corner of the note view. Tooltip on hover.
+A **container** is the unit of periodic aggregation. The plugin does not distinguish between built-in and user-defined container types — they all use the same config object and the same generation flow. The only difference between, say, a Calendar Week and a Sun Ingress is which **boundary detector** computes its date range.
 
-| Icon | Mode | Container | Subdivision (default) | Subdivision (alt) |
-|------|------|-----------|----------------------|-------------------|
-| 📅 | Calendar | Calendar month | Weeks | — |
-| 🌙 | Moon | New moon → new moon (~29.5 days) | Four lunar phases | — |
-| ☀️ | Solar | Major term pair (~30 days) | Individual solar terms | Lunar phases |
+### Container config (one per enabled container type)
 
-- **📅 Calendar** is the default mode. No external plugin dependency.
-- **🌙 Moon** and **☀️ Solar** require Moon Phase plugin for boundary dates. If not installed, these icons are disabled with tooltip "Requires Moon Phase plugin."
-- ☀️ Solar mode has a sub-toggle: subdivide by solar terms (default) or lunar phases.
-
----
-
-## Note Lifecycle
-
-### Generation
-1. **Container note** auto-generates at cycle **start** or **end** (user setting, default: start)
-2. **Subdivision notes** auto-generate at their respective boundaries
-3. Both use user-defined templates (selected via fuzzy finder in settings)
-4. Both use user-defined naming conventions (template string with tokens)
-5. Both use user-defined save locations (folder picker)
-
-### Naming Tokens
-Available tokens for naming conventions (resolved at generation time):
-
-| Token | Example | Notes |
-|-------|---------|-------|
-| `{{year}}` | `2026` | |
-| `{{month}}` | `03` | Zero-padded |
-| `{{month-name}}` | `March` | Full name |
-| `{{day}}` | `14` | |
-| `{{date}}` | `2026-03-14` | ISO format |
-| `{{cycle}}` | `03` | Cycle number within year |
-| `{{phase}}` | `New Moon` | 🌙 mode only |
-| `{{phase-short}}` | `new` / `q1` / `full` / `q3` | 🌙 mode only |
-| `{{sign}}` | `Pisces` | 🌙/☀️ + astrology toggle |
-| `{{sign-glyph}}` | `♓` | 🌙/☀️ + astrology toggle |
-| `{{term}}` | `Rain Water` | ☀️ mode only |
-| `{{term-cn}}` | `雨水` | ☀️ mode only |
-| `{{eclipse}}` | `🝘` | 🌙 + astrology + eclipse detected |
-| `{{week}}` | `11` | 📅 mode, ISO week number |
-| `{{week-start}}` | `2026-03-09` | 📅 mode |
-| `{{week-end}}` | `2026-03-15` | 📅 mode |
-
-Default naming conventions:
-- 📅 Container: `{{month-name}} {{year}}` → `March 2026`
-- 📅 Subdivision: `Week {{week}} — {{week-start}}` → `Week 11 — 2026-03-09`
-- 🌙 Container: `{{phase}} {{date}}` → `New Moon 2026-03-14`
-- 🌙 Subdivision: `{{phase}} {{date}}` → `First Quarter 2026-03-22`
-- ☀️ Container: `{{term}} {{year}}` → `Rain Water 2026`
-- ☀️ Subdivision: `{{term}} {{date}}` → `Awakening of Insects 2026-03-05`
-
-### Astrology Toggle (🌙/☀️ only)
-- Requires Moon Phase plugin
-- When on: naming tokens `{{sign}}`, `{{sign-glyph}}`, `{{eclipse}}` resolve to values
-- When off: those tokens resolve to empty strings
-- Two sub-toggles in settings:
-  - Include sign glyphs (toggle)
-  - Include eclipse flags (toggle)
-
----
-
-## Field Pipeline
-
-**Entirely optional.** Users who query with Dataview/Bases don't need this — their templates and naming conventions are sufficient. The pipeline is a convenience for pulling data up through layers automatically.
-
-### Layer 1: Daily → Subdivision
-- User defines 0+ field mappings in settings
-- Each mapping: `{ source: string, type: "inline" | "frontmatter" }`
-- At subdivision boundary (or on command), plugin finds all daily notes in the date range
-- Daily note identification: uses the same date-from-filename parsing as Daily Ritual (`parseDateFromFilename()`)
-- Reads specified fields from each daily note
-- Writes collected values into the subdivision note (appended under a section or as multi-value field — follow template structure)
-
-### Layer 2: Subdivision → Container
-- Same mechanic, independently configured
-- Reads from subdivision notes in the cycle's date range
-- Writes into the container note
-
-### Collection Format
-When pulling fields, values are collected chronologically. Format in the target note:
-```
-work:: Faced the Work — TALA edit. | Avoidant — reorganized channels. | Faced the Work — rough cut done.
-```
-Each day's value separated by ` | `. If a day has no value for that field, it's skipped (no empty entries).
-
----
-
-## Reflection Modals
-
-Two independent reflection flows, same progressive disclosure pattern as Daily Ritual.
-
-### Architecture (per reflection)
-Each reflection has:
-- **Questions array** — ordered list of question objects (same structure as Daily Ritual)
-  ```js
-  {
-    text: "",                    // question text
-    injectVar: false,            // show a value from another note above this question
-    varField: "",                // inline field name to pull
-    varSource: "previous",       // "previous" (previous note in sequence) or "note"
-    varNotePath: "",             // specific note path
-    outputToField: false,        // write answer to its own field
-    outputFieldName: "",         // field name
-    outputFieldType: "inline",   // "inline" or "frontmatter"
-  }
-  ```
-- **System prompt prepend** — short text area (behavioral directives, inline in settings)
-- **System prompt file** — fuzzy finder to select a `.md` file in the vault
-- **Data pass-through** — what additional data to send to the LLM alongside answers:
-  - `answers-only` — just the Q&A
-  - `selected-fields` — Q&A + specified fields from the note
-  - `whole-note` — Q&A + full note content
-- **Output field** — user-defined name and type (inline or frontmatter)
-
-### "Previous note" for variable injection
-- Container reflection: "previous" = the prior container note (last month / last lunar cycle / last solar term pair)
-- Subdivision reflection: "previous" = the prior subdivision note (last week / last phase / last term)
-
-### Commands (modular naming)
-Command names adapt based on active mode + subdivision type:
-
-| Mode | Subdivision | Container Command | Subdivision Command |
-|------|-------------|-------------------|---------------------|
-| 📅 | Weeks | Monthly Reflection | Weekly Reflection |
-| 🌙 | Phases | Moon Cycle Reflection | Phase Reflection |
-| ☀️ | Terms | Solar Cycle Reflection | Term Reflection |
-| ☀️ | Lunar phases | Solar Cycle Reflection | Phase Reflection |
-
-Commands are re-registered when mode changes. Each command:
-1. Checks if active file matches the expected note type (container or subdivision) — warns if not
-2. Loads injected variables
-3. Opens ReflectionModal (progressive disclosure, one question at a time, Enter to advance)
-4. On submit: writes answers to fields, optionally runs LLM summary, writes summary to output field
-
----
-
-## LLM Integration
-
-Same provider architecture as Daily Ritual. Shared across both reflection types.
-
-### Providers
-- **Google Gemini** — `system_instruction` (snake_case), `generateContent` endpoint
-- **OpenAI** — `system` role in messages, chat completions endpoint
-- **Anthropic Claude** — `system` field in body, messages endpoint
-
-### Settings (shared)
-- Provider dropdown
-- API key (password field)
-- Model dropdown with "Fetch Models" button (auto-populated from provider API)
-
-### Per-Reflection Summary Config
-Each reflection (container + subdivision) independently configures:
-- Pass to LLM: `answers-only` | `+ selected fields` | `+ whole note`
-- Fields to include (multi-select, when "selected fields" chosen)
-- Output field name (user-defined, not hardcoded)
-- Output field type (inline or frontmatter)
-
-### Prompt Structure (matches Daily Ritual pattern)
-```
-System role: [system prompt prepend] (behavioral directives)
-
-User message:
-  ## Mental Model (apply this lens to the reflection below)
-  [contents of system prompt .md file]
-  ---
-  ## My Reflection
-  **Q1: [question text]**
-  [answer]
-
-  **Q2: [question text]**
-  [answer]
-  ---
-  ## Context Data  (only if pass-through includes fields/note)
-  [field values or note content]
-  ---
-  Now follow the system instructions above precisely. Produce only the final output, nothing else.
+```js
+{
+  id: "calendar-week",          // unique key
+  name: "Calendar Week",        // display name
+  enabled: true,
+  template: "Templates/2025-Weekly-Review.md",
+  saveDir: "Home/Water/02. Weekly",
+  naming: "W{{week}}-{{year}}", // token template
+  systemPromptFile: "Templates/prompts/weekly.md",
+  llmService: "gemini-1.5-pro", // can differ per container
+  boundaryDetector: "calendar-week",
+  reflectionMode: "auto",       // "auto" | "manual" | "both"
+  questions: [ /* same shape as Daily Ritual */ ],
+  alignments: [ /* see Alignment module below */ ]
+}
 ```
 
+### Reflection mode
+
+Each container chooses how its frontmatter gets filled:
+
+- **`auto`** — The plugin generates the note at the boundary, collects daily data, runs the LLM with the system prompt, writes the result to frontmatter. No user interaction required. Anti-fragile default.
+- **`manual`** — The plugin generates the note at the boundary with empty (or minimally populated) frontmatter. The user runs a "Reflect on [container]" command when they want to fill it in — this opens a Daily-Ritual-style progressive-disclosure modal of the container's configured questions, then runs the LLM with both the answers and the daily data, then writes to frontmatter.
+- **`both`** — Auto runs at the boundary as in `auto` mode. The user can *also* run the reflection command at any time afterward to re-summarize with manual context layered in. The second pass reads the existing frontmatter as additional context and overwrites it with the new synthesis.
+
+The reflection modal is the same primitive Daily Ritual already uses — questions array, progressive disclosure, Enter-to-advance. We lift the modal directly. Per-container question lists are configured under each container's tab.
+
+### Boundary detectors (built-in)
+
+| id | source | range |
+|----|--------|-------|
+| `calendar-week` | ISO week math | Mon → Sun |
+| `calendar-month` | calendar month | 1st → last day |
+| `sun-ingress` | Helios `/planetary-ingresses?planet=Sun` | one zodiacal sign (~30d) |
+| `lunar-phase` | Helios `/moon-phases` | one phase (~7d) |
+| `lunar-cycle` | Helios `/moon-phases` | new moon → new moon (~29.5d) |
+| `chapter` | calendar quarter | 90d |
+| `book` | calendar year | 365d |
+
+Sun ingress and lunar detectors require the Moon Phase plugin's Helios server (`baratie:3000` by default — read from `app.plugins.plugins["obsidian-moon"].settings.serverUrl`). If Helios is unavailable, those container types are disabled with a tooltip.
+
+### Note generation flow
+
+1. **Boundary check.** On plugin load and on a daily timer, walk every enabled container. Ask its boundary detector "has a new period started since the last note we generated?" If yes:
+2. **Resolve naming.** Run the container's `naming` template through the token engine using the new period's date range to produce a filename.
+3. **Materialize template.** Read the template file. Apply token substitution. Write the new note to `saveDir/<filename>.md`. (Templater scripts inside the template execute as normal — they're rendered by templater on first open, not by us.)
+4. **Collect daily data.** Find all daily notes whose date falls within the new container's range, using the same `parseDateFromFilename` logic Daily Ritual uses. Collect each daily note's frontmatter and inline fields.
+5. **Build the LLM payload.** Concatenate the system-prompt MD file (verbatim, as the system role) with the collected daily data (as the user message). Hand to the configured LLM service.
+6. **Write the result.** Parse the LLM's response as YAML and merge it into the new container note's frontmatter via `app.fileManager.processFrontMatter`. Verify the write before declaring success (same pattern Daily Ritual now uses).
+7. **Notice.** Show a single notification: "Generated [container name]: [filename]." Do not block, do not pop modals, do not require interaction.
+
+If any step fails, log to console and surface a notice with the actual error. Never silently no-op.
+
+### What the plugin does NOT do
+
+- Doesn't modify daily notes.
+- Doesn't write to the body of the container note. (Templater renders the body.)
+- Doesn't enforce a pillar schema. The 6 pillars exist in the user's prompts, not in plugin code.
+- Doesn't require manual reflection. Reflection modals are optional, demoted from v0 architecture.
+- Doesn't aggregate across container types. Each container is independent.
+
 ---
 
-## Settings Structure
+## System prompt MD files
 
-### Layout
-```
-═══════════════════════════════════════════
- MODE
-═══════════════════════════════════════════
-Cycle mode:  📅 │ 🌙 │ ☀️    (icon toggle, tooltip on hover)
-             Controls which settings sections appear below.
-             📅 = Calendar (months + weeks)
-             🌙 = Moon (lunar cycles + phases)
-             ☀️ = Solar (solar terms + terms or phases)
+The customization layer. One markdown file per container type, picked via fuzzy finder in settings. The file's contents are sent to the LLM as the system role on every aggregation pass for that container.
 
-═══════════════════════════════════════════
- NOTES
-═══════════════════════════════════════════
+This is where the user encodes:
+- Which daily fields to read (`work::`, `study::`, `health::`, etc.)
+- Which YAML keys to write into the container's frontmatter
+- The narrative voice / pattern-spotting framing
+- How to handle missing days
+- How to translate daily-level field names into container-level field names (e.g., daily `admin::` → container `wealth:` if that's the prompt's job)
+- Whether to look at the parent container's frontmatter for orienting context
 
-── Container ──
-Template:            [fuzzy finder → .md file]
-Save location:       [folder picker]
-Naming convention:   [text field]  (token reference link)
-Generate at:         [cycle start ▾ │ cycle end]
+Example skeleton (for a calendar week prompt):
 
-── Subdivision ──
-Template:            [fuzzy finder → .md file]
-Save location:       [folder picker]
-Naming convention:   [text field]  (token reference link)
+```markdown
+You are aggregating one week of Atlas's daily notes into a weekly review's frontmatter.
 
-── Astrology ──  (visible only in 🌙/☀️ + Moon Phase detected)
-Include sign glyphs:    [toggle]
-Include eclipse flags:  [toggle]
+Read each day's frontmatter and inline fields. Look for: study, creative, admin, work, links, today, health, challenge, lessons.
 
-── Solar Subdivision ──  (visible only in ☀️)
-Subdivide by:        [Solar terms ▾ │ Lunar phases]
+Output ONLY a YAML frontmatter block (no fences, no commentary). Keys to fill:
+- summary: one paragraph synthesizing the week's arc, written in second person.
+- lessons: bullet list of 3–5 learnings.
+- health, study, links, work, creative, wealth: pipe-separated chronological values from each day's same field. Skip empty days. Translate `admin::` daily values into the `wealth` field at this level.
+- highlights: bullet list of standout moments.
+- challenges: bullet list of frictions and what got in the way.
 
-═══════════════════════════════════════════
- FIELD MAPPING  (all optional)
-═══════════════════════════════════════════
-
-── Daily → Subdivision ──
-[+ Add field]
-┌──────────────────────────────────────────┐
-│ Source: [text]    Type: [inline ▾ │ fm]  │
-│ Source: [text]    Type: [inline ▾ │ fm]  │  (× to remove)
-└──────────────────────────────────────────┘
-
-── Subdivision → Container ──
-[+ Add field]
-┌──────────────────────────────────────────┐
-│ Source: [text]    Type: [inline ▾ │ fm]  │
-└──────────────────────────────────────────┘
-
-═══════════════════════════════════════════
- LLM
-═══════════════════════════════════════════
-
-Enable LLM:          [toggle]
-
-(when enabled:)
-Provider:             [Gemini ▾ │ OpenAI │ Anthropic]
-API Key:              [password field]
-Model:                [dropdown]  [Fetch Models]
-
-═══════════════════════════════════════════
- REFLECTION  ─── Tabs: [Container] [Subdivision]
-═══════════════════════════════════════════
-
-(Each tab contains independently:)
-
-── Questions ──
-[Q1]  [←] [question text___________] [→] [↑↓×]
-  (← expands: inject variable config)
-  (→ expands: output to field config)
-[Q2]  [←] [question text___________] [→] [↑↓×]
-[+ Add Question]
-
-── Summary ──
-System prompt prepend:  [text area, 3 rows]
-System prompt file:     [fuzzy finder]  [× clear]
-Pass to LLM:            [answers only ▾ │ + fields │ + whole note]
-Fields to include:      [multi-select]  (when "+ fields" selected)
-Output field name:      [text field]
-Output field type:      [inline ▾ │ frontmatter]
+Treat goals as anchors, not prisons. If the week missed the mark, surface the pattern without judgment.
 ```
 
----
-
-## Implementation Plan
-
-### Phase 1: Core — Note Generation
-1. Plugin scaffold (manifest, settings, onload/onunload)
-2. Mode setting (📅/🌙/☀️) with conditional settings rendering
-3. Calendar mode: month boundary detection, container + weekly subdivision note generation from templates
-4. Template loading + token resolution
-5. Naming convention engine
-6. Save location handling
-7. Commands: "Generate [Container]" and "Generate [Subdivision]" (manual triggers for v1)
-
-**Milestone: can create monthly + weekly notes from templates with correct names in correct folders.**
-
-### Phase 2: Moon & Solar Modes
-8. Moon Phase plugin integration — API for reading lunar boundaries (new/q1/full/q3 dates)
-9. Moon mode: lunar cycle boundary detection, container + phase subdivision generation
-10. Solar mode: solar term boundary detection, container + term subdivision generation
-11. Solar mode alt: lunar phase subdivisions within solar container
-12. Astrology toggle: sign glyph + eclipse token resolution (reads from Moon Phase plugin)
-
-**Milestone: all three modes generate correct notes at correct boundaries.**
-
-### Phase 3: Field Pipeline
-13. Daily note discovery (date-from-filename parsing, shared with Daily Ritual)
-14. Inline field + frontmatter reader
-15. Daily → Subdivision field collection (chronological, pipe-separated)
-16. Subdivision → Container field collection
-17. Field mapping settings UI (add/remove rows, source + type)
-18. "Collect Fields" command (manual trigger — runs pipeline for active note)
-
-**Milestone: can pull `today::` values from daily notes into weekly note, weekly summaries into monthly note.**
-
-### Phase 4: Reflection Modals
-19. ReflectionModal (reuse Daily Ritual pattern — progressive disclosure, Enter to advance)
-20. Question objects with inject/output config
-21. Container reflection flow (questions → field writes → optional LLM)
-22. Subdivision reflection flow (same, independent config)
-23. "Previous note" resolution per reflection type
-24. Modular command naming based on active mode
-25. Tab UI in settings for container vs subdivision reflection config
-
-**Milestone: can run weekly reflection modal, answers write to fields, LLM summary writes to output field.**
-
-### Phase 5: LLM Integration
-26. Provider architecture (Gemini/OpenAI/Anthropic — port from Daily Ritual)
-27. System prompt prepend + file loading
-28. Prompt builder (structured reflection + optional context data)
-29. Data pass-through options (answers only / + fields / + whole note)
-30. Summary output writing
-31. Loading animation during LLM calls
-32. Test/debug modal (like Daily Ritual's "Test Daily Ritual" command)
-
-**Milestone: full pipeline works — generate note, collect fields, run reflection, get LLM summary.**
-
-### Phase 6: Polish
-33. Mode toggle polish (icon styling, tooltip hover states in settings tab)
-34. Auto-generation scheduling (detect when a boundary has passed and offer to generate)
-35. Edge cases: missing daily notes, partial cycles, mode switching mid-cycle
-36. Companion script support (same pattern as Daily Ritual — folder + file + validation)
-37. Migration handling for settings changes
-38. README
+Changing the prompt changes the behavior. No code touch. This is the entire customization story for v1.
 
 ---
 
-## Code Patterns (from Daily Ritual)
+## Alignment module
 
-### Carry forward as-is:
-- `makeQuestion()` factory
-- `PROVIDERS` object with `buildUrl`, `buildBody`, `extractText`, `headers`, `listModels`
-- `ReflectionModal` (progressive disclosure)
+Separate primitive. An Alignment is a measurable anchor attached to a container.
+
+```js
+{
+  id: "morning-mobility",
+  containerType: "chapter",         // which container level it lives in
+  description: "30 min mobility/cardio daily, 80% sleep score average",
+  dataSource: "health",             // daily field to read
+  dataSourceType: "inline"          // "inline" or "frontmatter"
+}
+```
+
+### Behavior
+
+1. When a container is generated, the plugin finds all alignments attached to that container type.
+2. For each alignment, it pulls the named field from every daily note in the container's range.
+3. It sends the alignment description + the collected data to the container's LLM (separate pass from the main aggregation, or appended — TBD).
+4. The LLM produces a short narrative + pattern observation, written into a dedicated frontmatter field on the container note (e.g., `alignment_health: "..."`) or into a body section the templater script can render.
+
+Multiple alignments per container. Modular — the user defines pillars, boundaries, and data sources. The plugin does not know that "Health" is a pillar; it only knows there's an alignment named "morning-mobility" attached to chapters with `dataSource: "health"`.
+
+### "Arc" terminology
+
+Arc and Alignment are the same mechanic. The user's existing vocabulary calls it "arc" when it lives in a sun ingress note with a dataview visualization. Internally the plugin treats them as one type.
+
+---
+
+## Settings UI
+
+Single settings tab in Obsidian, organized as **outer tabs by area** and **inner tabs by container**.
+
+```
+═══════════════════════════════════════
+[ Containers ] [ Alignments ] [ LLM ] [ General ]
+═══════════════════════════════════════
+
+CONTAINERS TAB:
+┌─[ + Add container ]──────────────────┐
+│ [📅 Calendar Week] [📅 Calendar Month] [☀️ Sun Ingress] [🌙 Lunar Phase] [Chapter] [Book] [+ custom] │
+└──────────────────────────────────────┘
+
+  Selected: Calendar Week
+  ┌──────────────────────────────────┐
+  │ Enabled:           [toggle]      │
+  │ Template:          [fuzzy file]  │
+  │ Save directory:    [folder]      │
+  │ Naming convention: [text + tokens link] │
+  │ Boundary detector: [dropdown]    │
+  │ System prompt:     [fuzzy file]  │
+  │ LLM service:       [dropdown — see LLM tab] │
+  │ Reflection mode:   [auto ▾ │ manual │ both] │
+  │                                  │
+  │ ── Questions (visible if mode ≠ auto) ── │
+  │ [Q1] [← inject] [text] [output →] [↑↓×] │
+  │ [+ Add Question]                 │
+  │                                  │
+  │ [Test boundary] [Generate now] [Reflect now] │
+  └──────────────────────────────────┘
+
+ALIGNMENTS TAB:
+┌─[ + Add alignment ]──────────────────┐
+│ Name | Container | Data source | Description (truncated) | × │
+│ ...                                                          │
+└──────────────────────────────────────┘
+
+LLM TAB:
+  Define one or more LLM services. Each service is a {provider, api key, model} bundle.
+  [+ Add service]
+  ┌──────────────────────────────────┐
+  │ Name:     [text]                 │
+  │ Provider: [Gemini ▾ │ OpenAI │ Anthropic] │
+  │ API key:  [password]             │
+  │ Model:    [dropdown] [↻ fetch]   │
+  └──────────────────────────────────┘
+  Containers reference services by name.
+
+GENERAL TAB:
+  Daily notes folder:    [folder picker]
+  Daily filename format: [text — for parseDateFromFilename]
+  Auto-generate on load: [toggle]   (when off, generate manually via command)
+```
+
+The settings model means:
+- Adding a new container type = adding a tab.
+- Adding a custom container = picking a boundary detector + filling four fields.
+- Switching LLMs per container = choosing a service from the dropdown.
+
+---
+
+## What's reused from existing `main.js`
+
+- LLM provider abstraction (Gemini / OpenAI / Anthropic + model fetching)
+- Helios bridge (read `serverUrl` from Moon Phase plugin)
+- Calendar View (`ItemView` + sidebar grid) — keep, possibly extend to show all enabled containers
+- Token engine for naming conventions (`{{year}}`, `{{month-name}}`, `{{phase}}`, `{{sign}}`, etc.)
+- `parseDateFromFilename` / `formatDateForFilename`
 - `MarkdownFileSuggestModal` (fuzzy finder)
-- `LoadingModal` + `DebugModal`
-- `parseDateFromFilename()` + `formatDateForFilename()`
-- `readInlineField()` (regex-based inline field reader)
-- `escapeRegex()`
-- Settings persistence pattern (`loadSettings` / `saveSettings` / `loadData`)
+- `escapeRegex`, settings persistence pattern, loadData/saveData
 
-### New code needed:
-- Mode setting with conditional settings rendering (📅/🌙/☀️ + subdivision variant)
-- Boundary detection engine (calendar = date math, lunar = Sun-Moon elongation scan, solar = Sun ingresses from Helios)
-- Moon Phase plugin bridge (read serverUrl, reuse glyph/emoji helpers)
-- Template engine (token resolution)
-- Field collection engine (multi-note reader + chronological assembly)
-- Note generator (template + tokens + save location → create file)
-- Tabbed settings UI (container vs subdivision reflection config)
-- Dynamic command registration (re-register on mode change)
-- Mode toggle UI component (StatusBarItem or view decoration)
+## What's deleted or rewritten
 
-### Helios API (baratie:3000 — via Moon Phase plugin's serverUrl):
-- `GET /moon-now` → `{ moonPhase, moonSign, degreeInSign, moonAge }` (moonAge = days since last new moon)
-- `GET /weekly-major-phase` → `{ date, moonPhase, moonSign }` or null
-- `GET /planets-now` → `{ planets: [{ name, sign, degreeInSign, isRetrograde }] }`
-- `GET /planetary-ingresses?planet=Sun&start=YYYY-MM-DD&end=YYYY-MM-DD` → Sun sign changes (= major solar terms)
-- `GET /planetary-ingresses?planet=Moon&start=X&end=Y` → Moon sign changes
-- `GET /planetary-ingresses?start=X&end=Y` → all planets (filter client-side)
-- `GET /void-of-course-moons` → VOC periods
-- `GET /dignity-score?planet=X&sign=Y&degree=Z` → dignity data
+- **Modes (📅/🌙/☀️ as mutually exclusive).** Replaced with independent containers.
+- **Field pipeline (Daily → Subdivision → Container as a hand-rolled per-field collector).** Replaced with "give the LLM the daily files in range."
+- **Reflection modals as the *only* flow.** They're now per-container optional via the `reflectionMode` setting (`auto` / `manual` / `both`). Auto-LLM at boundary is the new default; reflection modals are an opt-in enhancement, lifted directly from Daily Ritual's working pattern.
+- **The "container vs subdivision" distinction.** Gone. There are just containers.
+- **Tabbed reflection settings (container tab vs subdivision tab).** Gone, replaced by per-container tabs.
+- **The "astrology toggle."** Gone — sun ingress and lunar phase are first-class containers, not toggled features of another mode.
 
-### Moon Phase plugin bridge (`obsidian-moon`):
-- Access: `this.app.plugins.plugins["obsidian-moon"]`
-- Settings: `.settings.serverUrl` (Helios URL, e.g. `http://baratie:3000`)
-- API helpers (reuse for display): `.api.getMoonPhaseEmoji(phase)`, `.api.getPlanetGlyph(name)`
-- Detection: check `this.app.plugins.plugins["obsidian-moon"]` exists before enabling 🌙/☀️ modes
+## What still needs design work
 
-### Key Obsidian APIs:
-- `this.app.vault.create(path, content)` — create notes
-- `this.app.vault.read(file)` / `this.app.vault.modify(file, content)` — read/write
-- `this.app.vault.getAbstractFileByPath(path)` — find files
-- `this.addCommand()` — register commands (call in onload, re-register on mode change)
-- `this.addStatusBarItem()` — potential location for mode toggle
-- `this.app.plugins.plugins["moon-phase"]` — access Moon Phase plugin API (if available)
+These are the open questions to resolve before or during implementation. Each is small but real.
+
+1. **Auto-generate trigger.** Single on/off toggle in the General tab. When on, the plugin checks every enabled container's boundary detector at plugin load. For any container whose boundary has been crossed since the last time it generated a note, it generates the missed note(s). No timers, no polling — boundary-driven only. When off, the user generates manually via command. (Resolved.)
+2. **What happens when a boundary is missed by multiple periods.** Generate each missed period as its own note in chronological order. The note exists even if there is nothing to aggregate — the *existence of the empty note* is itself data, and the system must not require the user's attention to function. Empty containers get empty (or LLM-acknowledged-as-empty) frontmatter and move on. (Resolved.)
+3. **LLM payload size limits.** A chapter (90 days) of dailies could be a lot of tokens. Need a strategy: (a) trust the model's context window; (b) chunk and summarize hierarchically (daily → weekly → chapter); (c) let the system prompt handle truncation. Likely (a) for v1, document the limit, revisit if it bites.
+4. **YAML output parsing.** The LLM is asked to output YAML. What happens when it outputs garbage? Strategy: extract fenced YAML if present, fall back to parsing the whole response, fall back to writing the raw response into a single `summary` field with a notice.
+5. **Alignment LLM pass — same call or separate?** Either alignments are appended to the main aggregation prompt, or they get their own LLM pass per alignment. Trade-off: one call is cheaper, separate calls let alignments use a different model and avoid prompt-stuffing. Default: separate pass per alignment, batchable later.
+6. **Templater interaction.** Templater scripts in the body run on first file open in Obsidian, *after* the plugin has written frontmatter. We need to confirm Templater respects pre-existing frontmatter and doesn't clobber it. Test before shipping.
+7. **Custom container types.** The "+ custom" option in settings needs a UX. v1 ships built-in types only. v1.1 adds custom containers (user picks any boundary detector + fills the four fields).
+8. **Migration from prior monthly-ritual settings.** Existing installs have a settings shape from the old architecture. On load, detect old shape and migrate (or wipe with notice). Decide: migrate or wipe.
 
 ---
 
-## Resolved Questions
+## Implementation phases
 
-1. **Moon Phase plugin API** — Exposes `this.api` with: `getMoonData()`, `getWeeklyMajorPhase()`, `getPlanetaryData()`, `getPlanetGlyph()`, `getMoonPhaseEmoji()`, `getAspectsData()`, `getVOCStatus()`, `getTransitsData()`, `getDignityScore()`. No phase boundary dates or ingress data — it's a "right now" reader. **Solution:** Read `serverUrl` from Moon Phase plugin's settings (`this.app.plugins.plugins["obsidian-moon"].settings.serverUrl`) and call Helios directly. Use `/planetary-ingresses?planet=Sun&start=X&end=Y` for solar terms (Sun sign changes = major terms). **Lunar phase boundaries** are determined by Sun-Moon angular separation (aspect geometry): 0° conjunction = New Moon, 90° waxing square = First Quarter, 180° opposition = Full Moon, 270° waning square = Last Quarter. Scan forward by computing Sun-Moon elongation at daily intervals via `/planets-now` until the target angle is crossed, then narrow to exact date. Use Moon Phase plugin's `getPlanetGlyph()` and `getMoonPhaseEmoji()` for display glyphs.
+### Phase 0 — Rewrite groundwork
+- Update `manifest.json` name to "Periodic Ritual" (id stays).
+- Rewrite settings shape, write a migration that wipes old settings with a one-time notice.
+- Rip out: modes, field pipeline UI, reflection-tab settings, container/subdivision split.
+- Keep: LLM providers, Helios bridge, Calendar View, naming engine, fuzzy finder, daily filename parser.
 
-2. **Auto-generation trigger** — Command-triggered for v1. On plugin load, check if current boundary has passed since last generated note. If so, show Notice: "New [cycle] started. Run [command] to generate." No silent auto-creation.
+### Phase 1 — Single container, calendar week, no LLM
+- Settings: Containers tab with one hardcoded entry (Calendar Week).
+- Boundary detector: ISO week math.
+- Generation: read template, apply naming tokens, write file. No daily aggregation, no LLM.
+- Command: "Generate next [container]" for manual triggering during dev.
+- **Milestone:** clicking the command creates a correctly named, correctly placed weekly note from a template.
 
-3. **Mode toggle placement** — Settings-level control, not a runtime widget. The 📅 🌙 ☀️ toggle lives in the settings tab and controls which sections of settings are visible (conditional rendering in `display()` based on `this.plugin.settings.mode`). 📅 shows week config. 🌙 shows phase config + astrology toggles. ☀️ shows term config + subdivision choice + astrology toggles. No status bar item.
+### Phase 2 — LLM aggregation
+- LLM services tab: define one or more services.
+- Per-container: pick service + system prompt MD file.
+- On generate: collect dailies in range, send to LLM with prompt, write YAML response to frontmatter, verify.
+- **Milestone:** running "Generate next Calendar Week" produces a weekly note whose frontmatter is filled by Gemini from the system prompt.
 
-4. **Daily note folder convention** — Configurable "Daily notes folder" setting in plugin settings. Defaults to vault root. Plugin scans that folder for files matching date-from-filename parser.
+### Phase 3 — Auto-generation on boundary
+- On plugin load: walk all enabled containers, run their boundary detectors, generate any that have crossed since last run.
+- Track "last generated" timestamps in settings per container.
+- Optional periodic timer (default once per local midnight).
+- **Milestone:** open Obsidian Monday morning, last week's note is sitting there, filled in.
 
-5. **Mode switching** — Existing notes stay. No deletion, no migration. New mode generates its own notes going forward. Half-finished cycle notes become orphans — still valid, still queryable.
+### Phase 4 — Multiple container types
+- Add Calendar Month, Chapter (Quarter), Book (Year) — calendar-based, no Helios needed.
+- Each gets its own tab, its own template, its own prompt, its own service.
+- **Milestone:** week + month + chapter all auto-generate at their boundaries with different prompts.
+
+### Phase 5 — Astro containers
+- Sun Ingress and Lunar Phase boundary detectors via Helios.
+- Detect Moon Phase plugin presence; gate the UI.
+- Reuse Calendar View for visual reference.
+- **Milestone:** the day the Sun enters Aries, an "♈ Aries 2026" note auto-creates with LLM-aggregated frontmatter.
+
+### Phase 6 — Reflection modals
+- Lift `ReflectionModal` from Daily Ritual's `main.js`.
+- Per-container `reflectionMode` setting (`auto` / `manual` / `both`) and `questions` array in the container's tab.
+- "Reflect on [container]" command per enabled container — opens the modal, runs the LLM with both the answers and the daily data, writes to frontmatter.
+- In `both` mode, the manual reflection pass reads the existing auto-filled frontmatter as additional context and overwrites with the new synthesis.
+- **Milestone:** running "Reflect on Calendar Week" opens a question modal, accepts answers, and produces an updated weekly note frontmatter that incorporates both the answers and the daily data.
+
+### Phase 7 — Alignment module
+- Alignments tab. Add/edit/remove alignments.
+- On container generation, run alignment passes after main aggregation.
+- Write alignment results to dedicated frontmatter fields or a body section template.
+- **Milestone:** chapter notes have a working "morning mobility" alignment that surfaces patterns over 90 days.
+
+### Phase 8 — Polish
+- Custom container types UI.
+- Migration warnings.
+- Edge cases: missing daily folder, malformed dailies, LLM rate limits, partial periods.
+- README rewrite.
 
 ---
 
-## Calendar View (v1.1)
+## Non-goals (v1)
 
-Lunisolar calendar view added as an `ItemView` in the right sidebar.
-
-### Architecture
-- **Container**: Zodiac sign period (~30 days), derived from `ZODIAC_DATES` approximate boundaries
-- **Subdivisions**: Lunar phase periods within the sign, from Helios `/moon-phases` endpoint (Swiss Ephemeris)
-- **View class**: `RitualCalendarView extends ItemView`, registered as `monthly-ritual-calendar`
-- **Ribbon icon**: `calendar-days`, plus command `open-calendar`
-
-### Data Flow
-1. `getZodiacSignPeriod(date)` determines which sign the display date falls in
-2. `getPhasePeriodsFromHelios(plugin, start, end)` calls `/moon-phases?start=X&end=Y` for exact phase boundaries
-3. Phases are filtered to those overlapping the sign period, but full phase days are rendered (out-of-sign days dimmed)
-4. Moon sign per phase comes directly from the `/moon-phases` response
-5. Minor solar term (15° of sign) highlighted via `/sun-degree` endpoint (pending) or `/planets-now` fallback
-
-### Navigation
-- `<` / `>` calls `navigateZodiacSign(date, delta)` to move between signs
-- `TODAY` resets to current date
-- Header click opens the zodiac sign note (resolved via `calendarNoteNaming` template)
-- Moon emoji click opens the lunar phase note (resolved via `lunarNoteNaming[phase]` template)
-- Day click opens the daily note
-
-### Settings Added
-- `calendarTimezone` — timezone for calculations (default: `America/New_York`)
-- `calendarNoteFolder` — shared folder for solar/lunar notes
-- `calendarNoteNaming` — zodiac sign note template (default: `☀️ Sun in {{sign}}`)
-- `lunarNoteNaming` — per-phase naming templates with tokens: `{{phase-name}}`, `{{phase-emoji}}`, `{{moon-sign}}`, `{{moon-glyph}}`
-
-### Helios Endpoints
-- `/moon-phases?start=YYYY-MM-DD&end=YYYY-MM-DD` — **new endpoint** added to server.js. Scans Sun-Moon elongation every 6 hours, binary-searches to ~5 minute precision for exact phase crossings (0°, 90°, 180°, 270°). Returns date, time, phase name, moon sign, degree.
-- `/sun-degree?degree=15&sign=Aries` — **new endpoint** (pending deployment). Finds exact date Sun reaches a specific degree in a sign. Used for minor solar term highlight.
-- `/planets-now` — existing endpoint, used as fallback for Sun degree calculation
-- `/planetary-ingresses?planet=Moon` — existing endpoint, used for moon sign lookup
+- No mobile-specific UI.
+- No daily-note modification.
+- No cross-container analysis ("how does my Aries period compare to my Pisces period").
+- No built-in dashboards or charts. (Templater + Dataview do this in the body.)
+- No conflict resolution if two containers want to write the same frontmatter key. The user is responsible for not configuring overlapping prompts on the same note.
+- No streak tracking, no compliance scores, no red/green/yellow status indicators. Anti-fragile by design.
 
 ---
 
-## Non-Goals (v1)
-- No simultaneous modes
-- No cross-cycle trend analysis
-- No auto-fire LLM summaries (command-triggered only)
-- No Daily Ritual code changes (Monthly Ritual reads what DR already writes)
-- No mobile-specific UI (desktop-first, mobile works but not optimized)
+## Glossary
+
+| Term | Meaning |
+|------|---------|
+| Container | A periodic note (week, month, sun ingress, lunar phase, chapter, book). The unit of aggregation. |
+| Container type | A class of container with its own boundary detector, template, prompt, and LLM service. |
+| Boundary detector | The function that decides "has a new period of this type started?" — calendar math or Helios call. |
+| System prompt MD | A markdown file the user picks per container type. Sent to the LLM as the system role on every aggregation. The customization layer. |
+| LLM service | A `{provider, api key, model}` bundle defined in the LLM tab. Containers reference services by name. |
+| Alignment | A measurable anchor attached to a container. Pulls a daily field, runs an LLM pass against a description. |
+| Arc | User-facing alias for an alignment that lives in a sun ingress note. Same mechanic. |
+| Pillar | Health, Wealth, Work, Links, Creative, Study. Lives in the user's prompts, not in plugin code. |
+| Chapter | 90-day container (= calendar quarter). |
+| Book | 365-day container (= calendar year). |
+| Helios | Local API server on `baratie:3000` for ephemeris data. Provided by the Moon Phase plugin. |
