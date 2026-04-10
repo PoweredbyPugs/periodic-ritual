@@ -1744,7 +1744,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             { id: "containers", label: "Containers" },
             { id: "alignments", label: "Alignments" },
             { id: "llm",        label: "LLM" },
-            { id: "legacy",     label: "Legacy Settings" },
+            { id: "legacy",     label: "Existing" },
             { id: "general",    label: "General" },
         ];
 
