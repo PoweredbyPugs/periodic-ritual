@@ -223,6 +223,24 @@ function formatPRMetadataBlob(fields) {
     return Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(" ");
 }
 
+// Resolve Obsidian core Templates plugin tokens — separate from both Templater
+// and our own naming tokens. The user's templates often mix all three.
+//   {{title}}             → file basename (no extension)
+//   {{date}}              → today, YYYY-MM-DD
+//   {{date:FORMAT}}       → moment().format(FORMAT)
+//   {{time}}              → today, HH:mm
+//   {{time:FORMAT}}       → moment().format(FORMAT)
+function resolveCoreTemplateTokens(content, fileBasename) {
+    const m = (typeof window !== "undefined" && window.moment) ? window.moment() : null;
+    let out = content;
+    out = out.replace(/\{\{\s*title\s*\}\}/g, fileBasename);
+    out = out.replace(/\{\{\s*date\s*:\s*([^}]+?)\s*\}\}/g, (_, fmt) => m ? m.format(fmt) : "");
+    out = out.replace(/\{\{\s*date\s*\}\}/g, () => m ? m.format("YYYY-MM-DD") : "");
+    out = out.replace(/\{\{\s*time\s*:\s*([^}]+?)\s*\}\}/g, (_, fmt) => m ? m.format(fmt) : "");
+    out = out.replace(/\{\{\s*time\s*\}\}/g, () => m ? m.format("HH:mm") : "");
+    return out;
+}
+
 // Apply Periodic Ritual metadata to note content according to the container's
 // configured placement. Returns the (possibly modified) content string.
 function applyPRMetadata(content, placement, inlineKey, fields) {
@@ -1035,9 +1053,13 @@ class MonthlyRitualPlugin extends Plugin {
                 }
             }
 
-            // Load template, resolve tokens
+            // Load template, resolve our naming tokens, then resolve Obsidian
+            // core Templates plugin tokens ({{title}}, {{date:FORMAT}}, etc.).
+            // Templater tags (<% ... %>) are left untouched — Templater
+            // processes them after the file is created and opened.
             let content = await this.loadTemplate(container.template);
             content = this.resolveTokens(content, data.tokens);
+            content = resolveCoreTemplateTokens(content, fileName);
 
             // Stamp Periodic Ritual metadata so future phases can find these
             // notes again. Placement is per-container — frontmatter, inline,
@@ -1056,6 +1078,20 @@ class MonthlyRitualPlugin extends Plugin {
             );
 
             const file = await this.app.vault.create(filePath, content);
+
+            // Open the new file. Two reasons:
+            //  1. The user clicked "Generate" — they expect to see the result.
+            //  2. Templater scripts in the template that read
+            //     app.workspace.getActiveFile() (instead of tp.file) will
+            //     otherwise see whatever file was active when Generate was
+            //     clicked, and fail with "wrong filename" errors.
+            try {
+                const leaf = this.app.workspace.getLeaf(false);
+                await leaf.openFile(file);
+            } catch (e) {
+                console.error("Periodic Ritual: failed to open generated file", e);
+            }
+
             new Notice(`Created: ${fileName}`);
             return file;
         } catch (e) {
