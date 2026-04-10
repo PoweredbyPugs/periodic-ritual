@@ -6355,6 +6355,58 @@ class PRGraphView extends ItemView {
         this.render();
     }
 
+    // ─── Snap helper for wire drag ───
+    //
+    // Find the closest compatible socket within a snap radius. Returns
+    // { nodeId, socketId, el, pos } or null. drag.direction tells us
+    // whether to look for input sockets (out-drag → in) or output sockets
+    // (in-drag → out).
+    findSnapTarget(clientX, clientY, drag) {
+        const SNAP_RADIUS_VIEWPORT = 50; // 50px in viewport coords
+        const rect = this.canvasEl.getBoundingClientRect();
+        const mx = (clientX - rect.left - this.panX) / this.zoom;
+        const my = (clientY - rect.top - this.panY) / this.zoom;
+
+        const lookForOutputs = drag.direction === "in";
+        const selector = lookForOutputs ? ".pr-graph-socket-out" : ".pr-graph-socket-in";
+
+        let best = null;
+        let bestDist = SNAP_RADIUS_VIEWPORT;
+
+        for (const node of this.nodes) {
+            if (!node.el) continue;
+            const sockets = node.el.querySelectorAll(selector);
+            for (const socket of sockets) {
+                const socketId = socket.dataset.socketId;
+                const pos = this.socketPos(node.id, socketId);
+                const dx = pos.x - mx;
+                const dy = pos.y - my;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist >= bestDist) continue;
+
+                // Compatibility check via canConnect
+                if (drag.direction === "out") {
+                    if (!this.canConnect(drag.fromNode, node, socketId)) continue;
+                } else {
+                    if (!this.canConnect(node, drag.toNode, drag.toSocketId)) continue;
+                }
+
+                best = { nodeId: node.id, socketId, el: socket, pos };
+                bestDist = dist;
+            }
+        }
+        return best;
+    }
+
+    // Apply or clear the snap-target visual highlight on the relevant
+    // socket. Cleans up the previous highlight when switching targets.
+    setSnapHighlight(targetEl) {
+        if (this._snapHighlight === targetEl) return;
+        if (this._snapHighlight) this._snapHighlight.classList.remove("pr-graph-socket-snapping");
+        this._snapHighlight = targetEl || null;
+        if (targetEl) targetEl.classList.add("pr-graph-socket-snapping");
+    }
+
     setupWireDrag() {
         if (!this.viewportEl || !this.wireSvg) return;
         const SVG_NS = "http://www.w3.org/2000/svg";
@@ -6447,15 +6499,25 @@ class PRGraphView extends ItemView {
             const mx = (e.clientX - rect.left - this.panX) / this.zoom;
             const my = (e.clientY - rect.top - this.panY) / this.zoom;
 
+            // Snap to the closest compatible socket within the snap radius.
+            // When snapping, the ghost wire's free end becomes the target
+            // socket's center instead of the cursor — so the wire visibly
+            // "locks on" to the target.
+            const snap = this.findSnapTarget(e.clientX, e.clientY, active);
+            this.setSnapHighlight(snap?.el);
+            active.snap = snap;
+            const tx = snap ? snap.pos.x : mx;
+            const ty = snap ? snap.pos.y : my;
+
             if (active.direction === "out") {
                 const a = this.socketPos(active.fromNode.id, active.fromSocketId);
-                const dx = Math.max(60, Math.abs(mx - a.x) * 0.4);
-                const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${mx - dx} ${my}, ${mx} ${my}`;
+                const dx = Math.max(60, Math.abs(tx - a.x) * 0.4);
+                const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${tx - dx} ${ty}, ${tx} ${ty}`;
                 active.ghost.setAttribute("d", d);
             } else {
                 const b = this.socketPos(active.toNode.id, active.toSocketId);
-                const dx = Math.max(60, Math.abs(b.x - mx) * 0.4);
-                const d = `M ${mx} ${my} C ${mx + dx} ${my}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
+                const dx = Math.max(60, Math.abs(b.x - tx) * 0.4);
+                const d = `M ${tx} ${ty} C ${tx + dx} ${ty}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
                 active.ghost.setAttribute("d", d);
             }
         };
@@ -6466,11 +6528,27 @@ class PRGraphView extends ItemView {
             const drag = active;
             active = null;
             if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
+            this.setSnapHighlight(null);
+
+            // Snap target wins over hit-testing — if the user was within
+            // the snap radius of a compatible socket, drop there.
+            if (drag.snap) {
+                const snapNode = this.nodes.find(n => n.id === drag.snap.nodeId);
+                if (snapNode) {
+                    if (drag.direction === "out") {
+                        await this.applyConnection(drag.fromNode, snapNode, drag.fromSocketId, drag.snap.socketId);
+                    } else {
+                        await this.applyConnection(snapNode, drag.toNode, "out", drag.toSocketId);
+                    }
+                    return;
+                }
+            }
 
             const target = document.elementFromPoint(e.clientX, e.clientY);
 
             if (drag.direction === "out") {
-                // Forward drag: must drop on a compatible input socket
+                // Forward drag without a snap: hit-test for an input socket
+                // directly under the cursor.
                 if (!target) return;
                 const socket = target.closest(".pr-graph-socket-in");
                 if (!socket) return;
@@ -6487,9 +6565,8 @@ class PRGraphView extends ItemView {
                 return;
             }
 
-            // Reverse drag — either a fresh drag from an empty input
-            // (open the create-source menu on empty drop), or a rewire of
-            // an existing connection (just stay disconnected on empty drop).
+            // Reverse drag fallback (no snap): try the hit-test, then
+            // fall back to disconnect (rewire) or create-source menu (fresh).
             const dropOnNodeEl = target?.closest(".pr-graph-node");
             if (dropOnNodeEl) {
                 const fromNode = this.nodes.find(n => n.id === dropOnNodeEl.dataset.nodeId);
@@ -6499,13 +6576,9 @@ class PRGraphView extends ItemView {
                 }
             }
             if (drag.isRewire) {
-                // The wire was already detached on mousedown. Empty drop
-                // means the user wanted to disconnect — re-render to show
-                // the final state.
                 this.render();
                 return;
             }
-            // Fresh drag from an empty input → offer to create a new source
             this.openInputDragMenu(e, drag.toNode, drag.toSocketId);
         };
 

@@ -886,6 +886,17 @@
     transform: scale(1.3);
 }
 
+/* Socket pulses with an accent ring when a wire-drag is snapped to it */
+@keyframes pr-socket-snap-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 var(--interactive-accent); }
+    50%      { box-shadow: 0 0 0 6px var(--interactive-accent); }
+}
+
+.pr-graph-socket-snapping {
+    transform: scale(1.5);
+    animation: pr-socket-snap-pulse 0.8s ease-in-out infinite;
+}
+
 /* ═══════════════════════════════════════
    CALENDAR VIEW
    ═══════════════════════════════════════ */
