@@ -4867,13 +4867,402 @@ class PRGraphView extends ItemView {
         // inline widgets and live in the settings tabs via click-to-edit.
     }
 
-    // Phase 10c-2 fills this in with the full edit form per node kind.
-    // Phase 10c-1 ships a placeholder so the expanded affordance is visible.
+    // Per-kind full inline editor (Phase 10c-2). Equivalent to the
+    // settings tab card, but laid out compactly for the node body.
     renderNodeExpandedBody(body, node) {
-        // Inline widgets first (the same ones the collapsed state shows)
-        this.renderNodeWidgets(body, node);
-        const placeholder = body.createEl("div", { cls: "pr-graph-expanded-placeholder" });
-        placeholder.setText("Full inline editor coming in Phase 10c-2. For now: right-click → Edit in settings.");
+        const stop = (el) => el.addEventListener("mousedown", (e) => e.stopPropagation());
+        const reRender = () => this.render();
+        const save = async () => { await this.plugin.saveSettings(); };
+
+        // ── Generic helpers (compact versions of the settings widgets) ──
+
+        const addRow = (label) => {
+            const row = body.createEl("div", { cls: "pr-graph-form-row" });
+            if (label) row.createEl("div", { cls: "pr-graph-form-label", text: label });
+            return row;
+        };
+        const addLabeledText = (label, placeholder, get, set, opts = {}) => {
+            const row = addRow(label);
+            const input = row.createEl("input", { type: opts.type || "text", value: get() || "", cls: "pr-graph-form-text" });
+            input.placeholder = placeholder || "";
+            stop(input);
+            input.addEventListener("change", async () => { set(input.value); await save(); if (opts.rerender !== false) reRender(); });
+            return input;
+        };
+        const addLabeledTextArea = (label, placeholder, get, set, rows = 3) => {
+            const row = addRow(label);
+            const ta = row.createEl("textarea", { cls: "pr-graph-form-textarea" });
+            ta.value = get() || "";
+            ta.placeholder = placeholder || "";
+            ta.rows = rows;
+            stop(ta);
+            ta.addEventListener("change", async () => { set(ta.value); await save(); });
+            return ta;
+        };
+        const addLabeledDropdown = (label, options, get, set, opts = {}) => {
+            const row = addRow(label);
+            const sel = row.createEl("select", { cls: "pr-graph-form-select" });
+            for (const opt of options) {
+                const o = sel.createEl("option", { text: opt.label, value: opt.value });
+                if (opt.value === get()) o.selected = true;
+            }
+            stop(sel);
+            sel.addEventListener("change", async () => { set(sel.value); await save(); if (opts.rerender !== false) reRender(); });
+            return sel;
+        };
+        const addLabeledToggle = (label, get, set) => {
+            const row = addRow(label);
+            row.style.justifyContent = "space-between";
+            const wrap = row.createEl("label", { cls: "pr-graph-widget-toggle" });
+            const input = wrap.createEl("input", { type: "checkbox" });
+            input.checked = !!get();
+            stop(input);
+            input.addEventListener("change", async () => { set(input.checked); await save(); reRender(); });
+            wrap.createEl("span", { cls: "pr-graph-widget-toggle-track" });
+            return input;
+        };
+        const addPicker = (label, currentValue, placeholder, openPickerFn, clearFn) => {
+            const row = addRow(label);
+            const value = row.createEl("div", { cls: "pr-graph-form-picker-value", text: currentValue || placeholder });
+            const btnRow = row.createEl("div", { cls: "pr-graph-form-picker-buttons" });
+            const chooseBtn = btnRow.createEl("button", { text: currentValue ? "Change" : "Choose" });
+            stop(chooseBtn);
+            chooseBtn.addEventListener("click", (e) => { e.stopPropagation(); openPickerFn(); });
+            if (currentValue && clearFn) {
+                const clearBtn = btnRow.createEl("button", { text: "×" });
+                stop(clearBtn);
+                clearBtn.addEventListener("click", async (e) => { e.stopPropagation(); await clearFn(); });
+            }
+            return row;
+        };
+        const addButton = (label, onClick, opts = {}) => {
+            const row = body.createEl("div", { cls: "pr-graph-form-row" });
+            const btn = row.createEl("button", { text: label, cls: opts.cta ? "pr-graph-form-button mod-cta" : "pr-graph-form-button" });
+            stop(btn);
+            btn.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
+            return btn;
+        };
+
+        // ── Per-kind forms ──
+
+        if (node.kind === "container") this.renderContainerExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "reflection") this.renderReflectionExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "alignment") this.renderAlignmentExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "llm") this.renderLLMExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "boundary" && node.id.startsWith("boundary-custom-")) this.renderCustomBoundaryExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+    }
+
+    renderContainerExpanded(body, node, h) {
+        const c = node.primitive;
+        const s = this.plugin.settings;
+
+        // Boundary detector
+        const detectors = this.plugin.getPRAvailableBoundaryDetectors();
+        h.addLabeledDropdown(
+            "Boundary",
+            detectors.map(d => ({ value: d.id, label: d.label })),
+            () => c.boundaryDetector || "calendar-week",
+            (v) => { c.boundaryDetector = v; }
+        );
+
+        // Generate at
+        h.addLabeledDropdown(
+            "Generate at",
+            [
+                { value: "start", label: "Start of period" },
+                { value: "end",   label: "End of period" },
+            ],
+            () => c.generateAt || "start",
+            (v) => { c.generateAt = v; }
+        );
+
+        // Template picker
+        h.addPicker("Template", c.template, "(none)",
+            () => new MarkdownFileSuggestModal(this.app, async (file) => {
+                c.template = file.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { c.template = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        // Save dir picker
+        h.addPicker("Save dir", c.saveDir, "(vault root)",
+            () => new FolderSuggestModal(this.app, async (folder) => {
+                c.saveDir = folder.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { c.saveDir = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        // Naming convention with live preview
+        const namingInput = h.addLabeledText("Naming", "W{{week}}-{{year}}",
+            () => c.naming,
+            (v) => { c.naming = v; },
+            { rerender: false }
+        );
+        // Live preview line
+        const preview = body.createEl("div", { cls: "pr-graph-form-preview", text: "…" });
+        this.plugin.getPRBoundaryData(c.boundaryDetector || "calendar-week", new Date())
+            .then(data => {
+                preview.setText(c.naming
+                    ? `→ ${this.plugin.resolveTokens(c.naming, data.tokens)}`
+                    : "(empty)");
+            })
+            .catch(() => preview.setText("(unable to preview)"));
+        namingInput.addEventListener("input", async () => {
+            try {
+                const data = await this.plugin.getPRBoundaryData(c.boundaryDetector || "calendar-week", new Date());
+                preview.setText(namingInput.value
+                    ? `→ ${this.plugin.resolveTokens(namingInput.value, data.tokens)}`
+                    : "(empty)");
+            } catch (_) {}
+        });
+
+        // Metadata placement
+        h.addLabeledDropdown(
+            "Metadata",
+            [
+                { value: "frontmatter", label: "Frontmatter" },
+                { value: "inline",      label: "Inline marker" },
+                { value: "none",        label: "Don't write" },
+            ],
+            () => c.metadataPlacement || "frontmatter",
+            (v) => { c.metadataPlacement = v; }
+        );
+        if ((c.metadataPlacement || "frontmatter") === "inline") {
+            h.addLabeledText("Inline key", "periodic-ritual",
+                () => c.metadataInlineKey,
+                (v) => { c.metadataInlineKey = v; },
+                { rerender: false }
+            );
+        }
+
+        // Data source
+        const dsOpts = [{ value: "daily", label: "Daily notes" }];
+        for (const other of (s.prContainers || [])) {
+            if (other.id === c.id) continue;
+            dsOpts.push({ value: `container:${other.id}`, label: other.name || "(unnamed)" });
+        }
+        const ds = c.dataSource || { type: "daily" };
+        const dsCurrent = ds.type === "container" && ds.containerId ? `container:${ds.containerId}` : "daily";
+        h.addLabeledDropdown("Data source", dsOpts,
+            () => dsCurrent,
+            (v) => {
+                if (v === "daily") c.dataSource = { type: "daily" };
+                else if (v.startsWith("container:")) c.dataSource = { type: "container", containerId: v.slice("container:".length) };
+            }
+        );
+
+        // LLM service
+        const llmOpts = [{ value: "", label: "— None —" }];
+        for (const svc of (s.prLLMServices || [])) {
+            llmOpts.push({ value: svc.id, label: svc.name || "(unnamed)" });
+        }
+        h.addLabeledDropdown("LLM service", llmOpts,
+            () => c.llmServiceId || "",
+            (v) => { c.llmServiceId = v; }
+        );
+
+        // System prompt picker
+        h.addPicker("Sys prompt", c.systemPromptFile, "(none)",
+            () => new MarkdownFileSuggestModal(this.app, async (file) => {
+                c.systemPromptFile = file.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { c.systemPromptFile = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        // Reflection
+        const refOpts = [{ value: "", label: "— None —" }];
+        for (const r of (s.prReflections || [])) {
+            refOpts.push({ value: r.id, label: r.name || "(unnamed)" });
+        }
+        h.addLabeledDropdown("Reflection", refOpts,
+            () => c.reflectionId || "",
+            (v) => { c.reflectionId = v; }
+        );
+
+        // Generate now button
+        h.addButton("Generate now", () => this.plugin.generatePRContainerNote(c), { cta: true });
+    }
+
+    renderReflectionExpanded(body, node, h) {
+        const r = node.primitive;
+
+        // useLLM and replaceAutoLLM toggles already shown in collapsed widgets;
+        // skip the duplicates here. Show prompt prepend and questions list.
+
+        h.addLabeledTextArea("Prompt prepend",
+            "Optional markdown layered on top of the container's system prompt during reflection runs.",
+            () => r.promptPrepend,
+            (v) => { r.promptPrepend = v; },
+            3
+        );
+
+        // Questions list — text only. Per-question inject/output config still
+        // lives in the settings tab (too much UI for a node).
+        if (!Array.isArray(r.questions)) r.questions = [];
+        const qWrap = body.createEl("div", { cls: "pr-graph-form-row" });
+        qWrap.createEl("div", { cls: "pr-graph-form-label", text: `Questions (${r.questions.length})` });
+        const qList = qWrap.createEl("div", { cls: "pr-graph-form-qlist" });
+        for (let i = 0; i < r.questions.length; i++) {
+            const q = r.questions[i];
+            const qRow = qList.createEl("div", { cls: "pr-graph-form-qrow" });
+            const input = qRow.createEl("input", { type: "text", value: q.text || "", cls: "pr-graph-form-text" });
+            input.placeholder = `Question ${i + 1}`;
+            input.addEventListener("mousedown", (e) => e.stopPropagation());
+            input.addEventListener("change", async () => { q.text = input.value; await this.plugin.saveSettings(); });
+            const delBtn = qRow.createEl("button", { text: "×", cls: "pr-graph-form-qdel" });
+            delBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+            delBtn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                r.questions.splice(i, 1);
+                await this.plugin.saveSettings();
+                this.render();
+            });
+        }
+        const addQBtn = qWrap.createEl("button", { text: "+ Question", cls: "pr-graph-form-button" });
+        addQBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+        addQBtn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            r.questions.push(makePRQuestion(""));
+            await this.plugin.saveSettings();
+            this.render();
+        });
+    }
+
+    renderAlignmentExpanded(body, node, h) {
+        const a = node.primitive;
+        const s = this.plugin.settings;
+
+        // Container picker
+        const cOpts = [{ value: "", label: "— None —" }];
+        for (const c of (s.prContainers || [])) {
+            cOpts.push({ value: c.id, label: c.name || "(unnamed)" });
+        }
+        h.addLabeledDropdown("Container", cOpts,
+            () => a.containerId || "",
+            (v) => { a.containerId = v; }
+        );
+
+        // Field type
+        h.addLabeledDropdown("Field type",
+            [
+                { value: "inline",      label: "Inline (key:: value)" },
+                { value: "frontmatter", label: "Frontmatter (key: value)" },
+            ],
+            () => a.dataFieldType || "inline",
+            (v) => { a.dataFieldType = v; }
+        );
+
+        // Description
+        h.addLabeledTextArea("Description",
+            "What you're measuring and how the LLM should think about it.",
+            () => a.description,
+            (v) => { a.description = v; },
+            3
+        );
+
+        // Output field
+        h.addLabeledText("Output key", "alignment_<name>",
+            () => a.outputField,
+            (v) => { a.outputField = v; },
+            { rerender: false }
+        );
+    }
+
+    renderLLMExpanded(body, node, h) {
+        const svc = node.primitive;
+
+        // Provider dropdown
+        const providerOpts = Object.entries(PROVIDERS).map(([key, p]) => ({ value: key, label: p.name }));
+        h.addLabeledDropdown("Provider", providerOpts,
+            () => svc.provider || "gemini",
+            (v) => {
+                svc.provider = v;
+                svc.model = "";
+                const newProv = PROVIDERS[v];
+                if (newProv?.needsBaseUrl && !svc.baseUrl) svc.baseUrl = newProv.defaultBaseUrl || "";
+            }
+        );
+
+        const provDef = PROVIDERS[svc.provider];
+        if (provDef?.needsBaseUrl) {
+            h.addLabeledText("Base URL", provDef.defaultBaseUrl || "",
+                () => svc.baseUrl,
+                (v) => { svc.baseUrl = v; },
+                { rerender: false }
+            );
+        }
+
+        // API key
+        h.addLabeledText("API key", "sk-... / AIza... / sk-or-...",
+            () => svc.apiKey,
+            (v) => { svc.apiKey = v; },
+            { type: "password", rerender: false }
+        );
+
+        // Model + fetch
+        const modelLabel = svc.provider === "openclaw" ? "Agent" : "Model";
+        const modelInput = h.addLabeledText(modelLabel, "model name",
+            () => svc.model,
+            (v) => { svc.model = v; },
+            { rerender: false }
+        );
+        h.addButton("Fetch models", async () => {
+            const provider = PROVIDERS[svc.provider];
+            if (!provider) { new Notice(`Unknown provider: ${svc.provider}`); return; }
+            if (!provider.needsBaseUrl && !svc.apiKey) { new Notice("Set the API key first"); return; }
+            try {
+                new Notice(`Fetching from ${provider.name}…`);
+                const models = await provider.listModels(svc);
+                if (!models || models.length === 0) { new Notice("No models returned"); return; }
+                new PRModelPickerModal(this.app, models, async (chosen) => {
+                    svc.model = chosen;
+                    await this.plugin.saveSettings();
+                    this.render();
+                }).open();
+            } catch (e) {
+                new Notice(`Fetch failed: ${e.message}`);
+            }
+        });
+    }
+
+    renderCustomBoundaryExpanded(body, node, h) {
+        const cb = node.primitive;
+
+        // Script path picker
+        h.addPicker("Script", cb.scriptPath, "(none)",
+            () => new PRJSFileSuggestModal(this.app, async (file) => {
+                cb.scriptPath = file.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { cb.scriptPath = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        // Description
+        h.addLabeledTextArea("Description",
+            "Markdown text prepended to the LLM system prompt.",
+            () => cb.description,
+            (v) => { cb.description = v; },
+            3
+        );
+
+        // Test button
+        h.addButton("Test against today", async () => {
+            if (!cb.scriptPath) { new Notice("No script path set"); return; }
+            try {
+                const result = await this.plugin.runPRCustomBoundary(cb.id, new Date());
+                const summary = `start: ${formatDate(result.start)}, end: ${formatDate(result.end)}`;
+                new Notice(`OK: ${summary}`, 8000);
+            } catch (e) {
+                new Notice(`Error: ${e.message}`, 10000);
+            }
+        });
     }
 
     // Compute the screen position of a socket within the viewport's

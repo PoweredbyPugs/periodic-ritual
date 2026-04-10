@@ -489,6 +489,143 @@
     border-top: 1px dashed var(--background-modifier-border);
 }
 
+/* Inline form widgets in expanded node bodies (Phase 10c-2) */
+.pr-graph-form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+}
+
+.pr-graph-form-label {
+    color: var(--text-faint);
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.pr-graph-form-text,
+.pr-graph-form-textarea,
+.pr-graph-form-select {
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: var(--text-normal);
+    font-size: 0.85em;
+    font-family: var(--font-interface);
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.pr-graph-form-text:focus,
+.pr-graph-form-textarea:focus,
+.pr-graph-form-select:focus {
+    outline: none;
+    border-color: var(--interactive-accent);
+}
+
+.pr-graph-form-textarea {
+    font-family: var(--font-monospace);
+    font-size: 0.78em;
+    resize: vertical;
+}
+
+.pr-graph-form-select {
+    cursor: pointer;
+}
+
+.pr-graph-form-button {
+    background: var(--interactive-normal);
+    border: none;
+    border-radius: 4px;
+    padding: 5px 10px;
+    color: var(--text-normal);
+    font-size: 0.85em;
+    cursor: pointer;
+    width: 100%;
+}
+
+.pr-graph-form-button:hover {
+    background: var(--interactive-hover);
+}
+
+.pr-graph-form-button.mod-cta {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+}
+
+.pr-graph-form-button.mod-cta:hover {
+    background: var(--interactive-accent-hover);
+}
+
+.pr-graph-form-picker-value {
+    color: var(--text-muted);
+    font-size: 0.78em;
+    font-family: var(--font-monospace);
+    word-break: break-all;
+    padding: 2px 0;
+}
+
+.pr-graph-form-picker-buttons {
+    display: flex;
+    gap: 4px;
+}
+
+.pr-graph-form-picker-buttons button {
+    flex: 1;
+    background: var(--interactive-normal);
+    border: none;
+    border-radius: 3px;
+    padding: 3px 8px;
+    color: var(--text-normal);
+    font-size: 0.78em;
+    cursor: pointer;
+}
+
+.pr-graph-form-picker-buttons button:last-child:not(:only-child) {
+    flex: 0 0 28px;
+}
+
+.pr-graph-form-picker-buttons button:hover {
+    background: var(--interactive-hover);
+}
+
+.pr-graph-form-preview {
+    color: var(--interactive-accent);
+    font-family: var(--font-monospace);
+    font-size: 0.78em;
+    margin-top: 2px;
+}
+
+.pr-graph-form-qlist {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 4px 0;
+}
+
+.pr-graph-form-qrow {
+    display: flex;
+    gap: 4px;
+}
+
+.pr-graph-form-qdel {
+    flex: 0 0 24px;
+    background: var(--interactive-normal);
+    border: none;
+    border-radius: 3px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 1em;
+    line-height: 1;
+}
+
+.pr-graph-form-qdel:hover {
+    background: var(--background-modifier-error, #7c2222);
+    color: white;
+}
+
 .pr-graph-node-title {
     font-weight: 600;
     font-size: 0.95em;
