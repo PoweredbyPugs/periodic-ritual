@@ -271,6 +271,56 @@
     pointer-events: none;
 }
 
+/* Right-click context menu */
+.pr-graph-ctx-menu {
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    padding: 4px 0;
+    min-width: 160px;
+    user-select: none;
+}
+
+.pr-graph-ctx-item {
+    display: block;
+    width: 100%;
+    background: transparent;
+    border: none;
+    text-align: left;
+    padding: 6px 14px;
+    color: var(--text-normal);
+    font-size: 0.9em;
+    cursor: pointer;
+}
+
+.pr-graph-ctx-item:hover {
+    background: var(--background-modifier-hover);
+}
+
+.pr-graph-ctx-item:disabled,
+.pr-graph-ctx-item:first-child {
+    color: var(--text-faint);
+    cursor: default;
+    font-size: 0.8em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.pr-graph-ctx-item:first-child:hover {
+    background: transparent;
+}
+
+.pr-graph-ctx-danger {
+    color: var(--text-error, #e26a6a) !important;
+}
+
+.pr-graph-ctx-sep {
+    height: 1px;
+    background: var(--background-modifier-border);
+    margin: 4px 0;
+}
+
 /* Wire hover state — wires get a thicker stroke and full opacity to
    tell the user they can be clicked to delete. */
 .pr-graph-wire:hover {

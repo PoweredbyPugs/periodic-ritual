@@ -4705,6 +4705,8 @@ class PRGraphView extends ItemView {
         // Wire drag + wire delete (Phase 10b-1)
         this.setupWireDrag();
         this.setupWireClick();
+        // Right-click context menus (Phase 10b-2)
+        this.setupContextMenus();
     }
 
     renderNode(parent, node) {
@@ -4795,6 +4797,246 @@ class PRGraphView extends ItemView {
     applyTransform() {
         if (!this.viewportEl) return;
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+
+    // ─── Right-click context menus (Phase 10b-2) ───
+    //
+    // Three menu types:
+    //   - Empty canvas: add a new primitive (container, reflection, etc.)
+    //     positioned at the click location.
+    //   - Node: edit, duplicate, delete, enable/disable (containers only).
+    //   - Wire: delete (same as left-click on the wire, but discoverable).
+
+    setupContextMenus() {
+        if (!this.canvasEl) return;
+        const canvas = this.canvasEl;
+
+        const onContextMenu = (e) => {
+            e.preventDefault();
+
+            const wirePath = e.target.closest("path.pr-graph-wire:not(.pr-graph-wire-ghost)");
+            const nodeEl = e.target.closest(".pr-graph-node");
+
+            if (wirePath) {
+                this.openWireContextMenu(e, wirePath);
+            } else if (nodeEl) {
+                this.openNodeContextMenu(e, nodeEl);
+            } else {
+                this.openCanvasContextMenu(e);
+            }
+        };
+        canvas.addEventListener("contextmenu", onContextMenu);
+        this._ctxMenuCleanup = () => canvas.removeEventListener("contextmenu", onContextMenu);
+    }
+
+    // Build a free-floating menu rooted at (clientX, clientY). Items is an
+    // array of { label, onClick, danger? }.
+    showFloatingMenu(clientX, clientY, items) {
+        // Close any existing menu first
+        const existing = document.querySelector(".pr-graph-ctx-menu");
+        if (existing) existing.remove();
+
+        const menu = document.createElement("div");
+        menu.className = "pr-graph-ctx-menu";
+        menu.style.cssText = `position: fixed; left: ${clientX}px; top: ${clientY}px; z-index: 1000;`;
+        for (const item of items) {
+            if (item === "separator") {
+                const sep = document.createElement("div");
+                sep.className = "pr-graph-ctx-sep";
+                menu.appendChild(sep);
+                continue;
+            }
+            const btn = document.createElement("button");
+            btn.className = "pr-graph-ctx-item" + (item.danger ? " pr-graph-ctx-danger" : "");
+            btn.textContent = item.label;
+            btn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                menu.remove();
+                if (item.onClick) await item.onClick();
+            });
+            menu.appendChild(btn);
+        }
+        document.body.appendChild(menu);
+
+        // Dismiss on any other click
+        const dismiss = (e) => {
+            if (menu.contains(e.target)) return;
+            menu.remove();
+            document.removeEventListener("mousedown", dismiss, true);
+        };
+        setTimeout(() => document.addEventListener("mousedown", dismiss, true), 0);
+    }
+
+    openWireContextMenu(e, wirePath) {
+        const paths = Array.from(this.wireSvg.querySelectorAll("path.pr-graph-wire:not(.pr-graph-wire-ghost)"));
+        const idx = paths.indexOf(wirePath);
+        if (idx < 0 || !this.wires[idx]) return;
+        const wire = this.wires[idx];
+        this.showFloatingMenu(e.clientX, e.clientY, [
+            { label: `Wire: ${wire.kind}`, onClick: null },
+            "separator",
+            { label: "Delete", danger: true, onClick: () => this.deleteWire(wire) },
+        ]);
+    }
+
+    openNodeContextMenu(e, nodeEl) {
+        const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+        if (!node) return;
+
+        const items = [];
+        items.push({ label: `${node.title} (${node.kind})`, onClick: null });
+        items.push("separator");
+
+        if (node.primitiveTab) {
+            items.push({ label: "Edit in settings", onClick: () => this.onNodeClick(node) });
+        }
+        if (node.kind === "container" && node.primitive) {
+            items.push({
+                label: node.primitive.enabled ? "Disable" : "Enable",
+                onClick: async () => {
+                    node.primitive.enabled = !node.primitive.enabled;
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            });
+            items.push({
+                label: "Duplicate",
+                onClick: async () => {
+                    const copy = JSON.parse(JSON.stringify(node.primitive));
+                    copy.id = "pr-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+                    copy.name = `${copy.name} (copy)`;
+                    copy.lastGeneratedEnd = "";
+                    this.plugin.settings.prContainers.push(copy);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            });
+        }
+        if (node.kind === "reflection" && node.primitive) {
+            items.push({
+                label: "Duplicate",
+                onClick: async () => {
+                    const copy = JSON.parse(JSON.stringify(node.primitive));
+                    copy.id = "rf-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+                    copy.name = `${copy.name} (copy)`;
+                    this.plugin.settings.prReflections.push(copy);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            });
+        }
+
+        // Delete works for any primitive node — daily and built-in boundary
+        // nodes have no primitive to delete and skip this entry.
+        if (node.primitive) {
+            items.push("separator");
+            items.push({
+                label: "Delete",
+                danger: true,
+                onClick: async () => {
+                    await this.deletePrimitiveNode(node);
+                },
+            });
+        }
+
+        this.showFloatingMenu(e.clientX, e.clientY, items);
+    }
+
+    async deletePrimitiveNode(node) {
+        const s = this.plugin.settings;
+        if (node.kind === "container") {
+            s.prContainers = (s.prContainers || []).filter(c => c.id !== node.primitive.id);
+        } else if (node.kind === "reflection") {
+            s.prReflections = (s.prReflections || []).filter(r => r.id !== node.primitive.id);
+            // Also clear references on containers that pointed at this reflection
+            for (const c of (s.prContainers || [])) {
+                if (c.reflectionId === node.primitive.id) c.reflectionId = "";
+            }
+        } else if (node.kind === "alignment") {
+            s.prAlignments = (s.prAlignments || []).filter(a => a.id !== node.primitive.id);
+        } else if (node.kind === "llm") {
+            s.prLLMServices = (s.prLLMServices || []).filter(svc => svc.id !== node.primitive.id);
+            // Clear references on containers
+            for (const c of (s.prContainers || [])) {
+                if (c.llmServiceId === node.primitive.id) c.llmServiceId = "";
+            }
+        } else if (node.kind === "boundary" && node.id.startsWith("boundary-custom-")) {
+            const cbId = node.id.replace(/^boundary-custom-/, "");
+            s.prCustomBoundaries = (s.prCustomBoundaries || []).filter(cb => cb.id !== cbId);
+            // Reset containers that referenced it
+            for (const c of (s.prContainers || [])) {
+                if (c.boundaryDetector === `custom:${cbId}`) c.boundaryDetector = "calendar-week";
+            }
+        }
+        await this.plugin.saveSettings();
+        this.render();
+    }
+
+    openCanvasContextMenu(e) {
+        // Position the new node at the click location, in viewport coordinates.
+        const rect = this.canvasEl.getBoundingClientRect();
+        const vx = (e.clientX - rect.left - this.panX) / this.zoom;
+        const vy = (e.clientY - rect.top - this.panY) / this.zoom;
+
+        const seedPosition = (id) => {
+            if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
+            this.plugin.settings.prGraphLayout[id] = { x: vx, y: vy };
+        };
+
+        this.showFloatingMenu(e.clientX, e.clientY, [
+            { label: "Add…", onClick: null },
+            "separator",
+            {
+                label: "Container",
+                onClick: async () => {
+                    const c = makePRContainer({ name: "New container" });
+                    this.plugin.settings.prContainers.push(c);
+                    seedPosition(`container-${c.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+            {
+                label: "Reflection",
+                onClick: async () => {
+                    const r = makePRReflection();
+                    this.plugin.settings.prReflections.push(r);
+                    seedPosition(`reflection-${r.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+            {
+                label: "Alignment",
+                onClick: async () => {
+                    const a = makePRAlignment();
+                    this.plugin.settings.prAlignments.push(a);
+                    seedPosition(`alignment-${a.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+            {
+                label: "LLM service",
+                onClick: async () => {
+                    const svc = makePRLLMService();
+                    this.plugin.settings.prLLMServices.push(svc);
+                    seedPosition(`llm-${svc.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+            {
+                label: "Custom boundary",
+                onClick: async () => {
+                    const cb = makePRCustomBoundary();
+                    this.plugin.settings.prCustomBoundaries.push(cb);
+                    seedPosition(`boundary-custom-${cb.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+        ]);
     }
 
     // ─── Drag-to-wire (Phase 10b-1) ───
@@ -5195,6 +5437,10 @@ class PRGraphView extends ItemView {
         if (this._nodeDragCleanup) this._nodeDragCleanup();
         if (this._wireDragCleanup) this._wireDragCleanup();
         if (this._wireClickCleanup) this._wireClickCleanup();
+        if (this._ctxMenuCleanup) this._ctxMenuCleanup();
+        // Close any leftover floating menu
+        const menu = document.querySelector(".pr-graph-ctx-menu");
+        if (menu) menu.remove();
     }
 }
 
