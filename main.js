@@ -1259,6 +1259,7 @@ const DEFAULT_SETTINGS = {
     prLLMServices: [],         // LLMService[] — { name, provider, apiKey, model }
     prCustomBoundaries: [],    // CustomBoundary[] — { id, name, scriptPath, description }
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
+    prGraphLayout: {},         // { [nodeId]: { x, y } } — node positions in the graph view
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -1815,6 +1816,10 @@ class MonthlyRitualPlugin extends Plugin {
         this.registerView(CALENDAR_VIEW_TYPE, (leaf) => new RitualCalendarView(leaf, this));
         this.addRibbonIcon("calendar-days", "Zodiac Calendar", () => this.activateCalendarView());
 
+        // Phase 10: Periodic Ritual graph view
+        this.registerView(PR_GRAPH_VIEW_TYPE, (leaf) => new PRGraphView(leaf, this));
+        this.addRibbonIcon("git-fork", "Periodic Ritual Graph", () => this.activatePRGraphView());
+
         // Phase 3: auto-generation on load. Boundary-driven catch-up for any
         // enabled Periodic Ritual containers whose periods have crossed since
         // the last run. Deferred ~2 seconds so other plugins (Moon Phase /
@@ -1837,6 +1842,18 @@ class MonthlyRitualPlugin extends Plugin {
         }
         const leaf = this.app.workspace.getRightLeaf(false);
         await leaf.setViewState({ type: CALENDAR_VIEW_TYPE, active: true });
+        this.app.workspace.revealLeaf(leaf);
+    }
+
+    // Phase 10: open the Periodic Ritual graph view in a new tab.
+    async activatePRGraphView() {
+        const existing = this.app.workspace.getLeavesOfType(PR_GRAPH_VIEW_TYPE);
+        if (existing.length) {
+            this.app.workspace.revealLeaf(existing[0]);
+            return;
+        }
+        const leaf = this.app.workspace.getLeaf(true);
+        await leaf.setViewState({ type: PR_GRAPH_VIEW_TYPE, active: true });
         this.app.workspace.revealLeaf(leaf);
     }
 
@@ -4077,6 +4094,13 @@ class MonthlyRitualPlugin extends Plugin {
             name: "Periodic Ritual: Show hierarchy diagram",
             callback: () => new PRHierarchyModal(this.app, this).open(),
         });
+
+        // Phase 10: open the node-based graph view.
+        this.addCommand({
+            id: "pr-graph",
+            name: "Periodic Ritual: Open graph view",
+            callback: () => this.activatePRGraphView(),
+        });
     }
 
     // Phase 9: try to detect which container the active file belongs to
@@ -4345,6 +4369,435 @@ async function getPhasePeriodsFromHelios(plugin, rangeStart, rangeEnd) {
         new Notice("Could not fetch moon phases from Helios. Is /moon-phases endpoint available?");
         return [];
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PERIODIC RITUAL — Graph view (Phase 10a)
+// ═══════════════════════════════════════════════════════════════
+//
+// Node-based visual representation of the current PR configuration.
+// Containers, reflections, alignments, LLM services, and boundaries
+// are nodes; dataSource and attachment relationships are wires.
+//
+// v1 (10a-1): static rendering. Auto-layout if no saved positions.
+//             Nodes display their key info; wires connect via beziers.
+// v1 (10a-2): pan/zoom + drag nodes + persist positions.
+// v1 (10a-3): click a node to open the settings tab to that primitive.
+//
+// DOM nodes inside an absolutely-positioned viewport, SVG layer
+// behind for the wires. Both scale together via a CSS transform on
+// the viewport. No third-party library — fully custom for PR.
+
+const PR_GRAPH_VIEW_TYPE = "pr-graph-view";
+
+class PRGraphView extends ItemView {
+    constructor(leaf, plugin) {
+        super(leaf);
+        this.plugin = plugin;
+        this.zoom = 1;
+        this.panX = 0;
+        this.panY = 0;
+        this.nodes = [];      // built from settings on render
+        this.wires = [];      // built from settings on render
+    }
+
+    getViewType() { return PR_GRAPH_VIEW_TYPE; }
+    getDisplayText() { return "Periodic Ritual Graph"; }
+    getIcon() { return "git-fork"; }
+
+    async onOpen() {
+        this.render();
+    }
+    async onClose() {}
+
+    // ─── Build the model from settings ───
+
+    buildGraphModel() {
+        const s = this.plugin.settings;
+        const containers = s.prContainers || [];
+        const reflections = s.prReflections || [];
+        const alignments = s.prAlignments || [];
+        const services = s.prLLMServices || [];
+        const customBoundaries = s.prCustomBoundaries || [];
+
+        const nodes = [];
+        const wires = [];
+
+        // Track which boundaries / reflections / services / alignments are
+        // actually referenced — only show used ones to keep the graph clean.
+        const usedBoundaries = new Set();
+        const usedServices = new Set();
+        const usedReflections = new Set();
+        let anyDaily = false;
+
+        for (const c of containers) {
+            const ds = c.dataSource || { type: "daily" };
+            if (ds.type === "daily") anyDaily = true;
+            if (c.boundaryDetector) usedBoundaries.add(c.boundaryDetector);
+            if (c.llmServiceId) usedServices.add(c.llmServiceId);
+            if (c.reflectionId) usedReflections.add(c.reflectionId);
+        }
+
+        // ── Daily source node ──
+        if (anyDaily) {
+            nodes.push({
+                id: "daily",
+                kind: "daily",
+                title: "Daily notes",
+                subtitle: s.dailyNotesFolder || "(vault root)",
+            });
+        }
+
+        // ── Boundary nodes (one per used detector) ──
+        for (const detId of usedBoundaries) {
+            if (detId.startsWith("custom:")) {
+                const cbId = detId.slice("custom:".length);
+                const cb = customBoundaries.find(c => c.id === cbId);
+                nodes.push({
+                    id: `boundary-custom-${cbId}`,
+                    kind: "boundary",
+                    title: cb?.name || "(custom)",
+                    subtitle: "Custom JS",
+                    refKey: detId,
+                    primitiveTab: "boundaries",
+                });
+            } else {
+                const info = BUILT_IN_BOUNDARY_INFO[detId];
+                nodes.push({
+                    id: `boundary-${detId}`,
+                    kind: "boundary",
+                    title: info?.name || detId,
+                    subtitle: detId,
+                    refKey: detId,
+                    primitiveTab: "boundaries",
+                });
+            }
+        }
+
+        // ── Container nodes ──
+        for (const c of containers) {
+            const detector = c.boundaryDetector || "?";
+            nodes.push({
+                id: `container-${c.id}`,
+                kind: "container",
+                title: c.name || "(unnamed)",
+                subtitle: c.enabled ? detector : `${detector} (disabled)`,
+                primitive: c,
+                primitiveTab: "containers",
+            });
+        }
+
+        // ── LLM service nodes (only used ones) ──
+        for (const svc of services) {
+            if (!usedServices.has(svc.id)) continue;
+            nodes.push({
+                id: `llm-${svc.id}`,
+                kind: "llm",
+                title: svc.name || "(unnamed)",
+                subtitle: `${svc.provider}${svc.model ? " / " + svc.model.replace(new RegExp(`^${svc.provider}/`, "i"), "") : ""}`,
+                primitive: svc,
+                primitiveTab: "llm",
+            });
+        }
+
+        // ── Reflection nodes (only used ones) ──
+        for (const r of reflections) {
+            if (!usedReflections.has(r.id)) continue;
+            const flags = [];
+            if (r.useLLM) flags.push("LLM");
+            if (r.replaceAutoLLM) flags.push("replace");
+            nodes.push({
+                id: `reflection-${r.id}`,
+                kind: "reflection",
+                title: r.name || "(unnamed)",
+                subtitle: flags.length > 0 ? flags.join(" + ") : "Q&A only",
+                primitive: r,
+                primitiveTab: "reflection",
+            });
+        }
+
+        // ── Alignment nodes (only those with a containerId) ──
+        for (const a of alignments) {
+            if (!a.containerId) continue;
+            nodes.push({
+                id: `alignment-${a.id}`,
+                kind: "alignment",
+                title: a.name || "(unnamed)",
+                subtitle: a.dataField || "(no field)",
+                primitive: a,
+                primitiveTab: "alignments",
+            });
+        }
+
+        // ── Wires ──
+
+        // dataSource wires
+        for (const c of containers) {
+            const ds = c.dataSource || { type: "daily" };
+            if (ds.type === "container" && ds.containerId) {
+                wires.push({
+                    from: `container-${ds.containerId}`,
+                    to: `container-${c.id}`,
+                    fromSocket: "out",
+                    toSocket: "in-data",
+                    kind: "data-source",
+                });
+            } else if (anyDaily) {
+                wires.push({
+                    from: "daily",
+                    to: `container-${c.id}`,
+                    fromSocket: "out",
+                    toSocket: "in-data",
+                    kind: "data-source",
+                });
+            }
+        }
+
+        // boundary wires
+        for (const c of containers) {
+            if (!c.boundaryDetector) continue;
+            const fromId = c.boundaryDetector.startsWith("custom:")
+                ? `boundary-custom-${c.boundaryDetector.slice("custom:".length)}`
+                : `boundary-${c.boundaryDetector}`;
+            wires.push({
+                from: fromId,
+                to: `container-${c.id}`,
+                fromSocket: "out",
+                toSocket: "in-boundary",
+                kind: "boundary",
+            });
+        }
+
+        // llm service wires
+        for (const c of containers) {
+            if (!c.llmServiceId) continue;
+            wires.push({
+                from: `llm-${c.llmServiceId}`,
+                to: `container-${c.id}`,
+                fromSocket: "out",
+                toSocket: "in-llm",
+                kind: "llm",
+            });
+        }
+
+        // reflection wires
+        for (const c of containers) {
+            if (!c.reflectionId) continue;
+            wires.push({
+                from: `reflection-${c.reflectionId}`,
+                to: `container-${c.id}`,
+                fromSocket: "out",
+                toSocket: "in-reflection",
+                kind: "reflection",
+            });
+        }
+
+        // alignment wires
+        for (const a of alignments) {
+            if (!a.containerId) continue;
+            wires.push({
+                from: `alignment-${a.id}`,
+                to: `container-${a.containerId}`,
+                fromSocket: "out",
+                toSocket: "in-alignment",
+                kind: "alignment",
+            });
+        }
+
+        return { nodes, wires };
+    }
+
+    // ─── Auto-layout ───
+    // Simple grid by kind. Saved positions in prGraphLayout override.
+    layoutNodes(nodes) {
+        const COLS = {
+            daily: 0,
+            boundary: 1,
+            llm: 2,
+            container: 3,
+            reflection: 4,
+            alignment: 5,
+        };
+        const COL_X = 280;
+        const ROW_Y = 140;
+        const PAD_X = 60;
+        const PAD_Y = 60;
+
+        const counters = { daily: 0, boundary: 0, llm: 0, container: 0, reflection: 0, alignment: 0 };
+        const saved = this.plugin.settings.prGraphLayout || {};
+
+        for (const node of nodes) {
+            if (saved[node.id] && typeof saved[node.id].x === "number" && typeof saved[node.id].y === "number") {
+                node.x = saved[node.id].x;
+                node.y = saved[node.id].y;
+                continue;
+            }
+            const col = COLS[node.kind] ?? 0;
+            const row = counters[node.kind]++;
+            node.x = PAD_X + col * COL_X;
+            node.y = PAD_Y + row * ROW_Y;
+        }
+    }
+
+    // ─── Render ───
+
+    render() {
+        const container = this.containerEl.children[1];
+        container.empty();
+        container.classList.add("pr-graph-host");
+
+        // Build model
+        const { nodes, wires } = this.buildGraphModel();
+        this.layoutNodes(nodes);
+        this.nodes = nodes;
+        this.wires = wires;
+
+        if (nodes.length === 0) {
+            const empty = container.createEl("div", { cls: "pr-graph-empty" });
+            empty.createEl("h3", { text: "No Periodic Ritual graph yet" });
+            empty.createEl("p", { text: "Add a container in Settings → Periodic Ritual → Containers, then come back here to see it." });
+            return;
+        }
+
+        // Toolbar
+        const toolbar = container.createEl("div", { cls: "pr-graph-toolbar" });
+        const refreshBtn = toolbar.createEl("button", { text: "↻ Refresh" });
+        refreshBtn.addEventListener("click", () => this.render());
+        const fitBtn = toolbar.createEl("button", { text: "Fit" });
+        fitBtn.addEventListener("click", () => { this.zoom = 1; this.panX = 0; this.panY = 0; this.applyTransform(); });
+        const resetLayoutBtn = toolbar.createEl("button", { text: "Reset layout" });
+        resetLayoutBtn.addEventListener("click", async () => {
+            this.plugin.settings.prGraphLayout = {};
+            await this.plugin.saveSettings();
+            this.render();
+        });
+        const help = toolbar.createEl("span", { cls: "pr-graph-help" });
+        help.setText("Drag empty space to pan • Scroll to zoom • Drag nodes to move • Click a node to edit");
+
+        // Canvas (the scrollable / zoomable area)
+        const canvas = container.createEl("div", { cls: "pr-graph-canvas" });
+        this.canvasEl = canvas;
+        const viewport = canvas.createEl("div", { cls: "pr-graph-viewport" });
+        this.viewportEl = viewport;
+
+        // SVG wire layer
+        const SVG_NS = "http://www.w3.org/2000/svg";
+        const svg = document.createElementNS(SVG_NS, "svg");
+        svg.setAttribute("class", "pr-graph-wires");
+        svg.setAttribute("width", "4000");
+        svg.setAttribute("height", "3000");
+        viewport.appendChild(svg);
+        this.wireSvg = svg;
+
+        // Render nodes
+        for (const node of nodes) {
+            this.renderNode(viewport, node);
+        }
+
+        // Render wires (after nodes so socket positions are known)
+        this.renderWires();
+
+        // Apply current pan/zoom
+        this.applyTransform();
+
+        // Pan/zoom + drag handlers (Phase 10a-2)
+        this.setupPanZoom();
+        this.setupNodeDrag();
+    }
+
+    renderNode(parent, node) {
+        const el = parent.createEl("div", { cls: `pr-graph-node pr-graph-node-${node.kind}` });
+        el.style.left = `${node.x}px`;
+        el.style.top = `${node.y}px`;
+        el.dataset.nodeId = node.id;
+        node.el = el;
+
+        // Header (title)
+        const header = el.createEl("div", { cls: "pr-graph-node-header" });
+        header.createEl("span", { cls: "pr-graph-node-title", text: node.title });
+
+        // Body (subtitle)
+        const body = el.createEl("div", { cls: "pr-graph-node-body" });
+        body.createEl("div", { cls: "pr-graph-node-subtitle", text: node.subtitle });
+
+        // Sockets — input on left, output on right.
+        // Containers have multiple inputs stacked vertically; everything else
+        // has a single output.
+        if (node.kind === "container") {
+            const inputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-in" });
+            const inDefs = [
+                { id: "in-data",       cls: "data-source", label: "data" },
+                { id: "in-boundary",   cls: "boundary",    label: "boundary" },
+                { id: "in-llm",        cls: "llm",         label: "llm" },
+                { id: "in-reflection", cls: "reflection",  label: "reflection" },
+                { id: "in-alignment",  cls: "alignment",   label: "alignment" },
+            ];
+            for (const def of inDefs) {
+                const socket = inputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-in pr-graph-socket-${def.cls}` });
+                socket.dataset.socketId = def.id;
+                socket.title = def.label;
+            }
+            const outputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-out" });
+            const outSocket = outputs.createEl("div", { cls: "pr-graph-socket pr-graph-socket-out pr-graph-socket-data-source" });
+            outSocket.dataset.socketId = "out";
+        } else {
+            const outputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-out" });
+            const outSocket = outputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-out pr-graph-socket-${node.kind}` });
+            outSocket.dataset.socketId = "out";
+        }
+    }
+
+    // Compute the screen position of a socket within the viewport's
+    // coordinate system (NOT the document — viewport coords).
+    socketPos(nodeId, socketId) {
+        const node = this.nodes.find(n => n.id === nodeId);
+        if (!node || !node.el) return { x: 0, y: 0 };
+        const socket = node.el.querySelector(`[data-socket-id="${socketId}"]`);
+        if (!socket) return { x: node.x, y: node.y };
+        // Read the socket's offset relative to the node, then add the node's
+        // x/y position. We use offsetLeft/offsetTop relative to the node.
+        const sx = socket.offsetLeft + socket.offsetWidth / 2;
+        const sy = socket.offsetTop + socket.offsetHeight / 2;
+        // Walk up to the node element to accumulate offsets correctly
+        let acc = { x: 0, y: 0 };
+        let cur = socket.offsetParent;
+        while (cur && cur !== node.el) {
+            acc.x += cur.offsetLeft;
+            acc.y += cur.offsetTop;
+            cur = cur.offsetParent;
+        }
+        return {
+            x: node.x + acc.x + sx,
+            y: node.y + acc.y + sy,
+        };
+    }
+
+    renderWires() {
+        const SVG_NS = "http://www.w3.org/2000/svg";
+        // Clear existing wires
+        while (this.wireSvg.firstChild) this.wireSvg.removeChild(this.wireSvg.firstChild);
+
+        for (const wire of this.wires) {
+            const a = this.socketPos(wire.from, wire.fromSocket);
+            const b = this.socketPos(wire.to, wire.toSocket);
+            const dx = Math.max(60, Math.abs(b.x - a.x) * 0.4);
+            const path = document.createElementNS(SVG_NS, "path");
+            const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
+            path.setAttribute("d", d);
+            path.setAttribute("class", `pr-graph-wire pr-graph-wire-${wire.kind}`);
+            path.setAttribute("fill", "none");
+            this.wireSvg.appendChild(path);
+        }
+    }
+
+    applyTransform() {
+        if (!this.viewportEl) return;
+        this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+
+    // ─── Phase 10a-2: pan, zoom, drag (placeholders for next sub-commit) ───
+    setupPanZoom() { /* filled in 10a-2 */ }
+    setupNodeDrag() { /* filled in 10a-2 */ }
 }
 
 class RitualCalendarView extends ItemView {

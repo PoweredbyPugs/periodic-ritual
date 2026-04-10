@@ -159,6 +159,192 @@
 }
 
 /* ═══════════════════════════════════════
+   PERIODIC RITUAL — Graph view (Phase 10)
+   ═══════════════════════════════════════ */
+
+.pr-graph-host {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+    user-select: none;
+    background: var(--background-primary);
+}
+
+.pr-graph-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    background: var(--background-secondary);
+    flex-shrink: 0;
+}
+
+.pr-graph-toolbar button {
+    background: var(--interactive-normal);
+    border: none;
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 0.85em;
+    color: var(--text-normal);
+}
+
+.pr-graph-toolbar button:hover {
+    background: var(--interactive-hover);
+}
+
+.pr-graph-help {
+    margin-left: auto;
+    color: var(--text-faint);
+    font-size: 0.8em;
+}
+
+.pr-graph-empty {
+    padding: 32px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.pr-graph-canvas {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    cursor: grab;
+    background:
+        radial-gradient(circle, var(--background-modifier-border) 1px, transparent 1px);
+    background-size: 24px 24px;
+}
+
+.pr-graph-canvas:active {
+    cursor: grabbing;
+}
+
+.pr-graph-viewport {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 4000px;
+    height: 3000px;
+    transform-origin: 0 0;
+}
+
+.pr-graph-wires {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    overflow: visible;
+}
+
+.pr-graph-wire {
+    stroke-width: 2px;
+    fill: none;
+}
+
+.pr-graph-wire-data-source {
+    stroke: var(--interactive-accent);
+    stroke-width: 2.5px;
+}
+.pr-graph-wire-boundary {
+    stroke: #4a90e2;
+    stroke-dasharray: 6 4;
+}
+.pr-graph-wire-llm {
+    stroke: #5cb85c;
+    stroke-dasharray: 6 4;
+}
+.pr-graph-wire-reflection {
+    stroke: #a06cd5;
+    stroke-dasharray: 6 4;
+}
+.pr-graph-wire-alignment {
+    stroke: #f0a04b;
+    stroke-dasharray: 2 4;
+}
+
+/* Nodes */
+.pr-graph-node {
+    position: absolute;
+    width: 220px;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+    cursor: pointer;
+    transition: box-shadow 0.15s, border-color 0.15s;
+    z-index: 1;
+}
+
+.pr-graph-node:hover {
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+    border-color: var(--text-muted);
+    z-index: 2;
+}
+
+.pr-graph-node-header {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    background: var(--background-secondary-alt);
+}
+
+.pr-graph-node-title {
+    font-weight: 600;
+    font-size: 0.95em;
+    color: var(--text-normal);
+}
+
+.pr-graph-node-body {
+    padding: 8px 12px;
+}
+
+.pr-graph-node-subtitle {
+    color: var(--text-muted);
+    font-size: 0.8em;
+    font-family: var(--font-monospace);
+}
+
+/* Color stripes per kind on the header */
+.pr-graph-node-daily      .pr-graph-node-header { border-top: 3px solid var(--text-faint); }
+.pr-graph-node-container  .pr-graph-node-header { border-top: 3px solid var(--interactive-accent); }
+.pr-graph-node-boundary   .pr-graph-node-header { border-top: 3px solid #4a90e2; }
+.pr-graph-node-llm        .pr-graph-node-header { border-top: 3px solid #5cb85c; }
+.pr-graph-node-reflection .pr-graph-node-header { border-top: 3px solid #a06cd5; }
+.pr-graph-node-alignment  .pr-graph-node-header { border-top: 3px solid #f0a04b; }
+
+/* Sockets */
+.pr-graph-sockets {
+    position: absolute;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 0;
+}
+
+.pr-graph-sockets-in  { left: -7px;  align-items: flex-start; }
+.pr-graph-sockets-out { right: -7px; align-items: flex-end; top: 50%; transform: translateY(-50%); padding: 0; }
+
+.pr-graph-socket {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid var(--background-secondary);
+    background: var(--text-muted);
+}
+
+.pr-graph-socket-data-source { background: var(--interactive-accent); }
+.pr-graph-socket-boundary    { background: #4a90e2; }
+.pr-graph-socket-llm         { background: #5cb85c; }
+.pr-graph-socket-reflection  { background: #a06cd5; }
+.pr-graph-socket-alignment   { background: #f0a04b; }
+.pr-graph-socket-daily       { background: var(--text-faint); }
+.pr-graph-socket-container   { background: var(--interactive-accent); }
+
+/* ═══════════════════════════════════════
    CALENDAR VIEW
    ═══════════════════════════════════════ */
 
