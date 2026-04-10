@@ -4716,13 +4716,27 @@ class PRGraphView extends ItemView {
         el.dataset.nodeId = node.id;
         node.el = el;
 
-        // Header (title)
+        // Header — title is editable for primitive nodes (Phase 10b-3).
+        // Daily / built-in boundary nodes get a static span instead.
         const header = el.createEl("div", { cls: "pr-graph-node-header" });
-        header.createEl("span", { cls: "pr-graph-node-title", text: node.title });
+        if (node.primitive && (node.kind === "container" || node.kind === "reflection" || node.kind === "alignment" || node.kind === "llm" || (node.kind === "boundary" && node.id.startsWith("boundary-custom-")))) {
+            const titleInput = header.createEl("input", { type: "text", value: node.primitive.name || "" });
+            titleInput.className = "pr-graph-node-title pr-graph-node-title-editable";
+            // Don't trigger node drag when interacting with the input
+            titleInput.addEventListener("mousedown", (e) => e.stopPropagation());
+            titleInput.addEventListener("change", async () => {
+                node.primitive.name = titleInput.value;
+                await this.plugin.saveSettings();
+                node.title = titleInput.value;
+            });
+        } else {
+            header.createEl("span", { cls: "pr-graph-node-title", text: node.title });
+        }
 
-        // Body (subtitle)
+        // Body — subtitle + per-kind inline widgets (Phase 10b-3)
         const body = el.createEl("div", { cls: "pr-graph-node-body" });
         body.createEl("div", { cls: "pr-graph-node-subtitle", text: node.subtitle });
+        this.renderNodeWidgets(body, node);
 
         // Sockets — input on left, output on right.
         // Containers have multiple inputs stacked vertically; everything else
@@ -4749,6 +4763,64 @@ class PRGraphView extends ItemView {
             const outSocket = outputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-out pr-graph-socket-${node.kind}` });
             outSocket.dataset.socketId = "out";
         }
+    }
+
+    // ─── Inline parameter widgets (Phase 10b-3) ───
+    //
+    // Each node body grows a small set of widgets matching its kind. The
+    // emphasis is on the controls a user reaches for most often — toggles,
+    // simple text fields. Heavier config (template paths, system prompts,
+    // questions, etc.) still lives in the regular settings tabs and is
+    // reached via click-to-edit.
+    renderNodeWidgets(body, node) {
+        if (!node.primitive) return;
+
+        const stop = (el) => el.addEventListener("mousedown", (e) => e.stopPropagation());
+
+        const addToggle = (label, get, set) => {
+            const row = body.createEl("div", { cls: "pr-graph-widget-row" });
+            const labelEl = row.createEl("span", { text: label, cls: "pr-graph-widget-label" });
+            const wrap = row.createEl("label", { cls: "pr-graph-widget-toggle" });
+            const input = wrap.createEl("input", { type: "checkbox" });
+            input.checked = !!get();
+            stop(input);
+            input.addEventListener("change", async () => {
+                set(input.checked);
+                await this.plugin.saveSettings();
+                this.render();
+            });
+            wrap.createEl("span", { cls: "pr-graph-widget-toggle-track" });
+            return row;
+        };
+
+        const addText = (label, placeholder, get, set) => {
+            const row = body.createEl("div", { cls: "pr-graph-widget-row" });
+            row.createEl("span", { text: label, cls: "pr-graph-widget-label" });
+            const input = row.createEl("input", { type: "text", value: get() || "", cls: "pr-graph-widget-text" });
+            input.placeholder = placeholder || "";
+            stop(input);
+            input.addEventListener("change", async () => {
+                set(input.value);
+                await this.plugin.saveSettings();
+                this.render();
+            });
+            return row;
+        };
+
+        if (node.kind === "container") {
+            const c = node.primitive;
+            addToggle("Enabled", () => c.enabled, (v) => { c.enabled = v; });
+        } else if (node.kind === "reflection") {
+            const r = node.primitive;
+            addToggle("Send to LLM", () => r.useLLM, (v) => { r.useLLM = v; });
+            addToggle("Replace auto", () => r.replaceAutoLLM, (v) => { r.replaceAutoLLM = v; });
+        } else if (node.kind === "alignment") {
+            const a = node.primitive;
+            addText("Field", "health", () => a.dataField, (v) => { a.dataField = v; });
+        }
+        // LLM service and custom boundary nodes only get the editable name in
+        // the header — model selection and script paths are too complex for
+        // inline widgets and live in the settings tabs via click-to-edit.
     }
 
     // Compute the screen position of a socket within the viewport's
