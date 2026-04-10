@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, parseYaml, requestUrl } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, parseYaml, requestUrl, ToggleComponent } = require("obsidian");
 
 // ═══════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -677,6 +677,71 @@ class PRModelPickerModal extends FuzzySuggestModal {
     getItems() { return this.models; }
     getItemText(m) { return m; }
     onChooseItem(m) { this.onChooseCallback(m); }
+}
+
+// Periodic Ritual: token reference modal. Shows the available naming
+// tokens for a given boundary detector. Opens from the "Syntax reference"
+// link on the container card.
+class PRTokenReferenceModal extends Modal {
+    constructor(app, detectorId) {
+        super(app);
+        this.detectorId = detectorId || "calendar-week";
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h3", { text: "Naming tokens" });
+
+        const subtitle = contentEl.createEl("p");
+        subtitle.style.cssText = "color: var(--text-muted); font-size: 0.9em;";
+        subtitle.setText(`Tokens available for boundary detector: ${this.detectorId}`);
+
+        // Token catalog: the union of common tokens plus per-detector extras.
+        const COMMON = [
+            { token: "{{year}}", desc: "4-digit year, e.g. 2026" },
+            { token: "{{month}}", desc: "2-digit month, e.g. 04" },
+            { token: "{{month-name}}", desc: "Full month name, e.g. April" },
+            { token: "{{day}}", desc: "2-digit day, e.g. 10" },
+            { token: "{{date}}", desc: "ISO date of period start, e.g. 2026-04-10" },
+            { token: "{{cycle}}", desc: "Detector-specific cycle number" },
+        ];
+        const PER_DETECTOR = {
+            "calendar-week": [
+                { token: "{{week}}", desc: "ISO week number, e.g. 15" },
+                { token: "{{week-start}}", desc: "ISO date of week start" },
+                { token: "{{week-end}}", desc: "ISO date of week end" },
+            ],
+            "calendar-month": [
+                { token: "{{month-start}}", desc: "ISO date of 1st of month" },
+                { token: "{{month-end}}", desc: "ISO date of last day of month" },
+            ],
+            "calendar-quarter": [
+                { token: "{{quarter}}", desc: "Quarter number 1-4" },
+                { token: "{{quarter-name}}", desc: "Q1 / Q2 / Q3 / Q4" },
+                { token: "{{quarter-start}}", desc: "ISO date of quarter start" },
+                { token: "{{quarter-end}}", desc: "ISO date of quarter end" },
+            ],
+            "calendar-year": [
+                { token: "{{year-start}}", desc: "ISO date of January 1" },
+                { token: "{{year-end}}", desc: "ISO date of December 31" },
+            ],
+        };
+
+        const all = [...COMMON, ...(PER_DETECTOR[this.detectorId] || [])];
+        const list = contentEl.createEl("div");
+        list.style.cssText = "display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin-top: 8px;";
+        for (const t of all) {
+            const tk = list.createEl("code", { text: t.token });
+            tk.style.cssText = "color: var(--interactive-accent); font-weight: 600;";
+            const desc = list.createEl("span", { text: t.desc });
+            desc.style.color = "var(--text-muted)";
+        }
+
+        const example = contentEl.createEl("p");
+        example.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin-top: 16px;";
+        example.setText("Example: W{{week}}-{{year}} → W15-2026");
+    }
+    onClose() { this.contentEl.empty(); }
 }
 
 // Periodic Ritual: fuzzy picker for the starter system prompts embedded in main.js.
@@ -2742,6 +2807,11 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // Outer tab for Periodic Ritual rebuild. Legacy is the default until
         // the new Containers/Alignments/LLM tabs have content.
         this.outerTab = "legacy";
+        // Per-id expanded state for collapsible PR cards. Not persisted —
+        // resets to expanded (true) on every fresh display() call for ids
+        // that haven't been seen yet.
+        this.prExpandedContainers = {};
+        this.prExpandedServices = {};
     }
 
     // ─── New outer-tab dispatcher (Phase 0) ───
@@ -2829,42 +2899,58 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
     renderPRContainerCard(parent, container, idx) {
         const s = this.plugin.settings;
 
-        const card = parent.createDiv();
-        card.style.cssText = "border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;";
+        // Default to expanded for any id we haven't seen yet
+        if (this.prExpandedContainers[container.id] === undefined) {
+            this.prExpandedContainers[container.id] = true;
+        }
+        const expanded = this.prExpandedContainers[container.id];
 
-        // ── Header row: name + enabled + delete ──
-        const header = card.createDiv();
-        header.style.cssText = "display: flex; align-items: center; gap: 12px; margin-bottom: 12px;";
+        // `card` is `let` because once we know we're expanded we re-bind it
+        // to the inner body wrapper so subsequent `new Setting(card)` calls
+        // append to the right place.
+        let card = parent.createDiv({ cls: "mr-pr-card" });
 
-        const nameInput = header.createEl("input", { type: "text", value: container.name || "" });
+        // ── Header row: chevron + name + enabled toggle + delete ──
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+
+        const chevron = header.createSpan({ cls: "mr-pr-chevron", text: expanded ? "▼" : "▶" });
+        chevron.addEventListener("click", () => {
+            this.prExpandedContainers[container.id] = !expanded;
+            this.display();
+        });
+
+        const nameInput = header.createEl("input", { type: "text", value: container.name || "", cls: "mr-pr-name-input" });
         nameInput.placeholder = "Container name";
-        nameInput.style.cssText = "flex: 1; font-size: 1.05em; font-weight: 600; background: transparent; border: none; color: var(--text-normal); outline: none; border-bottom: 1px solid transparent; padding: 2px 0;";
-        nameInput.addEventListener("focus", () => { nameInput.style.borderBottom = "1px solid var(--background-modifier-border)"; });
-        nameInput.addEventListener("blur", () => { nameInput.style.borderBottom = "1px solid transparent"; });
         nameInput.addEventListener("change", async () => {
             container.name = nameInput.value;
             await this.plugin.saveSettings();
         });
+        // Clicking the name itself shouldn't toggle collapse
+        nameInput.addEventListener("click", e => e.stopPropagation());
 
-        const enabledWrap = header.createDiv();
-        enabledWrap.style.cssText = "display: flex; align-items: center; gap: 6px;";
-        const enabledLabel = enabledWrap.createSpan({ text: "Enabled" });
-        enabledLabel.style.cssText = "color: var(--text-muted); font-size: 0.85em;";
-        const enabledInput = enabledWrap.createEl("input", { type: "checkbox" });
-        enabledInput.checked = !!container.enabled;
-        enabledInput.addEventListener("change", async () => {
-            container.enabled = enabledInput.checked;
-            await this.plugin.saveSettings();
-        });
+        // Enabled toggle (Obsidian's pill style)
+        const toggleWrap = header.createDiv({ cls: "mr-pr-toggle-wrap" });
+        new ToggleComponent(toggleWrap)
+            .setValue(!!container.enabled)
+            .onChange(async (v) => {
+                container.enabled = v;
+                await this.plugin.saveSettings();
+            });
 
-        const deleteBtn = header.createEl("button", { text: "×" });
+        const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
         deleteBtn.title = "Delete container";
-        deleteBtn.style.cssText = "background: none; border: none; color: var(--text-muted); font-size: 1.4em; cursor: pointer; padding: 0 6px; line-height: 1;";
         deleteBtn.addEventListener("click", async () => {
             s.prContainers.splice(idx, 1);
             await this.plugin.saveSettings();
             this.display();
         });
+
+        // Collapsed: stop here, only the header shows.
+        if (!expanded) return;
+
+        // Body wrapper. Re-bind `card` to point at the body so the rest of
+        // this method's `new Setting(card)` calls append inside the body.
+        card = card.createDiv({ cls: "mr-pr-card-body" });
 
         // ── Boundary detector ──
         const detectors = this.plugin.getPRAvailableBoundaryDetectors();
@@ -2937,16 +3023,39 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             });
 
         // ── Naming convention ──
-        new Setting(card)
+        // Compute a live preview against the current period's tokens so the
+        // user sees what their format string will produce right now.
+        let previewText = "";
+        try {
+            const previewData = this.plugin.getPRBoundaryData(container.boundaryDetector, new Date());
+            previewText = container.naming
+                ? this.plugin.resolveTokens(container.naming, previewData.tokens)
+                : "(empty)";
+        } catch (e) {
+            previewText = "(detector not yet implemented)";
+        }
+        const namingSetting = new Setting(card)
             .setName("Naming convention")
-            .setDesc("Tokens vary per detector. Common: {{year}}, {{month}}, {{month-name}}, {{day}}, {{date}}, {{cycle}}. Week: {{week}}, {{week-start}}, {{week-end}}. Month: {{month-start}}, {{month-end}}. Quarter: {{quarter}}, {{quarter-name}}, {{quarter-start}}, {{quarter-end}}. Year: {{year-start}}, {{year-end}}.")
             .addText(t => t
                 .setPlaceholder("W{{week}}-{{year}}")
                 .setValue(container.naming || "")
                 .onChange(async v => {
                     container.naming = v;
                     await this.plugin.saveSettings();
+                    this.display();
                 }));
+        // Replace the default desc with a custom node containing a clickable
+        // syntax reference link and a live preview line.
+        namingSetting.descEl.empty();
+        const refLink = namingSetting.descEl.createEl("a", { text: "Syntax reference", cls: "mr-pr-link" });
+        refLink.addEventListener("click", e => {
+            e.preventDefault();
+            new PRTokenReferenceModal(this.app, container.boundaryDetector || "calendar-week").open();
+        });
+        namingSetting.descEl.createEl("br");
+        const previewLabel = namingSetting.descEl.createSpan({ text: "Currently looks like: " });
+        previewLabel.style.color = "var(--text-faint)";
+        const previewVal = namingSetting.descEl.createSpan({ text: previewText, cls: "mr-pr-preview" });
 
         // ── Metadata placement ──
         new Setting(card)
