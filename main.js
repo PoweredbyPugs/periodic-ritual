@@ -4702,6 +4702,9 @@ class PRGraphView extends ItemView {
         // Pan/zoom + drag handlers (Phase 10a-2)
         this.setupPanZoom();
         this.setupNodeDrag();
+        // Wire drag + wire delete (Phase 10b-1)
+        this.setupWireDrag();
+        this.setupWireClick();
     }
 
     renderNode(parent, node) {
@@ -4792,6 +4795,224 @@ class PRGraphView extends ItemView {
     applyTransform() {
         if (!this.viewportEl) return;
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+
+    // ─── Drag-to-wire (Phase 10b-1) ───
+    //
+    // Mousedown on an output socket starts a wire-drag. A floating ghost
+    // wire follows the cursor. On mouseup over a compatible input socket,
+    // the corresponding setting field gets written; otherwise the drag
+    // is cancelled.
+    //
+    // Compatibility: input/output sockets are typed by their CSS class
+    // (data-source / boundary / llm / reflection / alignment). A wire can
+    // only land on a socket whose type matches its source.
+
+    // Map a node kind to the socket TYPE it outputs.
+    nodeOutputType(kind) {
+        switch (kind) {
+            case "container":  return "data-source";  // containers feed other containers' data input
+            case "daily":      return "data-source";
+            case "boundary":   return "boundary";
+            case "llm":        return "llm";
+            case "reflection": return "reflection";
+            case "alignment":  return "alignment";
+        }
+        return null;
+    }
+
+    // Compatible drop check: source output type must equal target input type,
+    // and the target node must be a container (only containers have inputs).
+    canConnect(fromNode, toNode, toSocketId) {
+        if (!fromNode || !toNode) return false;
+        if (toNode.kind !== "container") return false;
+        const outType = this.nodeOutputType(fromNode.kind);
+        if (!outType) return false;
+        const expectedSocket = `in-${outType}`;
+        return toSocketId === expectedSocket;
+    }
+
+    // Apply a new connection — write the corresponding settings field.
+    async applyConnection(fromNode, toNode, fromSocket, toSocket) {
+        const containers = this.plugin.settings.prContainers || [];
+        if (toNode.kind !== "container") return;
+        const target = containers.find(c => `container-${c.id}` === toNode.id);
+        if (!target) return;
+
+        if (toSocket === "in-data") {
+            if (fromNode.id === "daily") {
+                target.dataSource = { type: "daily" };
+            } else if (fromNode.kind === "container") {
+                const sourceId = fromNode.id.replace(/^container-/, "");
+                if (sourceId === target.id) return; // can't self-reference
+                target.dataSource = { type: "container", containerId: sourceId };
+            }
+        } else if (toSocket === "in-boundary") {
+            if (fromNode.kind === "boundary") {
+                if (fromNode.id.startsWith("boundary-custom-")) {
+                    target.boundaryDetector = `custom:${fromNode.id.replace(/^boundary-custom-/, "")}`;
+                } else {
+                    target.boundaryDetector = fromNode.id.replace(/^boundary-/, "");
+                }
+            }
+        } else if (toSocket === "in-llm") {
+            if (fromNode.kind === "llm") {
+                target.llmServiceId = fromNode.id.replace(/^llm-/, "");
+            }
+        } else if (toSocket === "in-reflection") {
+            if (fromNode.kind === "reflection") {
+                target.reflectionId = fromNode.id.replace(/^reflection-/, "");
+            }
+        } else if (toSocket === "in-alignment") {
+            // Alignments attach via their own containerId field, so the
+            // wire writes the alignment's containerId, not the container's.
+            if (fromNode.kind === "alignment") {
+                const alignmentId = fromNode.id.replace(/^alignment-/, "");
+                const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
+                if (al) al.containerId = target.id;
+            }
+        }
+
+        await this.plugin.saveSettings();
+        this.render();
+    }
+
+    setupWireDrag() {
+        if (!this.viewportEl || !this.wireSvg) return;
+        const SVG_NS = "http://www.w3.org/2000/svg";
+
+        let active = null;       // { fromNode, fromSocketId, ghost: SVGPathElement }
+
+        const onMouseDown = (e) => {
+            if (e.button !== 0) return;
+            const socket = e.target.closest(".pr-graph-socket-out");
+            if (!socket) return;
+            const nodeEl = socket.closest(".pr-graph-node");
+            if (!nodeEl) return;
+            const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+            if (!node) return;
+
+            const ghost = document.createElementNS(SVG_NS, "path");
+            ghost.setAttribute("class", `pr-graph-wire pr-graph-wire-${this.nodeOutputType(node.kind)} pr-graph-wire-ghost`);
+            ghost.setAttribute("fill", "none");
+            this.wireSvg.appendChild(ghost);
+
+            active = {
+                fromNode: node,
+                fromSocketId: socket.dataset.socketId || "out",
+                ghost,
+            };
+            e.preventDefault();
+            e.stopPropagation();
+        };
+
+        const onMouseMove = (e) => {
+            if (!active) return;
+            // Convert mouse position from screen to viewport coordinates
+            const rect = this.canvasEl.getBoundingClientRect();
+            const mx = (e.clientX - rect.left - this.panX) / this.zoom;
+            const my = (e.clientY - rect.top - this.panY) / this.zoom;
+
+            const a = this.socketPos(active.fromNode.id, active.fromSocketId);
+            const dx = Math.max(60, Math.abs(mx - a.x) * 0.4);
+            const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${mx - dx} ${my}, ${mx} ${my}`;
+            active.ghost.setAttribute("d", d);
+        };
+
+        const onMouseUp = async (e) => {
+            if (!active) return;
+            const ghost = active.ghost;
+            const fromNode = active.fromNode;
+            const fromSocketId = active.fromSocketId;
+            active = null;
+            // Always remove the ghost
+            if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
+
+            // Did we drop on an input socket?
+            const target = document.elementFromPoint(e.clientX, e.clientY);
+            if (!target) return;
+            const socket = target.closest(".pr-graph-socket-in");
+            if (!socket) return;
+            const nodeEl = socket.closest(".pr-graph-node");
+            if (!nodeEl) return;
+            const toNode = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+            if (!toNode) return;
+            const toSocketId = socket.dataset.socketId;
+
+            if (!this.canConnect(fromNode, toNode, toSocketId)) {
+                new Notice(`Can't connect ${fromNode.kind} → ${toSocketId}`);
+                return;
+            }
+            await this.applyConnection(fromNode, toNode, fromSocketId, toSocketId);
+        };
+
+        this.viewportEl.addEventListener("mousedown", onMouseDown);
+        window.addEventListener("mousemove", onMouseMove);
+        window.addEventListener("mouseup", onMouseUp);
+
+        this._wireDragCleanup = () => {
+            this.viewportEl?.removeEventListener("mousedown", onMouseDown);
+            window.removeEventListener("mousemove", onMouseMove);
+            window.removeEventListener("mouseup", onMouseUp);
+        };
+    }
+
+    // ─── Wire click to delete (Phase 10b-1) ───
+    setupWireClick() {
+        if (!this.wireSvg) return;
+        // Wires are inside the SVG which has pointer-events: none in CSS.
+        // Re-enable pointer events on individual paths via SVG attribute.
+        for (const path of this.wireSvg.querySelectorAll("path.pr-graph-wire")) {
+            path.style.pointerEvents = "stroke";
+            path.style.cursor = "pointer";
+        }
+        this.wireSvg.style.pointerEvents = "none";  // SVG container stays transparent
+        // Click handler — delegated on the svg element
+        const onClick = async (e) => {
+            const path = e.target.closest("path.pr-graph-wire");
+            if (!path || path.classList.contains("pr-graph-wire-ghost")) return;
+            // Find the wire model that owns this path. Wires render in order
+            // so we can match by index against the model.
+            const paths = Array.from(this.wireSvg.querySelectorAll("path.pr-graph-wire:not(.pr-graph-wire-ghost)"));
+            const idx = paths.indexOf(path);
+            if (idx < 0 || !this.wires[idx]) return;
+            const wire = this.wires[idx];
+            await this.deleteWire(wire);
+        };
+        this.wireSvg.addEventListener("click", onClick);
+        this._wireClickCleanup = () => this.wireSvg?.removeEventListener("click", onClick);
+    }
+
+    // Clear the relationship that this wire represents.
+    async deleteWire(wire) {
+        const containers = this.plugin.settings.prContainers || [];
+        const targetContainerId = wire.to.replace(/^container-/, "");
+        const target = containers.find(c => c.id === targetContainerId);
+
+        switch (wire.kind) {
+            case "data-source":
+                if (target) target.dataSource = { type: "daily" };
+                break;
+            case "boundary":
+                // Don't allow disconnecting the boundary — every container needs one.
+                new Notice("Every container needs a boundary. Pick a different one in settings instead of deleting this wire.");
+                return;
+            case "llm":
+                if (target) target.llmServiceId = "";
+                break;
+            case "reflection":
+                if (target) target.reflectionId = "";
+                break;
+            case "alignment":
+                {
+                    const alignmentId = wire.from.replace(/^alignment-/, "");
+                    const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
+                    if (al) al.containerId = "";
+                }
+                break;
+        }
+        await this.plugin.saveSettings();
+        this.render();
     }
 
     // ─── Click to edit (Phase 10a-3) ───
@@ -4909,10 +5130,10 @@ class PRGraphView extends ItemView {
 
         const onMouseDown = (e) => {
             if (e.button !== 0) return; // left only
+            // Sockets get their own drag handler (setupWireDrag) — bail
+            if (e.target.closest(".pr-graph-socket")) return;
             const nodeEl = e.target.closest(".pr-graph-node");
             if (!nodeEl) return;
-            // Avoid hijacking clicks on sockets (Phase 10b will use them)
-            if (e.target.closest(".pr-graph-socket")) return;
 
             const id = nodeEl.dataset.nodeId;
             const node = this.nodes.find(n => n.id === id);
@@ -4972,6 +5193,8 @@ class PRGraphView extends ItemView {
     async onClose() {
         if (this._panZoomCleanup) this._panZoomCleanup();
         if (this._nodeDragCleanup) this._nodeDragCleanup();
+        if (this._wireDragCleanup) this._wireDragCleanup();
+        if (this._wireClickCleanup) this._wireClickCleanup();
     }
 }
 
@@ -5257,7 +5480,15 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const s = this.plugin.settings;
         if (!Array.isArray(s.prContainers)) s.prContainers = [];
 
-        containerEl.createEl("h2", { text: "Containers" });
+        // Header row: title on the left, "Open graph view" button on the right
+        const headerRow = containerEl.createDiv();
+        headerRow.style.cssText = "display: flex; align-items: center; justify-content: space-between; gap: 12px;";
+        headerRow.createEl("h2", { text: "Containers" }).style.margin = "0";
+        const graphBtn = headerRow.createEl("button", { text: "↗ Open graph view" });
+        graphBtn.style.cssText = "background: var(--interactive-accent); color: var(--text-on-accent); border: none; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 0.9em;";
+        graphBtn.addEventListener("click", () => {
+            this.plugin.activatePRGraphView();
+        });
 
         const intro = containerEl.createEl("p");
         intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";

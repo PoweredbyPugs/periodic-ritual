@@ -264,6 +264,20 @@
     stroke-dasharray: 2 4;
 }
 
+/* Wire being dragged from an output socket toward the cursor */
+.pr-graph-wire-ghost {
+    stroke-opacity: 0.6;
+    stroke-dasharray: 4 4;
+    pointer-events: none;
+}
+
+/* Wire hover state — wires get a thicker stroke and full opacity to
+   tell the user they can be clicked to delete. */
+.pr-graph-wire:hover {
+    stroke-width: 4px;
+    stroke-opacity: 1;
+}
+
 /* Nodes */
 .pr-graph-node {
     position: absolute;
