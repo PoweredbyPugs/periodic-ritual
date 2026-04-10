@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, parseYaml } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, parseYaml, requestUrl } = require("obsidian");
 
 // ═══════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -133,11 +133,23 @@ const MODE_LABELS = {
 //   needsBaseUrl        -> boolean (UI hint)
 //   defaultBaseUrl      -> string  (UI hint)
 //
-// New providers added in Phase 2 polish: openrouter, lmstudio, openclaw.
-// All three are OpenAI-compatible chat/completions schemas with different
-// auth conventions and base URLs. OpenClaw uses the model field for agent
-// selection (e.g. "openclaw/default" or "openclaw/<agentId>") and listing
-// /v1/models returns those agent targets as model ids.
+// All HTTP in the new providers uses Obsidian's requestUrl, not fetch.
+// fetch() from app://obsidian.md triggers CORS preflight which local
+// servers (LM Studio, OpenClaw) don't answer. requestUrl runs server-side
+// in Obsidian's main process and bypasses CORS entirely. The legacy
+// providers (gemini/openai/anthropic) use it too for consistency.
+//
+// Tiny helper because requestUrl returns { status, text, json } and we
+// need to throw on non-2xx with a useful message in every provider.
+async function prHttpJson(opts) {
+    const r = await requestUrl({ throw: false, ...opts });
+    if (r.status < 200 || r.status >= 300) {
+        const detail = (r.text || "").slice(0, 300);
+        throw new Error(`${r.status}${detail ? ": " + detail : ""}`);
+    }
+    return r.json;
+}
+
 const PROVIDERS = {
     gemini: {
         name: "Google Gemini",
@@ -146,9 +158,7 @@ const PROVIDERS = {
         extractText(d) { return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""; },
         async listModels(s) {
             const key = typeof s === "string" ? s : s.apiKey;
-            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
-            if (!r.ok) throw new Error(`${r.status}`);
-            const d = await r.json();
+            const d = await prHttpJson({ url: `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`, method: "GET" });
             return (d.models || []).filter(m => m.supportedGenerationMethods?.includes("generateContent")).map(m => m.name.replace("models/", "")).sort();
         },
     },
@@ -160,9 +170,7 @@ const PROVIDERS = {
         headers(s) { return { Authorization: `Bearer ${s.apiKey}` }; },
         async listModels(s) {
             const key = typeof s === "string" ? s : s.apiKey;
-            const r = await fetch("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${key}` } });
-            if (!r.ok) throw new Error(`${r.status}`);
-            const d = await r.json();
+            const d = await prHttpJson({ url: "https://api.openai.com/v1/models", method: "GET", headers: { Authorization: `Bearer ${key}` } });
             return (d.data || []).filter(m => m.id.startsWith("gpt") || m.id.startsWith("o")).map(m => m.id).sort();
         },
     },
@@ -174,9 +182,7 @@ const PROVIDERS = {
         headers(s) { return { "x-api-key": s.apiKey, "anthropic-version": "2023-06-01" }; },
         async listModels(s) {
             const key = typeof s === "string" ? s : s.apiKey;
-            const r = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": key, "anthropic-version": "2023-06-01" } });
-            if (!r.ok) throw new Error(`${r.status}`);
-            const d = await r.json();
+            const d = await prHttpJson({ url: "https://api.anthropic.com/v1/models", method: "GET", headers: { "x-api-key": key, "anthropic-version": "2023-06-01" } });
             return (d.data || []).map(m => m.id).sort();
         },
     },
@@ -195,9 +201,7 @@ const PROVIDERS = {
         },
         async listModels(s) {
             const key = typeof s === "string" ? s : s.apiKey;
-            const r = await fetch("https://openrouter.ai/api/v1/models", { headers: { Authorization: `Bearer ${key}` } });
-            if (!r.ok) throw new Error(`${r.status}`);
-            const d = await r.json();
+            const d = await prHttpJson({ url: "https://openrouter.ai/api/v1/models", method: "GET", headers: { Authorization: `Bearer ${key}` } });
             return (d.data || []).map(m => m.id).sort();
         },
     },
@@ -219,9 +223,7 @@ const PROVIDERS = {
             if (typeof s === "string") s = { apiKey: s };
             const base = (s.baseUrl || "http://localhost:1234/v1").replace(/\/+$/, "");
             const headers = s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
-            const r = await fetch(`${base}/models`, { headers });
-            if (!r.ok) throw new Error(`${r.status}`);
-            const d = await r.json();
+            const d = await prHttpJson({ url: `${base}/models`, method: "GET", headers });
             return (d.data || []).map(m => m.id).sort();
         },
     },
@@ -234,8 +236,9 @@ const PROVIDERS = {
             return `${base}/v1/chat/completions`;
         },
         // OpenClaw selects the agent via the `model` field. The user picks
-        // a model id like "openclaw/default" or "openclaw/<agentId>" from the
-        // listModels picker — we just pass it through unchanged.
+        // a model id like "openclaw/default", "openclaw/main", or
+        // "openclaw/<agentId>" from the listModels picker — we just pass
+        // it through unchanged.
         buildBody(prompt, s, sys) {
             return {
                 model: s.model || "openclaw/default",
@@ -244,17 +247,17 @@ const PROVIDERS = {
         },
         extractText(d) { return d.choices?.[0]?.message?.content?.trim() || ""; },
         headers(s) {
-            // Auth depends on the gateway config (token/proxy/open).
-            // Send Bearer only if a key is set; open mode ignores it.
+            // Auth depends on the gateway config (token / proxy / open).
+            // If the gateway is in token mode, the API key is REQUIRED;
+            // requests without it return 401. If it's in open mode, the
+            // header is ignored. We always send Bearer when a key is set.
             return s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
         },
         async listModels(s) {
             if (typeof s === "string") s = { apiKey: s };
             const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
             const headers = s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
-            const r = await fetch(`${base}/v1/models`, { headers });
-            if (!r.ok) throw new Error(`${r.status}`);
-            const d = await r.json();
+            const d = await prHttpJson({ url: `${base}/v1/models`, method: "GET", headers });
             return (d.data || []).map(m => m.id).sort();
         },
     },
@@ -1589,13 +1592,19 @@ class MonthlyRitualPlugin extends Plugin {
                 "Content-Type": "application/json",
                 ...(provider.headers ? provider.headers(service) : {}),
             };
-            const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-            if (!r.ok) {
-                const errText = await r.text();
-                throw new Error(`${r.status}: ${errText.slice(0, 300)}`);
+            // requestUrl bypasses CORS — required for local providers like
+            // LM Studio and OpenClaw whose servers don't return CORS headers.
+            const r = await requestUrl({
+                url,
+                method: "POST",
+                headers,
+                body: JSON.stringify(body),
+                throw: false,
+            });
+            if (r.status < 200 || r.status >= 300) {
+                throw new Error(`${r.status}: ${(r.text || "").slice(0, 300)}`);
             }
-            const data = await r.json();
-            responseText = provider.extractText(data);
+            responseText = provider.extractText(r.json);
         } catch (e) {
             new Notice(`${container.name}: LLM call failed — ${e.message}`);
             console.error("Periodic Ritual LLM error:", e);
@@ -2906,7 +2915,9 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // API key (password)
         new Setting(card)
             .setName("API key")
-            .setDesc(provDef?.needsBaseUrl ? "Optional for local providers" : "")
+            .setDesc(provDef?.needsBaseUrl
+                ? "Required if your local gateway has auth enabled (e.g. OpenClaw with auth.mode: token). Leave blank for open mode."
+                : "")
             .addText(t => {
                 t.setPlaceholder("sk-... / AIza... / sk-ant-... / sk-or-...")
                     .setValue(service.apiKey || "")
@@ -2938,7 +2949,9 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                             new Notice(`Unknown provider: ${service.provider}`);
                             return;
                         }
-                        // Local providers don't need an API key. Cloud providers do.
+                        // Cloud providers always require a key. Local providers
+                        // (LM Studio / OpenClaw) might or might not — we let
+                        // the request go and surface the 401 if it comes back.
                         if (!provider.needsBaseUrl && !service.apiKey) {
                             new Notice("Set the API key first");
                             return;
