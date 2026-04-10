@@ -566,20 +566,41 @@ function makePRReflection(overrides = {}) {
     return Object.assign({
         id: "rf-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
         name: "New reflection",
-        questions: [],   // [{ text: string }]
-        // How this reflection interacts with auto-aggregation when attached
-        // to a container:
-        // "manual" — replaces auto LLM. The container's auto-LLM is skipped
-        //            at boundary; the user runs the reflection command to
-        //            fill the frontmatter via Q&A + LLM.
-        // "both"   — auto LLM still runs at boundary. The reflection command
-        //            can be run later to re-summarize with answers AND the
-        //            existing frontmatter as additional context.
-        mode: "manual",
+        questions: [],
+        // Two independent toggles control how this reflection interacts
+        // with the LLM and the container's auto-aggregation:
+        //
+        // useLLM:
+        //   false (default) — the reflection just collects answers and
+        //                     writes them to each question's output field.
+        //                     No LLM call from the reflection. The container's
+        //                     auto-LLM at boundary may still run (controlled
+        //                     by replaceAutoLLM).
+        //   true            — after collecting answers, the plugin runs an
+        //                     LLM call with the answers, the daily data, and
+        //                     the container's system prompt + this profile's
+        //                     prepend. Output is merged into the container's
+        //                     frontmatter.
+        //
+        // replaceAutoLLM:
+        //   false (default) — the container's auto-LLM at boundary still
+        //                     runs as normal. The reflection is additive.
+        //   true            — the container's auto-LLM at boundary is
+        //                     suppressed. The user runs reflection on demand
+        //                     to fill (or not fill) the note.
+        //
+        // The four combinations:
+        //   F/F: Auto-LLM at boundary. Reflection collects manual notes
+        //        as a side channel.
+        //   T/F: Auto-LLM at boundary. Reflection can also call LLM later
+        //        with answers + previous frontmatter as context (re-run).
+        //   F/T: No LLM at all. Pure Q&A flow — questions in, answers to
+        //        fields out, done.
+        //   T/T: No auto. Reflection-driven LLM call when the user runs it.
+        useLLM: false,
+        replaceAutoLLM: false,
         // Optional markdown text prepended to the container's system prompt
-        // during reflection runs (only). Lets the user say e.g. "Weight the
-        // user's answers more heavily than the daily data, and quote at
-        // least one phrase from each answer in the summary."
+        // during reflection LLM runs only. Only relevant when useLLM is true.
         promptPrepend: "",
     }, overrides);
 }
@@ -2432,11 +2453,11 @@ class MonthlyRitualPlugin extends Plugin {
             // Skipped silently when not configured.
             //
             // Phase 6 (rework): also skipped when the attached reflection
-            // profile is in "manual" mode — in that case the user runs
-            // reflection later to fill the frontmatter via Q&A + LLM. No
-            // attached reflection or "both" mode = auto-LLM still runs here.
+            // profile has replaceAutoLLM=true — in that case the user runs
+            // reflection on demand instead. No attached reflection or
+            // replaceAutoLLM=false = auto-LLM still runs here.
             const reflection = this.getPRReflectionForContainer(container);
-            const skipAutoLLM = reflection && (reflection.mode || "manual") === "manual";
+            const skipAutoLLM = !!(reflection && reflection.replaceAutoLLM);
             const range = { start: data.start, end: data.end };
             if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM) {
                 await this.runPRLLMAggregation(container, file, range, opts);
@@ -2444,8 +2465,8 @@ class MonthlyRitualPlugin extends Plugin {
 
             // Phase 7: alignment passes. Run after main aggregation so the
             // alignment writes don't get clobbered. Skipped when the attached
-            // reflection is in "manual" mode — runPRContainerReflection runs
-            // them then so manual-mode containers still get alignments.
+            // reflection replaces auto-LLM — runPRContainerReflection runs
+            // them then so the user still gets alignment output.
             if (!skipAutoLLM) {
                 await this.runPRAlignmentsForContainer(container, file, range, opts);
             }
@@ -2608,15 +2629,24 @@ class MonthlyRitualPlugin extends Plugin {
 
         // Reflection answers section. The questions live on the reflection
         // profile (passed in via opts.reflection) since Phase 6 rework moved
-        // them out of the container.
+        // them out of the container. When opts.injectedVars is present, the
+        // resolved context that was shown to the user in the modal also
+        // gets sent to the LLM as a > blockquote line under each question,
+        // so the model sees what the user was responding to.
         const reflectionQuestions = opts.reflection?.questions || [];
+        const injected = Array.isArray(opts.injectedVars) ? opts.injectedVars : [];
         if (Array.isArray(opts.answers) && opts.answers.length > 0 && reflectionQuestions.length > 0) {
             parts.push("# Reflection answers", "");
             for (let i = 0; i < reflectionQuestions.length; i++) {
                 const ans = (opts.answers[i] || "").trim();
                 if (!ans) continue;
-                parts.push(`**${reflectionQuestions[i].text}**`);
-                parts.push(ans);
+                parts.push(`**Q: ${reflectionQuestions[i].text}**`);
+                const ctx = (injected[i] || "").trim();
+                if (ctx) {
+                    // Render multi-line context as multiple > lines
+                    for (const line of ctx.split("\n")) parts.push(`> ${line}`);
+                }
+                parts.push(`A: ${ans}`);
                 parts.push("");
             }
             parts.push("");
@@ -2820,10 +2850,12 @@ class MonthlyRitualPlugin extends Plugin {
         return (this.settings.prReflections || []).find(r => r.id === container.reflectionId) || null;
     }
 
-    // Open the reflection modal for a container, then on submit re-run LLM
-    // aggregation with the answers attached. In "both" mode, also pass the
-    // file's existing frontmatter as additional context so the LLM builds
-    // on the previous auto-summary instead of starting fresh.
+    // Open the reflection modal. On submit:
+    //   1. Always: write each answer to its configured output field.
+    //   2. If reflection.useLLM: run LLM aggregation with answers + injected
+    //      context + (when not replacing auto) previous frontmatter.
+    //   3. If reflection.replaceAutoLLM: alignments were skipped at boundary,
+    //      so run them now. Otherwise they already ran in generatePRContainerNote.
     async runPRContainerReflection(container) {
         if (!container) { new Notice("No container provided"); return; }
 
@@ -2836,8 +2868,11 @@ class MonthlyRitualPlugin extends Plugin {
             new Notice(`Reflection "${reflection.name}" has no questions. Add some in the Reflection tab.`);
             return;
         }
-        if (!container.llmServiceId || !container.systemPromptFile) {
-            new Notice(`${container.name}: reflection requires both an LLM service and a system prompt`);
+        // LLM service + system prompt are only required when this reflection
+        // actually calls the LLM. Pure-Q&A reflections (useLLM=false) work
+        // on containers without any LLM setup.
+        if (reflection.useLLM && (!container.llmServiceId || !container.systemPromptFile)) {
+            new Notice(`${container.name}: reflection with "Send answers to LLM" enabled requires both an LLM service and a system prompt on the container`);
             return;
         }
 
@@ -2847,48 +2882,59 @@ class MonthlyRitualPlugin extends Plugin {
             return;
         }
 
-        const periodEndDate = new Date(container.lastGeneratedEnd);
-        let range;
-        try {
-            range = await this.getPRBoundaryData(container.boundaryDetector, periodEndDate);
-        } catch (e) {
-            new Notice(`${container.name}: could not resolve period — ${e.message}`);
-            return;
+        // Range is needed for the LLM call and the alignment passes. Pure
+        // Q&A reflections don't need it — skip the resolution if everything
+        // is going to be no-ops anyway.
+        let range = null;
+        if (reflection.useLLM || reflection.replaceAutoLLM) {
+            try {
+                range = await this.getPRBoundaryData(container.boundaryDetector, new Date(container.lastGeneratedEnd));
+            } catch (e) {
+                if (reflection.useLLM) {
+                    new Notice(`${container.name}: could not resolve period — ${e.message}`);
+                    return;
+                }
+                // For pure replaceAutoLLM with no LLM call, alignments will
+                // be skipped silently below if range is null.
+            }
         }
 
         // Resolve variable injection for each question before opening the
-        // modal. The modal displays whatever string we put in injectedVars[i]
-        // above question i — Daily Ritual uses the same pattern.
+        // modal. The modal displays the resolved string above each question.
+        // The same array is also sent to the LLM (when useLLM is on) so the
+        // model sees the context the user was responding to.
         const injectedVars = [];
         for (const q of reflection.questions) {
             injectedVars.push(await this.resolvePRInjectedVar(q, container));
         }
 
-        // Reuse the existing ReflectionModal class — it only reads q.text
-        // from each question and onSubmit gets an array of answer strings.
         new ReflectionModal(this.app, reflection.questions, injectedVars, async (answers) => {
-            // Phase 6 (rework): write each answer to its configured output
-            // field BEFORE the LLM call. Two reasons:
-            //   1. The raw answer is persisted regardless of LLM success.
-            //   2. In "both" mode the LLM sees the answer in the existing
-            //      frontmatter, reinforcing it.
-            // If the user configured an output field that overlaps with a
-            // key the LLM is going to write, the LLM wins (last write).
+            // Step 1 — always: write each answer to its configured output
+            // field. Persists raw answers regardless of LLM success or
+            // whether the LLM is used at all.
             for (let i = 0; i < reflection.questions.length; i++) {
                 await this.writePRAnswerToField(file, reflection.questions[i], answers[i]);
             }
 
-            const includePreviousFrontmatter = (reflection.mode || "manual") === "both";
-            await this.runPRLLMAggregation(container, file, range, {
-                answers,
-                includePreviousFrontmatter,
-                reflection,
-            });
-            // Phase 7: also run any alignments attached to this container.
-            // In manual mode this is the only place alignments fire, since
-            // generatePRContainerNote skips them when the attached reflection
-            // is in manual mode.
-            await this.runPRAlignmentsForContainer(container, file, range, {});
+            // Step 2 — optional LLM call. The reflection's useLLM toggle
+            // controls whether this fires.
+            if (reflection.useLLM) {
+                await this.runPRLLMAggregation(container, file, range, {
+                    answers,
+                    injectedVars,
+                    includePreviousFrontmatter: !reflection.replaceAutoLLM,
+                    reflection,
+                });
+            }
+
+            // Step 3 — alignments. Only fire here when the reflection
+            // suppressed the boundary auto-aggregation; otherwise they
+            // already ran in generatePRContainerNote and we'd duplicate.
+            if (reflection.replaceAutoLLM && range) {
+                await this.runPRAlignmentsForContainer(container, file, range, {});
+            }
+
+            new Notice(`${container.name}: reflection complete`);
         }).open();
     }
 
@@ -4413,8 +4459,8 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // ── Reflection picker (Phase 6 rework) ──
         // Single dropdown referencing a reflection profile from the
         // Reflection tab. None = no reflection (auto-LLM only). Picking a
-        // profile activates Q&A; the profile's mode controls whether
-        // auto-LLM still runs or is replaced.
+        // profile activates Q&A; the profile's toggles (useLLM,
+        // replaceAutoLLM) control how it interacts with the LLM.
         const reflections = s.prReflections || [];
         new Setting(card)
             .setName("Reflection")
@@ -4422,8 +4468,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             .addDropdown(dd => {
                 dd.addOption("", "— None —");
                 for (const r of reflections) {
-                    const modeLabel = (r.mode || "manual") === "both" ? "both" : "manual";
-                    dd.addOption(r.id, `${r.name || "(unnamed)"} (${modeLabel})`);
+                    dd.addOption(r.id, r.name || "(unnamed)");
                 }
                 dd.setValue(container.reflectionId || "");
                 dd.onChange(async v => {
@@ -4516,33 +4561,44 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const body = card.createDiv({ cls: "mr-pr-card-body" });
 
-        // Mode dropdown
+        // Send answers to LLM toggle
         new Setting(body)
-            .setName("Mode")
-            .setDesc("Manual: replaces the container's auto-LLM. The note is created from the template only at boundary; you run reflection later to fill the frontmatter via Q&A. Both: auto-LLM still runs at boundary; you can re-run reflection later to re-summarize with answers + previous frontmatter as context.")
-            .addDropdown(dd => {
-                dd.addOption("manual", "Manual (Q&A on demand, replaces auto-LLM)");
-                dd.addOption("both", "Both (auto-LLM at boundary + reflection on demand)");
-                dd.setValue(reflection.mode || "manual");
-                dd.onChange(async v => {
-                    reflection.mode = v;
+            .setName("Send answers to LLM")
+            .setDesc("When on, after the user submits answers the plugin runs an LLM call with the answers, the daily data, and the container's system prompt. The LLM output is merged into the container's frontmatter. When off, the reflection just writes each answer to its configured output field and stops — no LLM call.")
+            .addToggle(t => t
+                .setValue(!!reflection.useLLM)
+                .onChange(async v => {
+                    reflection.useLLM = v;
                     await this.plugin.saveSettings();
-                });
-            });
+                    this.display();
+                }));
 
-        // Optional system prompt prepend
+        // Replace auto-LLM toggle
         new Setting(body)
-            .setName("Prompt prepend (optional)")
-            .setDesc("Markdown text layered on top of the container's system prompt during reflection runs. Use it to weight answers heavier than the daily data, override the output format, etc.")
-            .addTextArea(t => {
-                t.setValue(reflection.promptPrepend || "")
-                    .onChange(async v => {
-                        reflection.promptPrepend = v;
-                        await this.plugin.saveSettings();
-                    });
-                t.inputEl.rows = 3;
-                t.inputEl.style.width = "100%";
-            });
+            .setName("Replace container's auto-LLM at boundary")
+            .setDesc("When on, the container's auto-LLM aggregation at boundary is suppressed — the note is created from the template only, and you run reflection later to fill it. When off, the container's auto-LLM still runs at boundary as normal, and reflection is additive (you can run it any time).")
+            .addToggle(t => t
+                .setValue(!!reflection.replaceAutoLLM)
+                .onChange(async v => {
+                    reflection.replaceAutoLLM = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Prompt prepend — only meaningful when useLLM is on
+        if (reflection.useLLM) {
+            new Setting(body)
+                .setName("Prompt prepend (optional)")
+                .setDesc("Markdown text layered on top of the container's system prompt during reflection LLM runs only. Use it to weight answers heavier than the daily data, override the output format, etc.")
+                .addTextArea(t => {
+                    t.setValue(reflection.promptPrepend || "")
+                        .onChange(async v => {
+                            reflection.promptPrepend = v;
+                            await this.plugin.saveSettings();
+                        });
+                    t.inputEl.rows = 3;
+                    t.inputEl.style.width = "100%";
+                });
+        }
 
         // Questions list
         const qHeader = new Setting(body)
