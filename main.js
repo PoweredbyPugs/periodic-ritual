@@ -2112,7 +2112,10 @@ class MonthlyRitualPlugin extends Plugin {
 
     async onload() {
         await this.loadSettings();
-        this.addSettingTab(new MonthlyRitualSettingTab(this.app, this));
+        // Capture the settings tab instance so the graph view can talk to it
+        // directly (set outerTab + scroll to a card on double-click).
+        this.settingTab = new MonthlyRitualSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
         this.registerCommands();
 
         this.registerView(CALENDAR_VIEW_TYPE, (leaf) => new RitualCalendarView(leaf, this));
@@ -7180,21 +7183,34 @@ class PRGraphView extends ItemView {
 
     // ─── Click to edit ───
     //
-    // Double-clicking a node opens Obsidian's settings modal, switches to
-    // the Periodic Ritual plugin tab, sets the outer tab to the one that
-    // owns the primitive, AND scrolls to the specific card with a brief
-    // flash highlight so the user lands exactly on the thing they clicked.
+    // Double-clicking a node opens Obsidian's settings modal, switches the
+    // outer tab to the one that owns the primitive, AND scrolls to the
+    // specific card with a brief flash highlight so the user lands exactly
+    // on the thing they clicked.
+    //
+    // Uses this.plugin.settingTab — captured at addSettingTab time — as the
+    // direct reference to our settings tab instance instead of fishing
+    // through Obsidian's internal lists.
     onNodeClick(node) {
         if (!node || !node.primitiveTab) {
             // Daily / built-in boundary nodes have no primitive to edit
             return;
         }
-        const tab = node.primitiveTab;
+        const ourTab = this.plugin.settingTab;
+        if (!ourTab || typeof ourTab.display !== "function") {
+            new Notice("Could not access Periodic Ritual settings tab");
+            return;
+        }
         const setting = this.app.setting;
         if (!setting) {
             new Notice("Could not open settings — Obsidian setting API missing");
             return;
         }
+
+        // Set the outer tab BEFORE openTabById, so when openTabById
+        // triggers our display() the right outer tab is already active.
+        ourTab.outerTab = node.primitiveTab;
+
         try {
             setting.open();
             setting.openTabById("monthly-ritual");
@@ -7202,27 +7218,23 @@ class PRGraphView extends ItemView {
             console.error("Periodic Ritual: failed to open settings", e);
             return;
         }
-        // Find the active settings tab instance and switch its outer tab.
-        // Obsidian doesn't expose this directly, but we can find our tab
-        // through the plugin's setting tab list.
-        const settingTabs = setting.settingTabs || [];
-        const ourTab = settingTabs.find(t => t.id === "monthly-ritual" || t.plugin === this.plugin);
-        if (!ourTab || typeof ourTab.display !== "function") return;
-        ourTab.outerTab = tab;
-        ourTab.display();
 
-        // Scroll to and flash the matching card. Defer until display() has
-        // painted — requestAnimationFrame is enough in most cases, but a
-        // 50ms setTimeout is more reliable for the modal's layout.
-        const targetId = node.primitive?.id;
-        if (!targetId) return;
+        // Defensive: re-call display() in case Obsidian's openTabById
+        // didn't re-render with our new outerTab. Then scroll to the card.
         setTimeout(() => {
-            const card = ourTab.containerEl.querySelector(`[data-pr-card-id="${targetId}"]`);
-            if (!card) return;
-            card.scrollIntoView({ behavior: "smooth", block: "center" });
-            card.classList.add("pr-card-flash");
-            setTimeout(() => card.classList.remove("pr-card-flash"), 1500);
-        }, 60);
+            try {
+                ourTab.display();
+            } catch (e) { /* ignore */ }
+            const targetId = node.primitive?.id;
+            if (!targetId) return;
+            setTimeout(() => {
+                const card = ourTab.containerEl.querySelector(`[data-pr-card-id="${targetId}"]`);
+                if (!card) return;
+                card.scrollIntoView({ behavior: "smooth", block: "center" });
+                card.classList.add("pr-card-flash");
+                setTimeout(() => card.classList.remove("pr-card-flash"), 1500);
+            }, 50);
+        }, 50);
     }
 
     // ─── Pan, zoom, drag (Phase 10a-2) ───
