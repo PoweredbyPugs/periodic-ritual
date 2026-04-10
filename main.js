@@ -3214,13 +3214,21 @@ class MonthlyRitualPlugin extends Plugin {
     // Walk all enabled containers and catch each one up to the current period.
     // Called from onload when prAutoGenerateOnLoad is true, or manually via
     // the "Catch up missed notes" command.
+    //
+    // Phase 8c: containers are processed in topological order based on
+    // dataSource dependencies. If container A reads from container B
+    // (A.dataSource = container:B), B must generate its current note
+    // BEFORE A so A's auto-LLM can find the fresh source data. The sort
+    // walks the dependency graph and processes leaves (sources) first.
     async runPRAutoGenerate() {
-        const containers = (this.settings.prContainers || []).filter(c => c.enabled);
-        if (containers.length === 0) {
+        const all = (this.settings.prContainers || []).filter(c => c.enabled);
+        if (all.length === 0) {
             new Notice("Periodic Ritual: no enabled containers");
             return;
         }
-        for (const container of containers) {
+
+        const sorted = this.toposortPRContainers(all);
+        for (const container of sorted) {
             try {
                 await this.catchUpPRContainer(container);
             } catch (e) {
@@ -3228,6 +3236,40 @@ class MonthlyRitualPlugin extends Plugin {
                 new Notice(`Catch-up failed for ${container.name}: ${e.message}`);
             }
         }
+    }
+
+    // Topological sort of containers by dataSource dependencies.
+    // Children (sources) come before parents (consumers). Containers with
+    // no container dataSource are leaves and can be processed in any order.
+    // Cycles are broken by falling back to original order with a warning.
+    toposortPRContainers(containers) {
+        const byId = new Map(containers.map(c => [c.id, c]));
+        const visited = new Set();
+        const visiting = new Set();
+        const result = [];
+
+        const visit = (c) => {
+            if (visited.has(c.id)) return;
+            if (visiting.has(c.id)) {
+                console.warn(`Periodic Ritual: dataSource cycle detected at "${c.name}". Falling back to insertion order for cycle members.`);
+                return;
+            }
+            visiting.add(c.id);
+            const ds = c.dataSource;
+            if (ds && ds.type === "container" && ds.containerId) {
+                const dep = byId.get(ds.containerId);
+                if (dep) visit(dep);
+                // If the dep is disabled or not in the enabled set, we just
+                // skip — A will read whatever is on disk for B even if B
+                // wasn't generated this run.
+            }
+            visiting.delete(c.id);
+            visited.add(c.id);
+            result.push(c);
+        };
+
+        for (const c of containers) visit(c);
+        return result;
     }
 
     // For one container: figure out which periods have been crossed since
