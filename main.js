@@ -541,6 +541,212 @@ function makePRLLMService(overrides = {}) {
     }, overrides);
 }
 
+// ─── Periodic Ritual: Custom boundary factory (Phase 4c+) ───
+function makePRCustomBoundary(overrides = {}) {
+    return Object.assign({
+        id: "cb-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New custom boundary",
+        scriptPath: "",   // path to a .js file in the vault
+        // Optional markdown text. When this boundary is used by a container
+        // and the container runs LLM aggregation, this description gets
+        // prepended to the system prompt as orienting context. Tells the LLM
+        // what kind of period it's looking at, even when the calculation
+        // happens in the user's own JS module.
+        description: "",
+    }, overrides);
+}
+
+// ─── Periodic Ritual: Built-in boundary info (Phase 4c) ───
+// Registry of metadata for the built-in detectors. Each entry has:
+//   name: display name (matches getPRAvailableBoundaryDetectors label, ish)
+//   description: orienting markdown text. Used in two places:
+//     1. The Boundaries tab so the user can see what each detector does.
+//     2. Prepended to the LLM system prompt during aggregation when a
+//        container is using this detector, so the LLM knows what kind
+//        of period it's summarizing.
+//   tokens: list of available token names for the naming convention
+//   source: (calendar detectors only) standalone JS module source the
+//     user can fork as a custom boundary if they want to modify the
+//     calculation. Helios detectors are not forkable here because they
+//     depend on the Moon Phase plugin's HTTP API and the plugin instance
+//     context — the user would have to write their own helios client.
+const BUILT_IN_BOUNDARY_INFO = {
+    "calendar-week": {
+        name: "Calendar Week",
+        description: "ISO calendar week (Monday through Sunday by default). One period spans 7 days.",
+        tokens: ["year", "month", "month-name", "day", "date", "week", "week-start", "week-end"],
+        source:
+`// Calendar Week boundary detector — fork of the built-in.
+// Returns the ISO week containing the given date.
+//
+// To use: save this file in your vault, then in Settings -> Boundaries
+// add a custom boundary pointing at it. The plugin will call this
+// function with a Date and expects { start, end, tokens } back.
+
+function getISOWeek(d) {
+    const target = new Date(d.valueOf());
+    const dayNr = (d.getDay() + 6) % 7;
+    target.setDate(target.getDate() - dayNr + 3);
+    const firstThursday = target.valueOf();
+    target.setMonth(0, 1);
+    if (target.getDay() !== 4) {
+        target.setMonth(0, 1 + ((4 - target.getDay()) + 7) % 7);
+    }
+    return 1 + Math.ceil((firstThursday - target) / 604800000);
+}
+function getWeekStart(d) {
+    const day = d.getDay();
+    const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+    return new Date(d.getFullYear(), d.getMonth(), diff);
+}
+function getWeekEnd(d) {
+    const start = getWeekStart(d);
+    return new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6);
+}
+function fmt(d) {
+    return d.toISOString().slice(0, 10);
+}
+function monthName(d) {
+    return d.toLocaleString("default", { month: "long" });
+}
+
+module.exports = function(date) {
+    const d = date || new Date();
+    const ws = getWeekStart(d);
+    const we = getWeekEnd(d);
+    return {
+        start: ws,
+        end: we,
+        tokens: {
+            year: String(d.getFullYear()),
+            month: String(d.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(d),
+            day: String(d.getDate()).padStart(2, "0"),
+            date: fmt(ws),
+            week: String(getISOWeek(d)),
+            "week-start": fmt(ws),
+            "week-end": fmt(we),
+        },
+    };
+};
+`,
+    },
+    "calendar-month": {
+        name: "Calendar Month",
+        description: "Calendar month from the 1st through the last day. One period spans 28-31 days.",
+        tokens: ["year", "month", "month-name", "day", "date", "month-start", "month-end", "cycle"],
+        source:
+`// Calendar Month boundary detector — fork of the built-in.
+
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = function(date) {
+    const d = date || new Date();
+    const start = new Date(d.getFullYear(), d.getMonth(), 1);
+    const end = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+    return {
+        start, end,
+        tokens: {
+            year: String(d.getFullYear()),
+            month: String(d.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(d),
+            day: String(d.getDate()).padStart(2, "0"),
+            date: fmt(start),
+            "month-start": fmt(start),
+            "month-end": fmt(end),
+            cycle: String(d.getMonth() + 1).padStart(2, "0"),
+        },
+    };
+};
+`,
+    },
+    "calendar-quarter": {
+        name: "Calendar Quarter",
+        description: "Calendar quarter (Q1 = Jan-Mar, Q2 = Apr-Jun, Q3 = Jul-Sep, Q4 = Oct-Dec). One period spans roughly 90 days.",
+        tokens: ["year", "month", "month-name", "day", "date", "quarter", "quarter-name", "quarter-start", "quarter-end", "cycle"],
+        source:
+`// Calendar Quarter boundary detector — fork of the built-in.
+
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = function(date) {
+    const d = date || new Date();
+    const year = d.getFullYear();
+    const quarterIdx = Math.floor(d.getMonth() / 3); // 0..3
+    const start = new Date(year, quarterIdx * 3, 1);
+    const end = new Date(year, quarterIdx * 3 + 3, 0);
+    const quarterNum = quarterIdx + 1;
+    return {
+        start, end,
+        tokens: {
+            year: String(year),
+            month: String(d.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(d),
+            day: String(d.getDate()).padStart(2, "0"),
+            date: fmt(start),
+            quarter: String(quarterNum),
+            "quarter-name": "Q" + quarterNum,
+            "quarter-start": fmt(start),
+            "quarter-end": fmt(end),
+            cycle: String(quarterNum),
+        },
+    };
+};
+`,
+    },
+    "calendar-year": {
+        name: "Calendar Year",
+        description: "Calendar year from January 1 through December 31. One period spans 365-366 days.",
+        tokens: ["year", "month", "month-name", "day", "date", "year-start", "year-end", "cycle"],
+        source:
+`// Calendar Year boundary detector — fork of the built-in.
+
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = function(date) {
+    const d = date || new Date();
+    const year = d.getFullYear();
+    const start = new Date(year, 0, 1);
+    const end = new Date(year, 11, 31);
+    return {
+        start, end,
+        tokens: {
+            year: String(year),
+            month: String(d.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(d),
+            day: String(d.getDate()).padStart(2, "0"),
+            date: fmt(start),
+            "year-start": fmt(start),
+            "year-end": fmt(end),
+            cycle: String(year),
+        },
+    };
+};
+`,
+    },
+    "lunar-cycle": {
+        name: "Lunar Cycle",
+        description: "One synodic month — new moon to next new moon (~29.5 days). The astrological/lunisolar equivalent of a calendar month. Requires the Moon Phase plugin (Helios server).",
+        tokens: ["year", "month", "month-name", "day", "date", "cycle", "phase", "phase-short", "sign", "sign-glyph"],
+        source: null, // forking helios detectors requires a custom helios client
+    },
+    "lunar-phase": {
+        name: "Lunar Phase",
+        description: "One quarter of a lunar cycle (~7 days). The four phases are New Moon, First Quarter, Full Moon, Last Quarter — corresponding to Atlas's detach / plan / execute / share rhythm. Requires the Moon Phase plugin.",
+        tokens: ["year", "month", "month-name", "day", "date", "phase", "phase-short", "sign", "sign-glyph"],
+        source: null,
+    },
+    "sun-ingress": {
+        name: "Sun Ingress",
+        description: "The period the Sun spends in one zodiac sign (~30 days). Begins at the exact moment of ingress and ends when the Sun moves into the next sign. The astrological alternative to a calendar month — themed by sign archetype rather than calendar bookkeeping. Requires the Moon Phase plugin.",
+        tokens: ["year", "month", "month-name", "day", "date", "cycle", "term", "term-cn", "sign", "sign-glyph"],
+        source: null,
+    },
+};
+
 // Format the metadata fields as a single inline blob: "k1=v1 k2=v2 ...".
 // Used for both inline placement and as the value of the frontmatter key,
 // so the format is identical regardless of where it lands.
@@ -643,6 +849,7 @@ const DEFAULT_SETTINGS = {
     prContainers: [],          // Container[] — see PROJECT.md "Container config"
     prAlignments: [],          // Alignment[] — see PROJECT.md "Alignment module"
     prLLMServices: [],         // LLMService[] — { name, provider, apiKey, model }
+    prCustomBoundaries: [],    // CustomBoundary[] — { id, name, scriptPath, description }
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
 };
 
@@ -677,6 +884,47 @@ class PRModelPickerModal extends FuzzySuggestModal {
     getItems() { return this.models; }
     getItemText(m) { return m; }
     onChooseItem(m) { this.onChooseCallback(m); }
+}
+
+// Periodic Ritual: modal that displays a built-in boundary's source code in
+// a scrollable code block. Triggered from the View source button on a
+// built-in boundary card in the Boundaries tab.
+class PRBoundarySourceModal extends Modal {
+    constructor(app, name, source) {
+        super(app);
+        this.detectorName = name;
+        this.source = source || "// (no source available)";
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h3", { text: `${this.detectorName} — source` });
+
+        const note = contentEl.createEl("p");
+        note.style.cssText = "color: var(--text-muted); font-size: 0.9em;";
+        note.setText("This is the standalone JS module form of the built-in detector. To modify it, click \"Fork as custom\" on the detector card to drop a copy into your vault as a custom boundary.");
+
+        const pre = contentEl.createEl("pre");
+        pre.style.cssText = "background: var(--background-secondary); padding: 12px; border-radius: 6px; max-height: 60vh; overflow: auto; font-size: 0.85em;";
+        const code = pre.createEl("code");
+        code.setText(this.source);
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+// Periodic Ritual: fuzzy picker for .js files in the vault. Used by the
+// Custom Boundary script-path picker.
+class PRJSFileSuggestModal extends FuzzySuggestModal {
+    constructor(app, onChoose) {
+        super(app);
+        this.onChooseCallback = onChoose;
+        this.setPlaceholder("Pick a .js file from your vault…");
+    }
+    getItems() {
+        return this.app.vault.getFiles().filter(f => f.extension === "js");
+    }
+    getItemText(file) { return file.path; }
+    onChooseItem(file) { this.onChooseCallback(file); }
 }
 
 // Periodic Ritual: token reference modal. Shows the available naming
@@ -1525,6 +1773,12 @@ class MonthlyRitualPlugin extends Plugin {
     // Phase 4c: custom JS module backends.
     async getPRBoundaryData(detector, date) {
         const d = date || new Date();
+        // Custom boundaries: id format is "custom:<custom-boundary-id>".
+        // The actual calculation lives in a JS file in the user's vault.
+        if (typeof detector === "string" && detector.startsWith("custom:")) {
+            const cbId = detector.slice("custom:".length);
+            return await this.runPRCustomBoundary(cbId, d);
+        }
         switch (detector) {
             case "calendar-week":    return this.getCurrentWeekData(d);
             case "calendar-month":   return this.getCurrentCalendarMonthData(d);
@@ -1542,11 +1796,82 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
+    // Look up a custom boundary by id.
+    getPRCustomBoundary(cbId) {
+        return (this.settings.prCustomBoundaries || []).find(c => c.id === cbId);
+    }
+
+    // Load and execute a user-defined boundary script. Same wrapper pattern
+    // Templater uses for executing user JS scripts inside the vault.
+    //
+    // The script must:
+    //   module.exports = function(date, app, plugin) {
+    //       return { start: <Date>, end: <Date>, tokens: { ... } };
+    //   };
+    //
+    // start/end are JS Date objects, tokens is a flat string-keyed object
+    // matching the same shape the built-in detectors return.
+    async runPRCustomBoundary(cbId, date) {
+        const cb = this.getPRCustomBoundary(cbId);
+        if (!cb) throw new Error(`Custom boundary "${cbId}" not found in settings`);
+        if (!cb.scriptPath) throw new Error(`Custom boundary "${cb.name}" has no script path`);
+
+        const file = this.app.vault.getAbstractFileByPath(cb.scriptPath);
+        if (!file || !(file instanceof TFile)) {
+            throw new Error(`Custom boundary script not found in vault: ${cb.scriptPath}`);
+        }
+
+        const source = await this.app.vault.read(file);
+
+        let mod;
+        try {
+            // Wrap as a CommonJS module: pass module/exports/require so the
+            // user's script can use `module.exports = function(...)` and
+            // `require("obsidian")` if it needs requestUrl etc.
+            const wrapper = new Function("module", "exports", "require", source);
+            const moduleObj = { exports: {} };
+            wrapper(moduleObj, moduleObj.exports, require);
+            mod = moduleObj.exports;
+        } catch (e) {
+            throw new Error(`Error in custom boundary "${cb.name}" while loading script: ${e.message}`);
+        }
+
+        if (typeof mod !== "function") {
+            throw new Error(`Custom boundary "${cb.name}" script must export a function: module.exports = function(date, app, plugin) { ... }`);
+        }
+
+        let result;
+        try {
+            result = await mod(date, this.app, this);
+        } catch (e) {
+            throw new Error(`Error running custom boundary "${cb.name}": ${e.message}`);
+        }
+
+        if (!result || !(result.start instanceof Date) || !(result.end instanceof Date) || !result.tokens) {
+            throw new Error(`Custom boundary "${cb.name}" must return { start: Date, end: Date, tokens: object }`);
+        }
+        return result;
+    }
+
+    // Resolve the orienting description for any boundary detector — built-in
+    // or custom. Used by the LLM aggregation pass to prepend context about
+    // the period to the system prompt.
+    getPRBoundaryDescription(detector) {
+        if (typeof detector === "string" && detector.startsWith("custom:")) {
+            const cbId = detector.slice("custom:".length);
+            const cb = this.getPRCustomBoundary(cbId);
+            return cb ? (cb.description || "") : "";
+        }
+        const info = BUILT_IN_BOUNDARY_INFO[detector];
+        return info ? (info.description || "") : "";
+    }
+
     // List of detectors available in the current build, for the settings dropdown.
     // Adding a detector = adding an entry here + a case in getPRBoundaryData.
     // Labels are deliberately neutral — the user names containers themselves.
     // Helios-backed detectors are gated on the Moon Phase plugin being
-    // installed. Without it the dropdown only shows the calendar detectors.
+    // installed. Custom boundaries from the Boundaries tab are appended at
+    // the end with `custom:<id>` ids.
     getPRAvailableBoundaryDetectors() {
         const list = [
             { id: "calendar-week",    label: "Calendar Week" },
@@ -1560,6 +1885,10 @@ class MonthlyRitualPlugin extends Plugin {
                 { id: "lunar-phase",  label: "Lunar Phase (one quarter of a moon cycle)" },
                 { id: "sun-ingress",  label: "Sun Ingress (one zodiac sign)" },
             );
+        }
+        // Custom boundaries defined in the Boundaries tab
+        for (const cb of (this.settings.prCustomBoundaries || [])) {
+            list.push({ id: `custom:${cb.id}`, label: `${cb.name || "(unnamed)"} (custom)` });
         }
         return list;
     }
@@ -1785,6 +2114,17 @@ class MonthlyRitualPlugin extends Plugin {
         } catch (e) {
             if (!opts.silent) new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
             return;
+        }
+
+        // Phase 4c: prepend the boundary description to the system prompt.
+        // Built-in detectors have a baked description; custom boundaries
+        // get whatever the user typed in the Boundaries tab. The prepend
+        // gives the LLM orienting context about WHAT KIND of period it's
+        // looking at — useful for non-obvious boundaries (Ki cycles, lunar
+        // phases, custom arcs) where the calculation is opaque to the LLM.
+        const boundaryDesc = this.getPRBoundaryDescription(container.boundaryDetector);
+        if (boundaryDesc && boundaryDesc.trim()) {
+            systemPrompt = `# Period type\n${boundaryDesc.trim()}\n\n---\n\n${systemPrompt}`;
         }
 
         // Build the daily payload
@@ -2862,6 +3202,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const tabs = [
             { id: "containers", label: "Containers" },
+            { id: "boundaries", label: "Boundaries" },
             { id: "alignments", label: "Alignments" },
             { id: "llm",        label: "LLM" },
             { id: "legacy",     label: "Existing" },
@@ -2883,6 +3224,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const body = containerEl.createDiv({ cls: "mr-tab-content" });
         switch (this.outerTab) {
             case "containers":  this.displayContainersStub(body); break;
+            case "boundaries":  this.displayBoundaries(body); break;
             case "alignments":  this.displayAlignmentsStub(body); break;
             case "llm":         this.displayLLMStub(body); break;
             case "general":     this.displayGeneral(body); break;
@@ -3402,6 +3744,217 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         }
                     });
             });
+    }
+
+    // Phase 4c: Boundaries tab. Lists built-in detectors (read-only with
+    // View source / Fork as custom buttons) and custom user-defined boundaries
+    // (editable cards with script picker + description textarea).
+    displayBoundaries(containerEl) {
+        const s = this.plugin.settings;
+        if (!Array.isArray(s.prCustomBoundaries)) s.prCustomBoundaries = [];
+
+        containerEl.createEl("h2", { text: "Boundaries" });
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        intro.setText("Boundaries define the date range of a container's period. The plugin ships with several built-in detectors. You can also write your own as a JS module in your vault for boundaries the plugin doesn't natively understand.");
+
+        // ── Built-in section ──
+        const builtInHeader = containerEl.createEl("h3", { text: "Built-in" });
+        builtInHeader.style.cssText = "margin-top: 24px;";
+
+        const builtInIds = [
+            "calendar-week", "calendar-month", "calendar-quarter", "calendar-year",
+            "lunar-cycle", "lunar-phase", "sun-ingress",
+        ];
+        for (const id of builtInIds) {
+            const info = BUILT_IN_BOUNDARY_INFO[id];
+            if (!info) continue;
+            const heliosOnly = !info.source;
+            this.renderPRBuiltInBoundaryCard(containerEl, id, info, heliosOnly);
+        }
+
+        // ── Custom section ──
+        const customHeader = containerEl.createEl("h3", { text: "Custom" });
+        customHeader.style.cssText = "margin-top: 32px;";
+
+        const customIntro = containerEl.createEl("p");
+        customIntro.style.cssText = "color: var(--text-muted); max-width: 60ch; font-size: 0.9em;";
+        customIntro.setText("Write a JS file in your vault that exports a function returning { start, end, tokens } for a given date. The plugin loads and runs it whenever a container uses this boundary.");
+
+        if (s.prCustomBoundaries.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); margin: 16px 0;";
+            empty.setText("No custom boundaries yet.");
+        } else {
+            for (let i = 0; i < s.prCustomBoundaries.length; i++) {
+                this.renderPRCustomBoundaryCard(containerEl, s.prCustomBoundaries[i], i);
+            }
+        }
+
+        new Setting(containerEl)
+            .addButton(btn => btn
+                .setButtonText("+ Add custom boundary")
+                .setCta()
+                .onClick(async () => {
+                    s.prCustomBoundaries.push(makePRCustomBoundary());
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+    }
+
+    renderPRBuiltInBoundaryCard(parent, id, info, heliosOnly) {
+        const card = parent.createDiv({ cls: "mr-pr-card" });
+
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+        const title = header.createSpan({ text: info.name });
+        title.style.cssText = "flex: 1; font-size: 1.05em; font-weight: 600;";
+        const idBadge = header.createSpan({ text: id });
+        idBadge.style.cssText = "color: var(--text-faint); font-family: var(--font-monospace); font-size: 0.85em;";
+
+        const body = card.createDiv({ cls: "mr-pr-card-body" });
+
+        const desc = body.createEl("p");
+        desc.style.cssText = "color: var(--text-muted); margin: 0 0 8px 0;";
+        desc.setText(info.description || "");
+
+        const tokenLine = body.createEl("p");
+        tokenLine.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 0 0 12px 0;";
+        const tokenLabel = tokenLine.createSpan({ text: "Tokens: " });
+        for (let i = 0; i < info.tokens.length; i++) {
+            if (i > 0) tokenLine.createSpan({ text: " " });
+            const tk = tokenLine.createEl("code", { text: `{{${info.tokens[i]}}}` });
+            tk.style.cssText = "color: var(--interactive-accent); font-size: 0.95em;";
+        }
+
+        const actions = body.createDiv();
+        actions.style.cssText = "display: flex; gap: 8px; margin-top: 8px;";
+
+        if (info.source) {
+            const viewBtn = actions.createEl("button", { text: "View source" });
+            viewBtn.addEventListener("click", () => {
+                new PRBoundarySourceModal(this.app, info.name, info.source).open();
+            });
+
+            const forkBtn = actions.createEl("button", { text: "Fork as custom" });
+            forkBtn.addEventListener("click", async () => {
+                // Drop the source into a folder the user picks, then create
+                // a custom boundary entry pointing at it.
+                new FolderSuggestModal(this.app, async (folder) => {
+                    const folderPath = folder.path || "";
+                    const filename = `pr-${id}-fork.js`;
+                    const filePath = folderPath ? `${folderPath}/${filename}` : filename;
+                    try {
+                        const existing = this.app.vault.getAbstractFileByPath(filePath);
+                        if (existing) {
+                            new Notice(`File already exists: ${filePath}`);
+                            return;
+                        }
+                        if (folderPath) {
+                            const folderFile = this.app.vault.getAbstractFileByPath(folderPath);
+                            if (!folderFile) await this.app.vault.createFolder(folderPath);
+                        }
+                        await this.app.vault.create(filePath, info.source);
+                        // Create the custom boundary entry
+                        const s = this.plugin.settings;
+                        if (!Array.isArray(s.prCustomBoundaries)) s.prCustomBoundaries = [];
+                        s.prCustomBoundaries.push(makePRCustomBoundary({
+                            name: `${info.name} (fork)`,
+                            scriptPath: filePath,
+                            description: info.description,
+                        }));
+                        await this.plugin.saveSettings();
+                        new Notice(`Forked: ${filePath}`);
+                        this.display();
+                    } catch (e) {
+                        new Notice(`Failed to fork: ${e.message}`);
+                        console.error(e);
+                    }
+                }).open();
+            });
+        } else {
+            const note = actions.createEl("span", { text: heliosOnly ? "Forking helios-backed detectors requires writing a custom helios client. Use a custom boundary with your own JS module." : "" });
+            note.style.cssText = "color: var(--text-faint); font-size: 0.85em; font-style: italic;";
+        }
+    }
+
+    renderPRCustomBoundaryCard(parent, cb, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv({ cls: "mr-pr-card" });
+
+        // Header: name input + delete
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+        const nameInput = header.createEl("input", { type: "text", value: cb.name || "", cls: "mr-pr-name-input" });
+        nameInput.placeholder = "Custom boundary name";
+        nameInput.addEventListener("change", async () => {
+            cb.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
+        deleteBtn.title = "Delete custom boundary";
+        deleteBtn.addEventListener("click", async () => {
+            s.prCustomBoundaries.splice(idx, 1);
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const body = card.createDiv({ cls: "mr-pr-card-body" });
+
+        // Script path picker
+        new Setting(body)
+            .setName("Script path")
+            .setDesc(cb.scriptPath || "None selected")
+            .addButton(btn => {
+                btn.setButtonText(cb.scriptPath ? "Change" : "Choose").onClick(() => {
+                    new PRJSFileSuggestModal(this.app, async (file) => {
+                        cb.scriptPath = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    cb.scriptPath = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // Description (markdown text area)
+        new Setting(body)
+            .setName("Description")
+            .setDesc("Markdown text prepended to the LLM system prompt as orienting context whenever a container uses this boundary. Tells the LLM what kind of period this is (e.g., \"One Ki cycle (~9 days). Each cycle has a corresponding Ki number 1–9 that influences the energetic quality of the period.\")")
+            .addTextArea(t => {
+                t.setValue(cb.description || "")
+                    .onChange(async v => {
+                        cb.description = v;
+                        await this.plugin.saveSettings();
+                    });
+                t.inputEl.rows = 4;
+                t.inputEl.style.width = "100%";
+            });
+
+        // Test button — runs the script against today and shows the result
+        new Setting(body)
+            .addButton(btn => btn
+                .setButtonText("Test against today")
+                .onClick(async () => {
+                    if (!cb.scriptPath) {
+                        new Notice("No script path set");
+                        return;
+                    }
+                    try {
+                        const result = await this.plugin.runPRCustomBoundary(cb.id, new Date());
+                        const summary = `start: ${formatDate(result.start)}, end: ${formatDate(result.end)}, tokens: ${Object.keys(result.tokens).join(", ")}`;
+                        new Notice(`OK: ${summary}`, 8000);
+                        console.log("Periodic Ritual custom boundary test result:", result);
+                    } catch (e) {
+                        new Notice(`Error: ${e.message}`, 10000);
+                        console.error(e);
+                    }
+                }));
     }
 
     displayGeneral(containerEl) {
