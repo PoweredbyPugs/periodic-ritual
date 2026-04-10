@@ -5579,6 +5579,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const s = this.plugin.settings;
         containerEl.createEl("h2", { text: "General" });
 
+        // ── Periodic Ritual behavior ──
         new Setting(containerEl)
             .setName("Auto-generate on load")
             .setDesc("When on, the plugin checks every enabled Periodic Ritual container at startup and generates any notes whose boundaries have been crossed since the last run. Boundary-driven only — no timers, no polling. When off, you generate manually via command.")
@@ -5589,9 +5590,126 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        const note = containerEl.createEl("p");
-        note.style.cssText = "color: var(--text-faint); max-width: 60ch; font-size: 0.9em; margin-top: 16px;";
-        note.setText("Daily notes folder and filename format are still configured under Legacy Settings until the new Containers tab is wired up.");
+        // ── Daily notes ──
+        containerEl.createEl("h3", { text: "Daily notes" }).style.marginTop = "24px";
+        new Setting(containerEl)
+            .setName("Daily notes folder")
+            .setDesc("Where the plugin looks for daily notes when a container's data source is set to 'Daily notes'. Defaults to vault root.")
+            .addButton(btn => {
+                btn.setButtonText(s.dailyNotesFolder ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        s.dailyNotesFolder = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.dailyNotesFolder = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+        const dailyNote = containerEl.createEl("p");
+        dailyNote.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 4px 0 0 0;";
+        dailyNote.setText(`Currently: ${s.dailyNotesFolder || "(vault root)"}`);
+
+        // ── Astrology toggles ──
+        containerEl.createEl("h3", { text: "Astrology" }).style.marginTop = "24px";
+        new Setting(containerEl)
+            .setName("Include sign glyphs")
+            .setDesc("When on, lunar and solar boundary detectors resolve {{sign}} and {{sign-glyph}} tokens. The {{moon-sign}} / {{moon-glyph}} tokens are always available regardless of this toggle.")
+            .addToggle(t => t
+                .setValue(!!s.includeSignGlyphs)
+                .onChange(async v => {
+                    s.includeSignGlyphs = v;
+                    await this.plugin.saveSettings();
+                }));
+        new Setting(containerEl)
+            .setName("Include eclipse flags")
+            .setDesc("When on, the {{eclipse}} token resolves on lunar phase notes during eclipse seasons.")
+            .addToggle(t => t
+                .setValue(!!s.includeEclipseFlags)
+                .onChange(async v => {
+                    s.includeEclipseFlags = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // ── Calendar view (sidebar lunisolar grid) ──
+        containerEl.createEl("h3", { text: "Calendar view" }).style.marginTop = "24px";
+        const calIntro = containerEl.createEl("p");
+        calIntro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch;";
+        calIntro.setText("The Ritual Calendar is a sidebar view showing the current zodiac sign with lunar phase rows. Open it via the ribbon or the 'Open Ritual Calendar' command.");
+
+        new Setting(containerEl)
+            .setName("Timezone")
+            .setDesc("Timezone for the calendar view's date math")
+            .addText(t => t
+                .setPlaceholder("America/New_York")
+                .setValue(s.calendarTimezone || "America/New_York")
+                .onChange(async v => {
+                    s.calendarTimezone = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Note folder")
+            .setDesc("Where the calendar view links to / creates solar and lunar notes. Click the header or moon emoji in the calendar to navigate.")
+            .addButton(btn => {
+                btn.setButtonText(s.calendarNoteFolder ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        s.calendarNoteFolder = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.calendarNoteFolder = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+        const calFolderNote = containerEl.createEl("p");
+        calFolderNote.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 4px 0 0 0;";
+        calFolderNote.setText(`Currently: ${s.calendarNoteFolder || "(none)"}`);
+
+        new Setting(containerEl)
+            .setName("Solar note naming")
+            .setDesc("Naming template for the zodiac sign note the calendar header links to. Tokens: {{sign}}, {{glyph}}, {{year}}.")
+            .addText(t => t
+                .setPlaceholder("☀️ Sun in {{sign}}")
+                .setValue(s.calendarNoteNaming || "")
+                .onChange(async v => {
+                    s.calendarNoteNaming = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Lunar note naming is a per-phase object, surface as 4 text inputs
+        if (!s.lunarNoteNaming || typeof s.lunarNoteNaming !== "object") {
+            s.lunarNoteNaming = {
+                "New Moon": "🌑 {{phase-name}} Moon in {{moon-sign}}",
+                "First Quarter": "🌓 {{phase-name}} Moon in {{moon-sign}}",
+                "Full Moon": "🌕 {{phase-name}} Moon in {{moon-sign}}",
+                "Last Quarter": "🌗 {{phase-name}} Moon in {{moon-sign}}",
+            };
+        }
+        const lunarHeader = new Setting(containerEl)
+            .setName("Lunar note naming")
+            .setDesc("Per-phase naming templates for the lunar phase notes the calendar moon icons link to. Tokens: {{phase-name}}, {{phase-emoji}}, {{moon-sign}}, {{moon-glyph}}.");
+        for (const phase of MOON_PHASES) {
+            new Setting(containerEl)
+                .setName(phase)
+                .addText(t => t
+                    .setPlaceholder(`${MOON_PHASE_EMOJI[phase]} {{phase-name}} Moon in {{moon-sign}}`)
+                    .setValue(s.lunarNoteNaming[phase] || "")
+                    .onChange(async v => {
+                        s.lunarNoteNaming[phase] = v;
+                        await this.plugin.saveSettings();
+                    }));
+        }
     }
 
     // ─── Legacy settings UI (existing functionality, untouched) ───
