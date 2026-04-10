@@ -192,6 +192,20 @@ function makeReflectionConfig() {
     };
 }
 
+// ─── Periodic Ritual: Container factory (Phase 1+) ───
+function makePRContainer(overrides = {}) {
+    return Object.assign({
+        id: "pr-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New container",
+        enabled: false,
+        boundaryDetector: "calendar-week",
+        template: "",
+        saveDir: "",
+        naming: "",
+        // Phase 2+ adds: systemPromptFile, llmService, reflectionMode, questions
+    }, overrides);
+}
+
 const DEFAULT_SETTINGS = {
     mode: "calendar",
     solarSubdivision: "terms",
@@ -243,6 +257,22 @@ const DEFAULT_SETTINGS = {
 // ═══════════════════════════════════════════════════════════════
 //  MODALS
 // ═══════════════════════════════════════════════════════════════
+
+// Periodic Ritual: fuzzy picker for selecting which container to generate.
+class PRContainerPickerModal extends FuzzySuggestModal {
+    constructor(app, containers, onChoose) {
+        super(app);
+        this.containers = containers;
+        this.onChooseCallback = onChoose;
+        this.setPlaceholder("Pick a Periodic Ritual container to generate…");
+    }
+    getItems() { return this.containers; }
+    getItemText(c) {
+        const status = c.enabled ? "" : " (disabled)";
+        return `${c.name || "(unnamed)"} — ${c.boundaryDetector}${status}`;
+    }
+    onChooseItem(c) { this.onChooseCallback(c); }
+}
 
 class MarkdownFileSuggestModal extends FuzzySuggestModal {
     constructor(app, onChoose) {
@@ -897,6 +927,88 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  PERIODIC RITUAL — Container generation (Phase 1+)
+    // ═══════════════════════════════════════════════════════════════
+
+    // Boundary detector dispatcher. Phase 1 only handles calendar-week.
+    // Later phases add: calendar-month, sun-ingress, lunar-phase, lunar-cycle, chapter, book.
+    getPRBoundaryData(detector, date) {
+        const d = date || new Date();
+        switch (detector) {
+            case "calendar-week":
+                return this.getCurrentWeekData(d);
+            default:
+                throw new Error(`Boundary detector "${detector}" is not implemented yet`);
+        }
+    }
+
+    // List of detectors available in the current build, for the settings dropdown.
+    // Adding a phase = adding an entry here + a case in getPRBoundaryData.
+    getPRAvailableBoundaryDetectors() {
+        return [
+            { id: "calendar-week", label: "Calendar Week" },
+        ];
+    }
+
+    // Generate a single container note from its config.
+    // Reads template, resolves tokens, writes file. No daily aggregation, no LLM.
+    async generatePRContainerNote(container, dateOverride) {
+        if (!container) { new Notice("No container provided"); return; }
+        if (!container.template) {
+            new Notice(`${container.name}: no template configured`);
+            return;
+        }
+        if (!container.naming) {
+            new Notice(`${container.name}: no naming convention configured`);
+            return;
+        }
+
+        try {
+            const data = this.getPRBoundaryData(container.boundaryDetector, dateOverride);
+            const fileName = this.resolveTokens(container.naming, data.tokens);
+            const folderPath = container.saveDir || "";
+            const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
+
+            // Don't clobber an existing note. Phase 3 will track last-generated
+            // timestamps so auto-generation skips duplicates without surfacing them.
+            const existing = this.app.vault.getAbstractFileByPath(filePath);
+            if (existing) {
+                new Notice(`Already exists: ${filePath}`);
+                return existing;
+            }
+
+            // Ensure save directory exists
+            if (folderPath) {
+                const folderFile = this.app.vault.getAbstractFileByPath(folderPath);
+                if (!folderFile) {
+                    await this.app.vault.createFolder(folderPath);
+                }
+            }
+
+            // Load template, resolve tokens
+            let content = await this.loadTemplate(container.template);
+            content = this.resolveTokens(content, data.tokens);
+
+            // Stamp Periodic Ritual metadata so we can find these notes later
+            // (Phase 3 uses pr-container-id to track last-generated, etc.)
+            const fmFields = {
+                "pr-container-id": container.id,
+                "pr-boundary": container.boundaryDetector,
+                "pr-start": formatDate(data.start),
+                "pr-end": formatDate(data.end),
+            };
+            content = mergeFrontmatter(content, fmFields);
+
+            const file = await this.app.vault.create(filePath, content);
+            new Notice(`Created: ${fileName}`);
+            return file;
+        } catch (e) {
+            new Notice(`Error generating ${container.name}: ${e.message}`);
+            console.error("Periodic Ritual:", e);
+        }
+    }
+
     // ─── Field pipeline ───
 
     findDailyNotesInRange(start, end) {
@@ -1326,6 +1438,28 @@ class MonthlyRitualPlugin extends Plugin {
             name: `Test ${labels.subdivision} Reflection`,
             callback: () => this.runTestReflection("subdivision"),
         });
+
+        // ─── Periodic Ritual commands (Phase 1+) ───
+        this.addCommand({
+            id: "pr-generate-container",
+            name: "Periodic Ritual: Generate container note",
+            callback: () => this.pickAndGeneratePRContainer(),
+        });
+    }
+
+    // Fuzzy picker over all configured PR containers (enabled or not).
+    // Phase 3 will replace the manual call with auto-on-load behavior;
+    // this command stays as a manual override.
+    pickAndGeneratePRContainer() {
+        const containers = this.settings.prContainers || [];
+        if (containers.length === 0) {
+            new Notice("No Periodic Ritual containers configured. Add one in Settings → Containers.");
+            return;
+        }
+        const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
+            await this.generatePRContainerNote(container);
+        });
+        modal.open();
     }
 
     updateCommandNames() {
@@ -1773,11 +1907,162 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
     // ─── Stubs for the new tabs (Phase 0) ───
 
+    // Phase 1: Containers tab is real. Lists configured containers with
+    // per-container template/save dir/naming inputs and a "Generate now"
+    // button. No LLM, no auto-trigger — just template → tokens → file.
     displayContainersStub(containerEl) {
+        const s = this.plugin.settings;
+        if (!Array.isArray(s.prContainers)) s.prContainers = [];
+
         containerEl.createEl("h2", { text: "Containers" });
-        const p = containerEl.createEl("p");
-        p.style.cssText = "color: var(--text-muted); max-width: 60ch;";
-        p.setText("Independent container types (calendar week, calendar month, sun ingress, lunar phase, chapter, book) will live here. Each container will have its own template, save directory, system prompt MD file, LLM service, and optional reflection questions. Wired up in Phase 1.");
+
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        intro.setText("Each container is an independently configured periodic note type. Phase 1 supports Calendar Week. More boundary detectors land in later phases.");
+
+        if (s.prContainers.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); margin: 24px 0;";
+            empty.setText("No containers yet. Click below to add one.");
+        } else {
+            for (let i = 0; i < s.prContainers.length; i++) {
+                this.renderPRContainerCard(containerEl, s.prContainers[i], i);
+            }
+        }
+
+        // Add button — restricted to Calendar Week in Phase 1
+        const detectors = this.plugin.getPRAvailableBoundaryDetectors();
+        new Setting(containerEl)
+            .addButton(btn => btn
+                .setButtonText("+ Add Calendar Week")
+                .setCta()
+                .onClick(async () => {
+                    s.prContainers.push(makePRContainer({
+                        name: "Calendar Week",
+                        boundaryDetector: "calendar-week",
+                        naming: "W{{week}}-{{year}}",
+                    }));
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+    }
+
+    renderPRContainerCard(parent, container, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv();
+        card.style.cssText = "border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;";
+
+        // ── Header row: name + enabled + delete ──
+        const header = card.createDiv();
+        header.style.cssText = "display: flex; align-items: center; gap: 12px; margin-bottom: 12px;";
+
+        const nameInput = header.createEl("input", { type: "text", value: container.name || "" });
+        nameInput.placeholder = "Container name";
+        nameInput.style.cssText = "flex: 1; font-size: 1.05em; font-weight: 600; background: transparent; border: none; color: var(--text-normal); outline: none; border-bottom: 1px solid transparent; padding: 2px 0;";
+        nameInput.addEventListener("focus", () => { nameInput.style.borderBottom = "1px solid var(--background-modifier-border)"; });
+        nameInput.addEventListener("blur", () => { nameInput.style.borderBottom = "1px solid transparent"; });
+        nameInput.addEventListener("change", async () => {
+            container.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const enabledWrap = header.createDiv();
+        enabledWrap.style.cssText = "display: flex; align-items: center; gap: 6px;";
+        const enabledLabel = enabledWrap.createSpan({ text: "Enabled" });
+        enabledLabel.style.cssText = "color: var(--text-muted); font-size: 0.85em;";
+        const enabledInput = enabledWrap.createEl("input", { type: "checkbox" });
+        enabledInput.checked = !!container.enabled;
+        enabledInput.addEventListener("change", async () => {
+            container.enabled = enabledInput.checked;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×" });
+        deleteBtn.title = "Delete container";
+        deleteBtn.style.cssText = "background: none; border: none; color: var(--text-muted); font-size: 1.4em; cursor: pointer; padding: 0 6px; line-height: 1;";
+        deleteBtn.addEventListener("click", async () => {
+            s.prContainers.splice(idx, 1);
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        // ── Boundary detector ──
+        const detectors = this.plugin.getPRAvailableBoundaryDetectors();
+        new Setting(card)
+            .setName("Boundary detector")
+            .setDesc("Defines this container's date range")
+            .addDropdown(dd => {
+                for (const det of detectors) dd.addOption(det.id, det.label);
+                dd.setValue(container.boundaryDetector || "calendar-week");
+                dd.onChange(async v => {
+                    container.boundaryDetector = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // ── Template ──
+        new Setting(card)
+            .setName("Template")
+            .setDesc(container.template || "None selected")
+            .addButton(btn => {
+                btn.setButtonText(container.template ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        container.template = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    container.template = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // ── Save directory ──
+        new Setting(card)
+            .setName("Save directory")
+            .setDesc(container.saveDir || "Vault root")
+            .addButton(btn => {
+                btn.setButtonText(container.saveDir ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        container.saveDir = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    container.saveDir = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // ── Naming convention ──
+        new Setting(card)
+            .setName("Naming convention")
+            .setDesc("Tokens: {{year}}, {{month}}, {{month-name}}, {{day}}, {{date}}, {{week}}, {{week-start}}, {{week-end}}")
+            .addText(t => t
+                .setPlaceholder("W{{week}}-{{year}}")
+                .setValue(container.naming || "")
+                .onChange(async v => {
+                    container.naming = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // ── Generate button ──
+        new Setting(card)
+            .addButton(btn => btn
+                .setButtonText("Generate now")
+                .setCta()
+                .onClick(async () => {
+                    await this.plugin.generatePRContainerNote(container);
+                }));
     }
 
     displayAlignmentsStub(containerEl) {
