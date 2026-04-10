@@ -4408,7 +4408,6 @@ class PRGraphView extends ItemView {
     async onOpen() {
         this.render();
     }
-    async onClose() {}
 
     // ─── Build the model from settings ───
 
@@ -4795,9 +4794,150 @@ class PRGraphView extends ItemView {
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
     }
 
-    // ─── Phase 10a-2: pan, zoom, drag (placeholders for next sub-commit) ───
-    setupPanZoom() { /* filled in 10a-2 */ }
-    setupNodeDrag() { /* filled in 10a-2 */ }
+    // ─── Pan, zoom, drag (Phase 10a-2) ───
+
+    setupPanZoom() {
+        if (!this.canvasEl) return;
+        const canvas = this.canvasEl;
+
+        // Wheel zoom — zoom toward the cursor position
+        canvas.addEventListener("wheel", (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            // Mouse position in viewport (pre-zoom) coordinates
+            const vx = (mx - this.panX) / this.zoom;
+            const vy = (my - this.panY) / this.zoom;
+
+            const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            const newZoom = Math.max(0.25, Math.min(3, this.zoom * factor));
+            this.zoom = newZoom;
+            // Recompute pan so the cursor stays over the same viewport point
+            this.panX = mx - vx * this.zoom;
+            this.panY = my - vy * this.zoom;
+            this.applyTransform();
+        }, { passive: false });
+
+        // Drag to pan — only when starting on empty canvas (not on a node)
+        let panning = false;
+        let panStartX = 0;
+        let panStartY = 0;
+        let panOriginX = 0;
+        let panOriginY = 0;
+
+        canvas.addEventListener("mousedown", (e) => {
+            // If the target is a node or inside one, let node-drag handle it
+            if (e.target.closest(".pr-graph-node")) return;
+            if (e.button !== 0 && e.button !== 1) return; // left or middle only
+            panning = true;
+            panStartX = e.clientX;
+            panStartY = e.clientY;
+            panOriginX = this.panX;
+            panOriginY = this.panY;
+            canvas.style.cursor = "grabbing";
+            e.preventDefault();
+        });
+
+        const onMouseMove = (e) => {
+            if (!panning) return;
+            this.panX = panOriginX + (e.clientX - panStartX);
+            this.panY = panOriginY + (e.clientY - panStartY);
+            this.applyTransform();
+        };
+        const onMouseUp = () => {
+            if (panning) {
+                panning = false;
+                canvas.style.cursor = "";
+            }
+        };
+        window.addEventListener("mousemove", onMouseMove);
+        window.addEventListener("mouseup", onMouseUp);
+
+        // Track for cleanup
+        this._panZoomCleanup = () => {
+            window.removeEventListener("mousemove", onMouseMove);
+            window.removeEventListener("mouseup", onMouseUp);
+        };
+    }
+
+    setupNodeDrag() {
+        if (!this.viewportEl) return;
+        const viewport = this.viewportEl;
+
+        let dragging = null;       // the node being dragged
+        let dragStartX = 0;        // mouse start x (screen)
+        let dragStartY = 0;        // mouse start y (screen)
+        let nodeStartX = 0;        // node original x (viewport)
+        let nodeStartY = 0;        // node original y (viewport)
+        let moved = false;         // distinguish click from drag
+
+        const onMouseDown = (e) => {
+            if (e.button !== 0) return; // left only
+            const nodeEl = e.target.closest(".pr-graph-node");
+            if (!nodeEl) return;
+            // Avoid hijacking clicks on sockets (Phase 10b will use them)
+            if (e.target.closest(".pr-graph-socket")) return;
+
+            const id = nodeEl.dataset.nodeId;
+            const node = this.nodes.find(n => n.id === id);
+            if (!node) return;
+
+            dragging = node;
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+            nodeStartX = node.x;
+            nodeStartY = node.y;
+            moved = false;
+            nodeEl.style.zIndex = "10";
+            e.preventDefault();
+            e.stopPropagation();
+        };
+
+        const onMouseMove = (e) => {
+            if (!dragging) return;
+            const dx = (e.clientX - dragStartX) / this.zoom;
+            const dy = (e.clientY - dragStartY) / this.zoom;
+            if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+            dragging.x = nodeStartX + dx;
+            dragging.y = nodeStartY + dy;
+            dragging.el.style.left = `${dragging.x}px`;
+            dragging.el.style.top = `${dragging.y}px`;
+            this.renderWires();
+        };
+
+        const onMouseUp = async (e) => {
+            if (!dragging) return;
+            const node = dragging;
+            dragging = null;
+            node.el.style.zIndex = "";
+            if (moved) {
+                // Persist the new position
+                if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
+                this.plugin.settings.prGraphLayout[node.id] = { x: node.x, y: node.y };
+                await this.plugin.saveSettings();
+            }
+            // If not moved, treat as a click — Phase 10a-3 wires this up
+            if (!moved && this.onNodeClick) {
+                this.onNodeClick(node);
+            }
+        };
+
+        viewport.addEventListener("mousedown", onMouseDown);
+        window.addEventListener("mousemove", onMouseMove);
+        window.addEventListener("mouseup", onMouseUp);
+
+        this._nodeDragCleanup = () => {
+            viewport.removeEventListener("mousedown", onMouseDown);
+            window.removeEventListener("mousemove", onMouseMove);
+            window.removeEventListener("mouseup", onMouseUp);
+        };
+    }
+
+    async onClose() {
+        if (this._panZoomCleanup) this._panZoomCleanup();
+        if (this._nodeDragCleanup) this._nodeDragCleanup();
+    }
 }
 
 class RitualCalendarView extends ItemView {
