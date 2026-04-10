@@ -1477,6 +1477,267 @@ class PRHierarchyModal extends Modal {
     }
 }
 
+// Periodic Ritual: per-node inspect modal. Right-click → "Inspect output".
+// Shows kind-specific information about what a node currently has or
+// would produce.
+//
+//   Container: most-recently generated note path + filtered frontmatter
+//              + data sources + alignment outputs found on the note
+//   Boundary:  current period range computed by the detector + tokens
+//   Reflection: questions, mode flags, prompt prepend
+//   Alignment: which container, data field, last observation if any
+//   LLM:       provider, model, base URL, key status
+//   Daily:     daily folder + count of recent files
+class PRNodeInspectModal extends Modal {
+    constructor(app, plugin, node) {
+        super(app);
+        this.plugin = plugin;
+        this.node = node;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h3", { text: `Inspect: ${this.node.title || this.node.id}` });
+
+        const meta = contentEl.createEl("p");
+        meta.style.cssText = "color: var(--text-muted); font-size: 0.85em; margin-bottom: 12px;";
+        meta.setText(`Kind: ${this.node.kind}`);
+
+        // Dispatch to per-kind renderer
+        switch (this.node.kind) {
+            case "container":  this.renderContainerInspect(contentEl); break;
+            case "boundary":   this.renderBoundaryInspect(contentEl); break;
+            case "reflection": this.renderReflectionInspect(contentEl); break;
+            case "alignment":  this.renderAlignmentInspect(contentEl); break;
+            case "llm":        this.renderLLMInspect(contentEl); break;
+            case "daily":      this.renderDailyInspect(contentEl); break;
+        }
+    }
+    onClose() { this.contentEl.empty(); }
+
+    section(parent, label) {
+        const h = parent.createEl("h4", { text: label });
+        h.style.cssText = "margin: 14px 0 4px 0; color: var(--text-muted); font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.05em;";
+        return h;
+    }
+
+    keyValueBlock(parent, obj, opts = {}) {
+        const filter = opts.filter || (() => true);
+        const block = parent.createEl("div");
+        block.style.cssText = "background: var(--background-secondary); padding: 8px 12px; border-radius: 6px; font-family: var(--font-monospace); font-size: 0.82em; max-height: 240px; overflow: auto; user-select: text;";
+        let any = false;
+        for (const [k, v] of Object.entries(obj || {})) {
+            if (!filter(k, v)) continue;
+            any = true;
+            const row = block.createEl("div");
+            row.style.cssText = "padding: 2px 0;";
+            const keyEl = row.createEl("span", { text: `${k}: ` });
+            keyEl.style.color = "var(--interactive-accent)";
+            const valStr = (v === null || v === undefined) ? "" : (typeof v === "object" ? JSON.stringify(v) : String(v));
+            row.createEl("span", { text: valStr });
+        }
+        if (!any) {
+            const empty = block.createEl("div");
+            empty.style.color = "var(--text-faint)";
+            empty.setText("(empty)");
+        }
+        return block;
+    }
+
+    async renderContainerInspect(contentEl) {
+        const c = this.node.primitive;
+        if (!c) return;
+
+        // Data sources
+        this.section(contentEl, "Data sources");
+        const sources = getContainerDataSources(c);
+        const srcBlock = contentEl.createEl("div");
+        srcBlock.style.cssText = "background: var(--background-secondary); padding: 8px 12px; border-radius: 6px; font-family: var(--font-monospace); font-size: 0.82em;";
+        for (const src of sources) {
+            const row = srcBlock.createEl("div");
+            if (src.type === "daily") row.setText("• Daily notes");
+            else if (src.type === "container") {
+                const target = (this.plugin.settings.prContainers || []).find(x => x.id === src.containerId);
+                row.setText(`• ${target?.name || "(missing)"} (container)`);
+            }
+        }
+
+        // Current period
+        this.section(contentEl, "Current period");
+        try {
+            const data = await this.plugin.getPRBoundaryData(c.boundaryDetector, new Date());
+            const p = contentEl.createEl("div");
+            p.style.cssText = "font-family: var(--font-monospace); font-size: 0.82em; color: var(--text-muted);";
+            p.setText(`${formatDate(data.start)} → ${formatDate(data.end)}`);
+        } catch (e) {
+            const p = contentEl.createEl("div");
+            p.style.color = "var(--text-error, #e26a6a)";
+            p.setText(`Could not resolve: ${e.message}`);
+        }
+
+        // Most recent generated note
+        this.section(contentEl, "Most recent note");
+        const file = await this.plugin.findMostRecentPRContainerNote(c);
+        const filePathEl = contentEl.createEl("div");
+        filePathEl.style.cssText = "font-family: var(--font-monospace); font-size: 0.82em; color: var(--text-muted); user-select: text;";
+        if (!file) {
+            filePathEl.setText("(none generated yet — click Generate now to create one)");
+            return;
+        }
+        filePathEl.setText(file.path);
+
+        const openBtn = contentEl.createEl("button", { text: "Open note" });
+        openBtn.style.cssText = "margin: 8px 0; background: var(--interactive-normal); border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer;";
+        openBtn.addEventListener("click", () => {
+            this.app.workspace.getLeaf(false).openFile(file);
+            this.close();
+        });
+
+        // Frontmatter
+        this.section(contentEl, "Frontmatter (LLM-aggregated + alignments)");
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter || {};
+        this.keyValueBlock(contentEl, fm, {
+            filter: (k) => k !== "periodic-ritual" && k !== "position" && !k.startsWith("pr-"),
+        });
+
+        // Alignment outputs called out separately
+        const alignmentKeys = Object.keys(fm).filter(k => k.startsWith("alignment_"));
+        if (alignmentKeys.length > 0) {
+            this.section(contentEl, "Alignment outputs");
+            const alBlock = contentEl.createEl("div");
+            alBlock.style.cssText = "background: var(--background-secondary); padding: 8px 12px; border-radius: 6px; font-family: var(--font-monospace); font-size: 0.82em; user-select: text;";
+            for (const k of alignmentKeys) {
+                const row = alBlock.createEl("div");
+                row.style.cssText = "padding: 4px 0; border-bottom: 1px dashed var(--background-modifier-border);";
+                const name = row.createEl("div");
+                name.style.color = "#f0a04b";
+                name.setText(k);
+                const val = row.createEl("div");
+                val.style.color = "var(--text-normal)";
+                val.style.marginTop = "2px";
+                val.setText(String(fm[k]));
+            }
+        }
+    }
+
+    async renderBoundaryInspect(contentEl) {
+        const id = this.node.refKey || this.node.id.replace(/^boundary-/, "").replace(/^custom-/, "custom:");
+        this.section(contentEl, "Description");
+        const desc = contentEl.createEl("p");
+        desc.style.cssText = "color: var(--text-muted); font-size: 0.9em;";
+        desc.setText(this.plugin.getPRBoundaryDescription(id) || "(no description)");
+
+        this.section(contentEl, "Current period (from today)");
+        try {
+            const data = await this.plugin.getPRBoundaryData(id, new Date());
+            const p = contentEl.createEl("div");
+            p.style.cssText = "font-family: var(--font-monospace); font-size: 0.85em; color: var(--text-normal);";
+            p.setText(`${formatDate(data.start)} → ${formatDate(data.end)}`);
+
+            this.section(contentEl, "Tokens");
+            this.keyValueBlock(contentEl, data.tokens || {});
+        } catch (e) {
+            const p = contentEl.createEl("div");
+            p.style.color = "var(--text-error, #e26a6a)";
+            p.setText(`Could not resolve: ${e.message}`);
+        }
+    }
+
+    renderReflectionInspect(contentEl) {
+        const r = this.node.primitive;
+        if (!r) return;
+        this.section(contentEl, "Mode");
+        const mode = contentEl.createEl("p");
+        mode.style.cssText = "color: var(--text-muted); font-size: 0.85em;";
+        const flags = [];
+        if (r.useLLM) flags.push("Send answers to LLM");
+        if (r.replaceAutoLLM) flags.push("Replace auto-LLM");
+        if (r.includeAlignmentContext) flags.push("Include alignment outputs");
+        mode.setText(flags.length > 0 ? flags.join(" • ") : "Pure Q&A (no LLM, additive)");
+
+        if (r.promptPrepend) {
+            this.section(contentEl, "Prompt prepend");
+            const pre = contentEl.createEl("pre");
+            pre.style.cssText = "background: var(--background-secondary); padding: 8px 12px; border-radius: 6px; font-size: 0.8em; max-height: 160px; overflow: auto; user-select: text; white-space: pre-wrap;";
+            pre.setText(r.promptPrepend);
+        }
+
+        this.section(contentEl, `Questions (${(r.questions || []).length})`);
+        const list = contentEl.createEl("ol");
+        list.style.cssText = "color: var(--text-normal); font-size: 0.85em; padding-left: 20px;";
+        for (const q of (r.questions || [])) {
+            const li = list.createEl("li");
+            li.setText(q.text || "(empty)");
+            if (q.injectVar || q.outputToField) {
+                const tags = li.createEl("span");
+                tags.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin-left: 6px;";
+                const tagList = [];
+                if (q.injectVar) tagList.push(`inject:${q.varField || "?"}`);
+                if (q.outputToField) tagList.push(`output:${q.outputFieldName || "?"}`);
+                tags.setText(`[${tagList.join(", ")}]`);
+            }
+        }
+    }
+
+    renderAlignmentInspect(contentEl) {
+        const a = this.node.primitive;
+        if (!a) return;
+        this.section(contentEl, "Wired to");
+        const target = (this.plugin.settings.prContainers || []).find(c => c.id === a.containerId);
+        const wired = contentEl.createEl("p");
+        wired.style.cssText = "font-family: var(--font-monospace); font-size: 0.85em; color: var(--text-muted);";
+        wired.setText(target ? target.name : "(unattached)");
+
+        this.section(contentEl, "Reads field");
+        const field = contentEl.createEl("p");
+        field.style.cssText = "font-family: var(--font-monospace); font-size: 0.85em; color: var(--text-muted);";
+        field.setText(`${a.dataField || "(none)"} (${a.dataFieldType || "inline"})`);
+
+        this.section(contentEl, "Writes to");
+        const out = contentEl.createEl("p");
+        out.style.cssText = "font-family: var(--font-monospace); font-size: 0.85em; color: var(--text-muted);";
+        const outKey = (a.outputField || "").trim() || `alignment_${(a.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+        out.setText(`${outKey} (frontmatter on ${target?.name || "(unattached)"})`);
+
+        if (a.description) {
+            this.section(contentEl, "Description (system prompt)");
+            const pre = contentEl.createEl("pre");
+            pre.style.cssText = "background: var(--background-secondary); padding: 8px 12px; border-radius: 6px; font-size: 0.8em; max-height: 160px; overflow: auto; user-select: text; white-space: pre-wrap;";
+            pre.setText(a.description);
+        }
+    }
+
+    renderLLMInspect(contentEl) {
+        const svc = this.node.primitive;
+        if (!svc) return;
+        this.section(contentEl, "Configuration");
+        this.keyValueBlock(contentEl, {
+            provider: svc.provider,
+            model: svc.model || "(none)",
+            baseUrl: svc.baseUrl || "(default)",
+            "API key": svc.apiKey ? `set (${svc.apiKey.length} chars)` : "(not set)",
+        });
+    }
+
+    renderDailyInspect(contentEl) {
+        const folder = this.plugin.settings.dailyNotesFolder || "(vault root)";
+        this.section(contentEl, "Daily folder");
+        const f = contentEl.createEl("p");
+        f.style.cssText = "font-family: var(--font-monospace); font-size: 0.85em; color: var(--text-muted);";
+        f.setText(folder);
+
+        this.section(contentEl, "Recent count");
+        const today = new Date();
+        const monthAgo = new Date(today);
+        monthAgo.setDate(today.getDate() - 30);
+        const recent = this.plugin.findDailyNotesInRange(monthAgo, today);
+        const c = contentEl.createEl("p");
+        c.style.cssText = "color: var(--text-muted); font-size: 0.85em;";
+        c.setText(`${recent.length} daily notes in the last 30 days`);
+    }
+}
+
 // Periodic Ritual: debug modal showing the last LLM call's full payload.
 // Triggered by the "Show last LLM call" command. Useful when YAML parsing
 // fails or the model returns weird output — you can see exactly what went
@@ -6112,6 +6373,30 @@ class PRGraphView extends ItemView {
         items.push({ label: `${node.title} (${node.kind})`, onClick: null });
         items.push("separator");
 
+        // Inspect — read-only "what does this currently produce" view.
+        // Available for every node kind, including built-in boundaries
+        // and the daily source.
+        items.push({
+            label: "Inspect output",
+            onClick: () => new PRNodeInspectModal(this.app, this.plugin, node).open(),
+        });
+
+        // Container shortcut: open the system prompt MD file in a leaf
+        // so the user can read what's defining the LLM contract.
+        if (node.kind === "container" && node.primitive?.systemPromptFile) {
+            items.push({
+                label: "View system prompt",
+                onClick: () => {
+                    const file = this.app.vault.getAbstractFileByPath(node.primitive.systemPromptFile);
+                    if (file && file instanceof TFile) {
+                        this.app.workspace.getLeaf(false).openFile(file);
+                    } else {
+                        new Notice(`System prompt not found: ${node.primitive.systemPromptFile}`);
+                    }
+                },
+            });
+        }
+
         if (node.primitiveTab) {
             items.push({ label: "Edit in settings", onClick: () => this.onNodeClick(node) });
         }
@@ -6290,12 +6575,23 @@ class PRGraphView extends ItemView {
 
     // Compatible drop check: source output type must equal target input type,
     // and the target node must be a container (only containers have inputs).
+    //
+    // Note the asymmetry: the data-source output type maps to the in-data
+    // socket, not in-data-source. Other types (boundary / llm / reflection
+    // / alignment) match their socket ids 1:1.
     canConnect(fromNode, toNode, toSocketId) {
         if (!fromNode || !toNode) return false;
         if (toNode.kind !== "container") return false;
         const outType = this.nodeOutputType(fromNode.kind);
         if (!outType) return false;
-        const expectedSocket = `in-${outType}`;
+        const SOCKET_FOR_OUTPUT_TYPE = {
+            "data-source": "in-data",
+            "boundary":    "in-boundary",
+            "llm":         "in-llm",
+            "reflection":  "in-reflection",
+            "alignment":   "in-alignment",
+        };
+        const expectedSocket = SOCKET_FOR_OUTPUT_TYPE[outType];
         return toSocketId === expectedSocket;
     }
 
