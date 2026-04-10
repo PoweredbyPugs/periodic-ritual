@@ -533,13 +533,29 @@ function makePRContainer(overrides = {}) {
     }, overrides);
 }
 
-// Periodic Ritual: simple question factory for the PR reflection modal.
-// Only needs `text` because the existing ReflectionModal class only reads
-// q.text. The legacy makeQuestion has more fields used by the old reflection
-// flow (var injection, output to field) — we don't need any of that for PR
-// because the LLM handles output.
+// Periodic Ritual question factory. Same shape as Daily Ritual's question
+// so each question can optionally:
+//   - Inject a value from another note as context above the question prompt
+//   - Write its answer to a specific inline or frontmatter field on the
+//     container note (in addition to feeding the LLM)
 function makePRQuestion(text) {
-    return { text: text || "" };
+    return {
+        text: text || "",
+        // Variable injection — show a value from another note above the
+        // question prompt before asking. Lets you frame a question with
+        // context like "last week's answer was X — what about this week?"
+        injectVar: false,
+        varField: "",                  // field name to read
+        varFieldType: "inline",        // "inline" | "frontmatter"
+        varSource: "previous-period",  // "previous-period" | "note"
+        varNotePath: "",               // path to a specific .md file when varSource = "note"
+        // Output to field — write the answer directly to a field on the
+        // container note, in addition to passing it to the LLM. Makes the
+        // raw answer visible and queryable, not just the LLM's synthesis.
+        outputToField: false,
+        outputFieldName: "",
+        outputFieldType: "inline",     // "inline" | "frontmatter"
+    };
 }
 
 // ─── Periodic Ritual: Reflection profile factory (Phase 6 rework) ───
@@ -2713,6 +2729,91 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
+    // Find the container's PREVIOUS note (one period before the most recent one).
+    // Used by question variable injection when varSource = "previous-period".
+    async findPreviousPRContainerNote(container) {
+        if (!container || !container.lastGeneratedEnd || !container.naming) return null;
+        const recentEndDate = new Date(container.lastGeneratedEnd);
+        if (isNaN(recentEndDate.getTime())) return null;
+        try {
+            // Step into the period before lastGeneratedEnd by going one day
+            // earlier than the start of the most recent period.
+            const recentRange = await this.getPRBoundaryData(container.boundaryDetector, recentEndDate);
+            const dayBeforeRecentStart = addDays(recentRange.start, -1);
+            const previousRange = await this.getPRBoundaryData(container.boundaryDetector, dayBeforeRecentStart);
+            const fileName = this.resolveTokens(container.naming, previousRange.tokens);
+            const folderPath = container.saveDir || "";
+            const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
+            const file = this.app.vault.getAbstractFileByPath(filePath);
+            return (file && file instanceof TFile) ? file : null;
+        } catch (e) {
+            console.error("Periodic Ritual: findPreviousPRContainerNote failed", e);
+            return null;
+        }
+    }
+
+    // Resolve a single question's variable injection. Returns the string to
+    // show above the question, or empty string if no injection or if the
+    // referenced field/note doesn't exist.
+    async resolvePRInjectedVar(question, container) {
+        if (!question || !question.injectVar || !question.varField) return "";
+        let sourceFile = null;
+        if (question.varSource === "note" && question.varNotePath) {
+            const f = this.app.vault.getAbstractFileByPath(question.varNotePath);
+            if (f && f instanceof TFile) sourceFile = f;
+        } else {
+            // Default: previous-period
+            sourceFile = await this.findPreviousPRContainerNote(container);
+        }
+        if (!sourceFile) return "";
+        try {
+            if ((question.varFieldType || "inline") === "frontmatter") {
+                const cache = this.app.metadataCache.getFileCache(sourceFile);
+                const v = cache?.frontmatter?.[question.varField];
+                return (v === null || v === undefined) ? "" : String(v);
+            }
+            // Inline field — read body and regex match
+            const content = await this.app.vault.read(sourceFile);
+            const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+            const re = new RegExp(`^${escapeRegex(question.varField)}::\\s*(.+)$`, "m");
+            const m = body.match(re);
+            return m ? m[1].trim() : "";
+        } catch (e) {
+            console.error("Periodic Ritual: resolvePRInjectedVar failed", e);
+            return "";
+        }
+    }
+
+    // Write a single answer to its configured output field on the container
+    // note. Inline fields go in the body; frontmatter fields go via
+    // processFrontMatter so we don't hand-edit YAML.
+    async writePRAnswerToField(file, question, answer) {
+        if (!file || !question || !question.outputToField || !question.outputFieldName) return;
+        const ans = (answer || "").trim();
+        if (!ans) return;
+        const fieldName = question.outputFieldName;
+        const fieldType = question.outputFieldType || "inline";
+        try {
+            if (fieldType === "frontmatter") {
+                await this.app.fileManager.processFrontMatter(file, fm => {
+                    fm[fieldName] = ans;
+                });
+                return;
+            }
+            // Inline: replace existing `key:: ...` if present, else append
+            let content = await this.app.vault.read(file);
+            const re = new RegExp(`^(${escapeRegex(fieldName)}::).*$`, "m");
+            if (re.test(content)) {
+                content = content.replace(re, `$1 ${ans}`);
+            } else {
+                content = content.trimEnd() + `\n${fieldName}:: ${ans}\n`;
+            }
+            await this.app.vault.modify(file, content);
+        } catch (e) {
+            console.error(`Periodic Ritual: failed to write answer for question "${question.text}":`, e);
+        }
+    }
+
     // Look up the reflection profile attached to a container.
     getPRReflectionForContainer(container) {
         if (!container || !container.reflectionId) return null;
@@ -2755,10 +2856,28 @@ class MonthlyRitualPlugin extends Plugin {
             return;
         }
 
+        // Resolve variable injection for each question before opening the
+        // modal. The modal displays whatever string we put in injectedVars[i]
+        // above question i — Daily Ritual uses the same pattern.
+        const injectedVars = [];
+        for (const q of reflection.questions) {
+            injectedVars.push(await this.resolvePRInjectedVar(q, container));
+        }
+
         // Reuse the existing ReflectionModal class — it only reads q.text
         // from each question and onSubmit gets an array of answer strings.
-        const injectedVars = reflection.questions.map(() => "");
         new ReflectionModal(this.app, reflection.questions, injectedVars, async (answers) => {
+            // Phase 6 (rework): write each answer to its configured output
+            // field BEFORE the LLM call. Two reasons:
+            //   1. The raw answer is persisted regardless of LLM success.
+            //   2. In "both" mode the LLM sees the answer in the existing
+            //      frontmatter, reinforcing it.
+            // If the user configured an output field that overlaps with a
+            // key the LLM is going to write, the LLM wins (last write).
+            for (let i = 0; i < reflection.questions.length; i++) {
+                await this.writePRAnswerToField(file, reflection.questions[i], answers[i]);
+            }
+
             const includePreviousFrontmatter = (reflection.mode || "manual") === "both";
             await this.runPRLLMAggregation(container, file, range, {
                 answers,
@@ -4438,10 +4557,27 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 this.display();
             }));
 
+        // Per-question expand state for the inject/output panels.
+        if (!this.prExpandedQInject) this.prExpandedQInject = {};
+        if (!this.prExpandedQOutput) this.prExpandedQOutput = {};
+
         const questions = Array.isArray(reflection.questions) ? reflection.questions : [];
         for (let i = 0; i < questions.length; i++) {
             const q = questions[i];
+            const qKey = `${reflection.id}-${i}`;
+            const expandedIn = !!this.prExpandedQInject[qKey];
+            const expandedOut = !!this.prExpandedQOutput[qKey];
+
+            // Question row: ← inject toggle, text input, → output toggle, ↑↓×
             const row = new Setting(body)
+                .addExtraButton(btn => {
+                    btn.setIcon(expandedIn ? "chevrons-left" : "chevron-left")
+                        .setTooltip(q.injectVar ? "Inject is enabled — click to configure" : "Configure variable injection")
+                        .onClick(() => {
+                            this.prExpandedQInject[qKey] = !expandedIn;
+                            this.display();
+                        });
+                })
                 .addText(t => {
                     t.setPlaceholder(`Question ${i + 1}`)
                         .setValue(q.text || "")
@@ -4450,6 +4586,14 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                             await this.plugin.saveSettings();
                         });
                     t.inputEl.style.width = "100%";
+                })
+                .addExtraButton(btn => {
+                    btn.setIcon(expandedOut ? "chevrons-right" : "chevron-right")
+                        .setTooltip(q.outputToField ? "Output is enabled — click to configure" : "Configure output to field")
+                        .onClick(() => {
+                            this.prExpandedQOutput[qKey] = !expandedOut;
+                            this.display();
+                        });
                 })
                 .addExtraButton(btn => {
                     btn.setIcon("up-chevron-glyph").setTooltip("Move up").onClick(async () => {
@@ -4470,11 +4614,127 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .addExtraButton(btn => {
                     btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
                         questions.splice(i, 1);
+                        delete this.prExpandedQInject[qKey];
+                        delete this.prExpandedQOutput[qKey];
                         await this.plugin.saveSettings();
                         this.display();
                     });
                 });
             row.infoEl.style.display = "none";
+            // Mark the row visually if inject/output are enabled
+            if (q.injectVar) row.settingEl.style.borderLeft = "2px solid var(--interactive-accent)";
+            if (q.outputToField) row.settingEl.style.borderRight = "2px solid var(--interactive-accent)";
+
+            // ── Inject panel (when expanded) ──
+            if (expandedIn) {
+                const panel = body.createDiv();
+                panel.style.cssText = "padding: 8px 12px 12px 32px; border-left: 2px solid var(--interactive-accent); margin: 0 0 8px 0; background: var(--background-secondary-alt);";
+
+                new Setting(panel)
+                    .setName("Enable variable injection")
+                    .setDesc("Show a value from another note above this question.")
+                    .addToggle(t => t
+                        .setValue(!!q.injectVar)
+                        .onChange(async v => {
+                            q.injectVar = v;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }));
+
+                if (q.injectVar) {
+                    new Setting(panel)
+                        .setName("Source")
+                        .addDropdown(dd => {
+                            dd.addOption("previous-period", "Previous period's container note");
+                            dd.addOption("note", "A specific note");
+                            dd.setValue(q.varSource || "previous-period");
+                            dd.onChange(async v => {
+                                q.varSource = v;
+                                await this.plugin.saveSettings();
+                                this.display();
+                            });
+                        });
+
+                    if ((q.varSource || "previous-period") === "note") {
+                        new Setting(panel)
+                            .setName("Source note")
+                            .setDesc(q.varNotePath || "None selected")
+                            .addButton(btn => {
+                                btn.setButtonText(q.varNotePath ? "Change" : "Choose").onClick(() => {
+                                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                                        q.varNotePath = file.path;
+                                        await this.plugin.saveSettings();
+                                        this.display();
+                                    }).open();
+                                });
+                            });
+                    }
+
+                    new Setting(panel)
+                        .setName("Field name")
+                        .setDesc("Field on the source note to read")
+                        .addText(t => t
+                            .setPlaceholder("today")
+                            .setValue(q.varField || "")
+                            .onChange(async v => {
+                                q.varField = v;
+                                await this.plugin.saveSettings();
+                            }));
+
+                    new Setting(panel)
+                        .setName("Field type")
+                        .addDropdown(dd => {
+                            dd.addOption("inline", "Inline (key:: value)");
+                            dd.addOption("frontmatter", "Frontmatter (key: value)");
+                            dd.setValue(q.varFieldType || "inline");
+                            dd.onChange(async v => {
+                                q.varFieldType = v;
+                                await this.plugin.saveSettings();
+                            });
+                        });
+                }
+            }
+
+            // ── Output panel (when expanded) ──
+            if (expandedOut) {
+                const panel = body.createDiv();
+                panel.style.cssText = "padding: 8px 12px 12px 32px; border-right: 2px solid var(--interactive-accent); margin: 0 0 8px 0; background: var(--background-secondary-alt); text-align: right;";
+
+                new Setting(panel)
+                    .setName("Write answer to field")
+                    .setDesc("Save the answer directly to a field on the container note (in addition to feeding it to the LLM).")
+                    .addToggle(t => t
+                        .setValue(!!q.outputToField)
+                        .onChange(async v => {
+                            q.outputToField = v;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }));
+
+                if (q.outputToField) {
+                    new Setting(panel)
+                        .setName("Field name")
+                        .addText(t => t
+                            .setPlaceholder("non_negotiable")
+                            .setValue(q.outputFieldName || "")
+                            .onChange(async v => {
+                                q.outputFieldName = v;
+                                await this.plugin.saveSettings();
+                            }));
+
+                    new Setting(panel)
+                        .setName("Field type")
+                        .addDropdown(dd => {
+                            dd.addOption("inline", "Inline (key:: value)");
+                            dd.addOption("frontmatter", "Frontmatter (key: value)");
+                            dd.setValue(q.outputFieldType || "inline");
+                            dd.onChange(async v => {
+                                q.outputFieldType = v;
+                                await this.plugin.saveSettings();
+                            });
+                        });
+                }
+            }
         }
 
         // Where this reflection is currently attached
