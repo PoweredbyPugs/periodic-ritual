@@ -562,6 +562,34 @@ function makePRLLMService(overrides = {}) {
     }, overrides);
 }
 
+// ─── Periodic Ritual: Alignment factory (Phase 7+) ───
+// An Alignment is a measurable anchor attached to a specific container.
+// It names a daily field to read, an optional description of what's being
+// measured, and an output field on the container note where the LLM
+// observation gets written. Multiple alignments per container.
+function makePRAlignment(overrides = {}) {
+    return Object.assign({
+        id: "al-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New alignment",
+        // Which container this alignment is attached to. Empty string means
+        // unassigned — the alignment exists in settings but doesn't fire on
+        // any container generation until you pick one.
+        containerId: "",
+        // Daily field to pull. e.g. "health" for inline `health::` or
+        // frontmatter `health:`.
+        dataField: "",
+        dataFieldType: "inline",  // "inline" | "frontmatter"
+        // Markdown text describing what's being measured. Sent to the LLM as
+        // context for the alignment pass — e.g., "30 min mobility/cardio
+        // daily, 80% sleep score average. Surface patterns of consistency
+        // and avoidance, not compliance scoring."
+        description: "",
+        // Frontmatter key on the container note where the LLM observation
+        // is written. Defaults to alignment_<sanitized-name>.
+        outputField: "",
+    }, overrides);
+}
+
 // ─── Periodic Ritual: Custom boundary factory (Phase 4c+) ───
 function makePRCustomBoundary(overrides = {}) {
     return Object.assign({
@@ -2373,11 +2401,18 @@ class MonthlyRitualPlugin extends Plugin {
             // frontmatter via Q&A + LLM. "auto" and "both" both run the LLM
             // here at boundary; "both" lets the user re-run later with answers.
             const reflectionMode = container.reflectionMode || "auto";
+            const range = { start: data.start, end: data.end };
             if (container.llmServiceId && container.systemPromptFile && reflectionMode !== "manual") {
-                await this.runPRLLMAggregation(container, file, {
-                    start: data.start,
-                    end: data.end,
-                }, opts);
+                await this.runPRLLMAggregation(container, file, range, opts);
+            }
+
+            // Phase 7: alignment passes. Run after main aggregation so the
+            // alignment writes don't get clobbered. Each alignment is one
+            // additional LLM call. Like the main aggregation, alignments are
+            // skipped in "manual" reflection mode and run by runPRContainerReflection
+            // along with the manual reflection pass.
+            if (reflectionMode !== "manual") {
+                await this.runPRAlignmentsForContainer(container, file, range, opts);
             }
 
             return file;
@@ -2688,10 +2723,150 @@ class MonthlyRitualPlugin extends Plugin {
                 answers,
                 includePreviousFrontmatter,
             });
+            // Phase 7: also run any alignments attached to this container.
+            // In manual mode this is the only place alignments fire, since
+            // generatePRContainerNote skips them when reflectionMode is "manual".
+            await this.runPRAlignmentsForContainer(container, file, range, {});
         }).open();
     }
 
-    // ─── Periodic Ritual auto-generation (Phase 3) ───
+    // ─── Periodic Ritual alignments (Phase 7) ───
+
+    // Find all alignments attached to a given container.
+    getPRAlignmentsForContainer(containerId) {
+        return (this.settings.prAlignments || []).filter(a => a.containerId === containerId);
+    }
+
+    // Run a single alignment pass against the container's date range.
+    // Pulls the named daily field from every daily note in range, sends
+    // the collected values to the LLM with the alignment description as
+    // the system prompt, and writes the LLM's observation to a single
+    // frontmatter key on the container note.
+    //
+    // Alignment passes are simpler than the main aggregation: one field,
+    // one prompt (the description), one output key. The LLM gets a focused
+    // task and returns a focused answer.
+    async runPRAlignmentPass(alignment, container, file, range, opts = {}) {
+        if (!alignment || !container || !file) return;
+        if (!alignment.dataField) {
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": no data field configured`);
+            return;
+        }
+        if (!alignment.description || !alignment.description.trim()) {
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": no description configured`);
+            return;
+        }
+
+        const service = this.getPRLLMService(container.llmServiceId);
+        if (!service || !service.model) {
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": container has no usable LLM service`);
+            return;
+        }
+
+        // Collect the named field from each daily note in range
+        const endInclusive = new Date(range.end);
+        endInclusive.setHours(23, 59, 59, 999);
+        const dailies = this.findDailyNotesInRange(range.start, endInclusive);
+
+        const entries = [];
+        for (const dn of dailies) {
+            let val = "";
+            if (alignment.dataFieldType === "frontmatter") {
+                const cache = this.app.metadataCache.getFileCache(dn);
+                const v = cache?.frontmatter?.[alignment.dataField];
+                val = (v === null || v === undefined) ? "" : String(v);
+            } else {
+                const content = await this.app.vault.read(dn);
+                const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+                const re = new RegExp(`^${escapeRegex(alignment.dataField)}::\\s*(.+)$`, "m");
+                const m = body.match(re);
+                val = m ? m[1].trim() : "";
+            }
+            if (val) entries.push(`- ${dn.basename}: ${val}`);
+        }
+
+        // Compose the LLM payload
+        const systemPrompt = [
+            `# Alignment: ${alignment.name}`,
+            "",
+            alignment.description.trim(),
+            "",
+            "# Your task",
+            "",
+            `Look at the daily values below for the field "${alignment.dataField}" across the period. Surface patterns of consistency, drift, and absence — not compliance scoring. Return ONLY a single string: a short observation (1-3 sentences) on how this alignment is going. No YAML, no markdown headings, no preamble.`,
+        ].join("\n");
+
+        const userMessage = [
+            `# Period`,
+            `start: ${formatDate(range.start)}`,
+            `end: ${formatDate(range.end)}`,
+            `daily_count: ${dailies.length}`,
+            `entries_with_value: ${entries.length}`,
+            "",
+            `# Daily values for "${alignment.dataField}"`,
+            "",
+            entries.length > 0 ? entries.join("\n") : "(no entries in range)",
+        ].join("\n");
+
+        const provider = PROVIDERS[service.provider];
+        if (!provider) {
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": unknown provider "${service.provider}"`);
+            return;
+        }
+
+        let responseText;
+        try {
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": running…`);
+            const url = provider.buildUrl(service);
+            const body = provider.buildBody(userMessage, service, systemPrompt);
+            const headers = {
+                "Content-Type": "application/json",
+                ...(provider.headers ? provider.headers(service) : {}),
+            };
+            const r = await requestUrl({
+                url, method: "POST", headers,
+                body: JSON.stringify(body),
+                throw: false,
+            });
+            if (r.status < 200 || r.status >= 300) {
+                throw new Error(`${r.status}: ${(r.text || "").slice(0, 300)}`);
+            }
+            responseText = provider.extractText(r.json);
+        } catch (e) {
+            new Notice(`Alignment "${alignment.name}" failed: ${e.message}`);
+            console.error("Periodic Ritual alignment error:", e);
+            return;
+        }
+
+        if (!responseText) {
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": empty response`);
+            return;
+        }
+
+        // Pick the output frontmatter key. Default: alignment_<sanitized-name>.
+        const outputKey = (alignment.outputField || "").trim() || `alignment_${(alignment.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+
+        try {
+            await this.app.fileManager.processFrontMatter(file, fm => {
+                fm[outputKey] = responseText.trim();
+            });
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": wrote to ${outputKey}`);
+        } catch (e) {
+            new Notice(`Alignment "${alignment.name}": failed to write — ${e.message}`);
+            console.error(e);
+        }
+    }
+
+    // Run all alignments attached to a container after main aggregation.
+    async runPRAlignmentsForContainer(container, file, range, opts = {}) {
+        const alignments = this.getPRAlignmentsForContainer(container.id);
+        if (alignments.length === 0) return;
+        for (const a of alignments) {
+            await this.runPRAlignmentPass(a, container, file, range, opts);
+        }
+    }
+
+    // ─── Periodic Ritual reflection (Phase 6) ───
 
     // Walk all enabled containers and catch each one up to the current period.
     // Called from onload when prAutoGenerateOnLoad is true, or manually via
@@ -4162,11 +4337,135 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         }
     }
 
+    // Phase 7: real Alignments tab. List of alignments with full edit UI.
     displayAlignmentsStub(containerEl) {
+        const s = this.plugin.settings;
+        if (!Array.isArray(s.prAlignments)) s.prAlignments = [];
+
         containerEl.createEl("h2", { text: "Alignments" });
-        const p = containerEl.createEl("p");
-        p.style.cssText = "color: var(--text-muted); max-width: 60ch;";
-        p.setText("Measurable anchors attached to a container. Each alignment names a daily field, a description of what is being measured, and the container level it lives in. Wired up in Phase 7.");
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        intro.setText("Measurable anchors attached to a container. Each alignment names a daily field to read, a description of what is being measured, and an output frontmatter key. The plugin runs an LLM pass per alignment after the main aggregation, surfacing patterns of consistency, drift, and absence — not compliance scoring.");
+
+        const containers = s.prContainers || [];
+        if (containers.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); margin: 16px 0;";
+            empty.setText("Add at least one container in the Containers tab before creating alignments.");
+            return;
+        }
+
+        if (s.prAlignments.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); margin: 16px 0;";
+            empty.setText("No alignments yet. Click below to add one.");
+        } else {
+            for (let i = 0; i < s.prAlignments.length; i++) {
+                this.renderPRAlignmentCard(containerEl, s.prAlignments[i], i);
+            }
+        }
+
+        new Setting(containerEl)
+            .addButton(btn => btn
+                .setButtonText("+ Add alignment")
+                .setCta()
+                .onClick(async () => {
+                    s.prAlignments.push(makePRAlignment());
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+    }
+
+    renderPRAlignmentCard(parent, alignment, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv({ cls: "mr-pr-card" });
+
+        // Header: name input + delete
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+        const nameInput = header.createEl("input", { type: "text", value: alignment.name || "", cls: "mr-pr-name-input" });
+        nameInput.placeholder = "Alignment name";
+        nameInput.addEventListener("change", async () => {
+            alignment.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
+        deleteBtn.title = "Delete alignment";
+        deleteBtn.addEventListener("click", async () => {
+            s.prAlignments.splice(idx, 1);
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const body = card.createDiv({ cls: "mr-pr-card-body" });
+
+        // Container picker
+        new Setting(body)
+            .setName("Container")
+            .setDesc("Which container this alignment is attached to. The alignment runs after the container's main aggregation.")
+            .addDropdown(dd => {
+                dd.addOption("", "— None —");
+                for (const c of (s.prContainers || [])) {
+                    dd.addOption(c.id, c.name || "(unnamed)");
+                }
+                dd.setValue(alignment.containerId || "");
+                dd.onChange(async v => {
+                    alignment.containerId = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // Data field
+        new Setting(body)
+            .setName("Data field")
+            .setDesc("Daily field to pull values from. e.g. \"health\" reads inline health:: from each daily note in the container's range.")
+            .addText(t => t
+                .setPlaceholder("health")
+                .setValue(alignment.dataField || "")
+                .onChange(async v => {
+                    alignment.dataField = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Data field type
+        new Setting(body)
+            .setName("Field type")
+            .addDropdown(dd => {
+                dd.addOption("inline", "Inline (key:: value)");
+                dd.addOption("frontmatter", "Frontmatter (key: value)");
+                dd.setValue(alignment.dataFieldType || "inline");
+                dd.onChange(async v => {
+                    alignment.dataFieldType = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // Description
+        new Setting(body)
+            .setName("Description")
+            .setDesc("What you're measuring and how the LLM should think about it. Sent as the system prompt for this alignment's LLM pass. Example: \"30 min mobility/cardio daily, 80% sleep score average. Surface patterns of consistency and avoidance, not compliance.\"")
+            .addTextArea(t => {
+                t.setValue(alignment.description || "")
+                    .onChange(async v => {
+                        alignment.description = v;
+                        await this.plugin.saveSettings();
+                    });
+                t.inputEl.rows = 4;
+                t.inputEl.style.width = "100%";
+            });
+
+        // Output field
+        new Setting(body)
+            .setName("Output frontmatter key")
+            .setDesc("Frontmatter key on the container note where the LLM observation gets written. Leave blank to default to alignment_<sanitized-name>.")
+            .addText(t => t
+                .setPlaceholder("alignment_morning_mobility")
+                .setValue(alignment.outputField || "")
+                .onChange(async v => {
+                    alignment.outputField = v;
+                    await this.plugin.saveSettings();
+                }));
     }
 
     // Phase 2: real LLM tab. List of services with add/edit/remove and a
