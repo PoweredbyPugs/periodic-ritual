@@ -1008,6 +1008,78 @@ class MonthlyRitualPlugin extends Plugin {
         };
     }
 
+    // ─── Calendar boundaries (Phase 4a) ───
+
+    // Calendar month containing `date`. Reuses the same logic as the legacy
+    // getCalendarContainerData but exposes it through the PR detector dispatch.
+    getCurrentCalendarMonthData(date) {
+        const d = date || new Date();
+        const start = getMonthStart(d);
+        const end = getMonthEnd(d);
+        return {
+            start, end,
+            tokens: {
+                year: String(d.getFullYear()),
+                month: String(d.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(d),
+                day: String(d.getDate()).padStart(2, "0"),
+                date: formatDate(start),
+                "month-start": formatDate(start),
+                "month-end": formatDate(end),
+                cycle: String(d.getMonth() + 1).padStart(2, "0"),
+            },
+        };
+    }
+
+    // Calendar quarter containing `date`. Q1 = Jan–Mar, Q2 = Apr–Jun,
+    // Q3 = Jul–Sep, Q4 = Oct–Dec. The container's name is left to the user
+    // (they might call this "Chapter", "Quarter", "Q1", or anything else).
+    getCurrentCalendarQuarterData(date) {
+        const d = date || new Date();
+        const year = d.getFullYear();
+        const quarterIdx = Math.floor(d.getMonth() / 3); // 0..3
+        const start = new Date(year, quarterIdx * 3, 1);
+        const end = new Date(year, quarterIdx * 3 + 3, 0); // last day of last month in quarter
+        const quarterNum = quarterIdx + 1;
+        return {
+            start, end,
+            tokens: {
+                year: String(year),
+                month: String(d.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(d),
+                day: String(d.getDate()).padStart(2, "0"),
+                date: formatDate(start),
+                quarter: String(quarterNum),
+                "quarter-name": `Q${quarterNum}`,
+                "quarter-start": formatDate(start),
+                "quarter-end": formatDate(end),
+                cycle: String(quarterNum),
+            },
+        };
+    }
+
+    // Calendar year containing `date`. The container's name is left to the
+    // user (they might call this "Book", "Year", or the year number).
+    getCurrentCalendarYearData(date) {
+        const d = date || new Date();
+        const year = d.getFullYear();
+        const start = new Date(year, 0, 1);
+        const end = new Date(year, 11, 31);
+        return {
+            start, end,
+            tokens: {
+                year: String(year),
+                month: String(d.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(d),
+                day: String(d.getDate()).padStart(2, "0"),
+                date: formatDate(start),
+                "year-start": formatDate(start),
+                "year-end": formatDate(end),
+                cycle: String(year),
+            },
+        };
+    }
+
     // ─── Lunar boundaries ───
 
     async getLunarContainerData(date) {
@@ -1361,23 +1433,30 @@ class MonthlyRitualPlugin extends Plugin {
     //  PERIODIC RITUAL — Container generation (Phase 1+)
     // ═══════════════════════════════════════════════════════════════
 
-    // Boundary detector dispatcher. Phase 1 only handles calendar-week.
-    // Later phases add: calendar-month, sun-ingress, lunar-phase, lunar-cycle, chapter, book.
+    // Boundary detector dispatcher. Phase 4a adds calendar month/quarter/year.
+    // Phase 4b will add helios-backed sun-ingress / lunar-phase / lunar-cycle.
+    // Phase 4c will add custom JS module backends.
     getPRBoundaryData(detector, date) {
         const d = date || new Date();
         switch (detector) {
-            case "calendar-week":
-                return this.getCurrentWeekData(d);
+            case "calendar-week":    return this.getCurrentWeekData(d);
+            case "calendar-month":   return this.getCurrentCalendarMonthData(d);
+            case "calendar-quarter": return this.getCurrentCalendarQuarterData(d);
+            case "calendar-year":    return this.getCurrentCalendarYearData(d);
             default:
                 throw new Error(`Boundary detector "${detector}" is not implemented yet`);
         }
     }
 
     // List of detectors available in the current build, for the settings dropdown.
-    // Adding a phase = adding an entry here + a case in getPRBoundaryData.
+    // Adding a detector = adding an entry here + a case in getPRBoundaryData.
+    // Labels are deliberately neutral — the user names containers themselves.
     getPRAvailableBoundaryDetectors() {
         return [
-            { id: "calendar-week", label: "Calendar Week" },
+            { id: "calendar-week",    label: "Calendar Week" },
+            { id: "calendar-month",   label: "Calendar Month" },
+            { id: "calendar-quarter", label: "Calendar Quarter" },
+            { id: "calendar-year",    label: "Calendar Year" },
         ];
     }
 
@@ -2860,7 +2939,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // ── Naming convention ──
         new Setting(card)
             .setName("Naming convention")
-            .setDesc("Tokens: {{year}}, {{month}}, {{month-name}}, {{day}}, {{date}}, {{week}}, {{week-start}}, {{week-end}}")
+            .setDesc("Tokens vary per detector. Common: {{year}}, {{month}}, {{month-name}}, {{day}}, {{date}}, {{cycle}}. Week: {{week}}, {{week-start}}, {{week-end}}. Month: {{month-start}}, {{month-end}}. Quarter: {{quarter}}, {{quarter-name}}, {{quarter-start}}, {{quarter-end}}. Year: {{year-start}}, {{year-end}}.")
             .addText(t => t
                 .setPlaceholder("W{{week}}-{{year}}")
                 .setValue(container.naming || "")
