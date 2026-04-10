@@ -2786,8 +2786,15 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             .addDropdown(dd => {
                 dd.addOption("", "— None —");
                 for (const svc of services) {
-                    const provName = PROVIDERS[svc.provider]?.name || svc.provider;
-                    const modelLabel = svc.model || "no model selected";
+                    // Strip parenthetical suffixes like "(local agent)" / "(local)"
+                    // from the provider's display name to keep the dropdown short.
+                    const rawName = PROVIDERS[svc.provider]?.name || svc.provider;
+                    const provName = rawName.replace(/\s*\([^)]*\)\s*$/, "");
+                    // Strip a leading "<provider>/" prefix from the model id so
+                    // OpenClaw shows "OpenClaw (mei)" instead of the redundant
+                    // "OpenClaw (local agent) (openclaw/mei)".
+                    const rawModel = svc.model || "no model selected";
+                    const modelLabel = rawModel.replace(new RegExp(`^${svc.provider}/`, "i"), "");
                     dd.addOption(svc.id, `${provName} (${modelLabel})`);
                 }
                 dd.setValue(container.llmServiceId || "");
