@@ -526,7 +526,28 @@ function makePRContainer(overrides = {}) {
         // First-run containers have an empty string and only generate the
         // current period (no historical backfill).
         lastGeneratedEnd: "",
+        // Phase 6+ reflection
+        // "auto"   — at boundary, the LLM runs against daily data only.
+        //            No user interaction.
+        // "manual" — at boundary, the note is created with template content
+        //            only (no LLM call). The user runs the reflection
+        //            command later to fill the frontmatter via Q&A + LLM.
+        // "both"   — auto LLM runs at boundary as in "auto" mode. The
+        //            reflection command can be run any time after to
+        //            re-summarize with answers AND the existing frontmatter
+        //            as additional context.
+        reflectionMode: "auto",
+        questions: [],   // [{ text: string }]
     }, overrides);
+}
+
+// Periodic Ritual: simple question factory for the PR reflection modal.
+// Only needs `text` because the existing ReflectionModal class only reads
+// q.text. The legacy makeQuestion has more fields used by the old reflection
+// flow (var injection, output to field) — we don't need any of that for PR
+// because the LLM handles output.
+function makePRQuestion(text) {
+    return { text: text || "" };
 }
 
 // ─── Periodic Ritual: LLM service factory (Phase 2+) ───
@@ -2345,9 +2366,14 @@ class MonthlyRitualPlugin extends Plugin {
             // Phase 2: LLM aggregation. If the container has both a service
             // and a system prompt configured, run the aggregation pass and
             // merge the parsed YAML response into the file's frontmatter.
-            // Skipped silently when not configured — Phase 1 behavior is
-            // preserved for containers without LLM setup.
-            if (container.llmServiceId && container.systemPromptFile) {
+            // Skipped silently when not configured.
+            //
+            // Phase 6: also skipped when reflectionMode is "manual" — in that
+            // mode, the user runs the reflection command later to fill the
+            // frontmatter via Q&A + LLM. "auto" and "both" both run the LLM
+            // here at boundary; "both" lets the user re-run later with answers.
+            const reflectionMode = container.reflectionMode || "auto";
+            if (container.llmServiceId && container.systemPromptFile && reflectionMode !== "manual") {
                 await this.runPRLLMAggregation(container, file, {
                     start: data.start,
                     end: data.end,
@@ -2487,17 +2513,57 @@ class MonthlyRitualPlugin extends Plugin {
         // Build the daily payload
         const payload = await this.buildPRDailyPayload(range.start, range.end);
 
-        // Compose the user message
-        const userMessage = [
+        // Compose the user message. Three optional sections beyond the
+        // standard period header + daily notes:
+        //   1. Reflection answers (Phase 6) — when opts.answers is provided
+        //      from the manual reflection modal.
+        //   2. Previous frontmatter (Phase 6) — when opts.includePreviousFrontmatter
+        //      is set, used in "both" mode re-runs so the LLM sees what was
+        //      auto-aggregated before and can build on it instead of starting
+        //      from scratch.
+        //   3. (none yet) — Phase 7 will add alignment context.
+        const parts = [
             `# Period`,
             `start: ${formatDate(range.start)}`,
             `end: ${formatDate(range.end)}`,
             `daily_count: ${payload.count}`,
             "",
-            `# Daily notes`,
-            "",
-            payload.text,
-        ].join("\n");
+        ];
+
+        if (Array.isArray(opts.answers) && opts.answers.length > 0 && Array.isArray(container.questions)) {
+            parts.push("# Reflection answers", "");
+            for (let i = 0; i < container.questions.length; i++) {
+                const ans = (opts.answers[i] || "").trim();
+                if (!ans) continue;
+                parts.push(`**${container.questions[i].text}**`);
+                parts.push(ans);
+                parts.push("");
+            }
+            parts.push("");
+        }
+
+        if (opts.includePreviousFrontmatter && file) {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const fm = cache?.frontmatter || {};
+            const lines = [];
+            for (const [k, v] of Object.entries(fm)) {
+                if (k === "periodic-ritual" || k === "position") continue;
+                if (k.startsWith("pr-")) continue;
+                if (v === null || v === undefined) continue;
+                if (typeof v === "object") {
+                    lines.push(`${k}: ${JSON.stringify(v)}`);
+                } else {
+                    lines.push(`${k}: ${v}`);
+                }
+            }
+            if (lines.length > 0) {
+                parts.push("# Previous frontmatter (from earlier auto-aggregation)", "", ...lines, "");
+            }
+        }
+
+        parts.push("# Daily notes", "", payload.text);
+
+        const userMessage = parts.join("\n");
 
         // Call the LLM
         const provider = PROVIDERS[service.provider];
@@ -2558,6 +2624,71 @@ class MonthlyRitualPlugin extends Plugin {
             if (!opts.silent) new Notice(`${container.name}: failed to write frontmatter — ${e.message}`);
             console.error("Periodic Ritual processFrontMatter error:", e);
         }
+    }
+
+    // ─── Periodic Ritual reflection (Phase 6) ───
+
+    // Find the most recently generated note for a container by walking back
+    // from lastGeneratedEnd through the boundary detector to recover the
+    // period that produced the file, then resolving the naming convention
+    // against that period's tokens.
+    async findMostRecentPRContainerNote(container) {
+        if (!container || !container.lastGeneratedEnd || !container.naming) return null;
+        const periodEndDate = new Date(container.lastGeneratedEnd);
+        if (isNaN(periodEndDate.getTime())) return null;
+        try {
+            const data = await this.getPRBoundaryData(container.boundaryDetector, periodEndDate);
+            const fileName = this.resolveTokens(container.naming, data.tokens);
+            const folderPath = container.saveDir || "";
+            const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
+            const file = this.app.vault.getAbstractFileByPath(filePath);
+            return (file && file instanceof TFile) ? file : null;
+        } catch (e) {
+            console.error("Periodic Ritual: findMostRecentPRContainerNote failed", e);
+            return null;
+        }
+    }
+
+    // Open the reflection modal for a container, then on submit re-run LLM
+    // aggregation with the answers attached. In "both" mode, also pass the
+    // file's existing frontmatter as additional context so the LLM builds
+    // on the previous auto-summary instead of starting fresh.
+    async runPRContainerReflection(container) {
+        if (!container) { new Notice("No container provided"); return; }
+        if (!Array.isArray(container.questions) || container.questions.length === 0) {
+            new Notice(`${container.name}: no questions configured. Add some in the container settings.`);
+            return;
+        }
+        if (!container.llmServiceId || !container.systemPromptFile) {
+            new Notice(`${container.name}: reflection requires both an LLM service and a system prompt`);
+            return;
+        }
+
+        const file = await this.findMostRecentPRContainerNote(container);
+        if (!file) {
+            new Notice(`${container.name}: no recent note found. Generate one first.`);
+            return;
+        }
+
+        const periodEndDate = new Date(container.lastGeneratedEnd);
+        let range;
+        try {
+            range = await this.getPRBoundaryData(container.boundaryDetector, periodEndDate);
+        } catch (e) {
+            new Notice(`${container.name}: could not resolve period — ${e.message}`);
+            return;
+        }
+
+        // Reuse the existing ReflectionModal class — it only reads q.text
+        // from each question and onSubmit gets an array of answer strings.
+        const injectedVars = container.questions.map(() => "");
+        new ReflectionModal(this.app, container.questions, injectedVars, async (answers) => {
+            const includePreviousFrontmatter = (container.reflectionMode || "auto") === "both";
+            await this.runPRLLMAggregation(container, file, range, {
+                answers,
+                includePreviousFrontmatter,
+            });
+        }).open();
     }
 
     // ─── Periodic Ritual auto-generation (Phase 3) ───
@@ -3123,6 +3254,29 @@ class MonthlyRitualPlugin extends Plugin {
             name: "Periodic Ritual: Catch up missed notes",
             callback: () => this.runPRAutoGenerate(),
         });
+
+        // Phase 6: reflect on a container. Opens a fuzzy picker over
+        // containers that have reflection enabled (mode != auto), then
+        // opens the modal for the picked one.
+        this.addCommand({
+            id: "pr-reflect",
+            name: "Periodic Ritual: Reflect on container",
+            callback: () => this.pickAndReflectPRContainer(),
+        });
+    }
+
+    pickAndReflectPRContainer() {
+        const containers = (this.settings.prContainers || [])
+            .filter(c => (c.reflectionMode || "auto") !== "auto");
+        if (containers.length === 0) {
+            new Notice("No Periodic Ritual containers have reflection enabled. Set a container's reflection mode to manual or both in the Containers tab.");
+            return;
+        }
+        const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
+            await this.runPRContainerReflection(container);
+        });
+        modal.setPlaceholder("Pick a container to reflect on…");
+        modal.open();
     }
 
     // Fuzzy picker over all configured PR containers (enabled or not).
@@ -3918,14 +4072,94 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 });
             });
 
-        // ── Generate button ──
+        // ── Reflection mode (Phase 6) ──
         new Setting(card)
+            .setName("Reflection")
+            .setDesc("Auto: LLM runs at boundary against daily data only. Manual: note is created without an LLM call; you run the reflection command later to fill it. Both: LLM runs at boundary AND you can re-run reflection later with answers + existing frontmatter as context.")
+            .addDropdown(dd => {
+                dd.addOption("auto", "Auto (LLM at boundary)");
+                dd.addOption("manual", "Manual (Q&A on demand)");
+                dd.addOption("both", "Both");
+                dd.setValue(container.reflectionMode || "auto");
+                dd.onChange(async v => {
+                    container.reflectionMode = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // Show questions list + Reflect now button only when reflection is enabled
+        const mode = container.reflectionMode || "auto";
+        if (mode !== "auto") {
+            // Questions list
+            const qHeader = new Setting(card)
+                .setName("Reflection questions")
+                .setDesc("Asked one at a time when you run reflection. Answers are sent to the LLM along with the daily data.");
+            qHeader.addButton(btn => btn
+                .setButtonText("+ Add")
+                .onClick(async () => {
+                    if (!Array.isArray(container.questions)) container.questions = [];
+                    container.questions.push(makePRQuestion(""));
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+
+            const questions = Array.isArray(container.questions) ? container.questions : [];
+            for (let i = 0; i < questions.length; i++) {
+                const q = questions[i];
+                const row = new Setting(card)
+                    .addText(t => {
+                        t.setPlaceholder(`Question ${i + 1}`)
+                            .setValue(q.text || "")
+                            .onChange(async v => {
+                                q.text = v;
+                                await this.plugin.saveSettings();
+                            });
+                        t.inputEl.style.width = "100%";
+                    })
+                    .addExtraButton(btn => {
+                        btn.setIcon("up-chevron-glyph").setTooltip("Move up").onClick(async () => {
+                            if (i === 0) return;
+                            [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]];
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                    })
+                    .addExtraButton(btn => {
+                        btn.setIcon("down-chevron-glyph").setTooltip("Move down").onClick(async () => {
+                            if (i === questions.length - 1) return;
+                            [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]];
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                    })
+                    .addExtraButton(btn => {
+                        btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
+                            questions.splice(i, 1);
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                    });
+                // Strip the setting-item-info side so the text input takes the full width
+                row.infoEl.style.display = "none";
+            }
+        }
+
+        // ── Generate / Reflect buttons ──
+        const actions = new Setting(card)
             .addButton(btn => btn
                 .setButtonText("Generate now")
                 .setCta()
                 .onClick(async () => {
                     await this.plugin.generatePRContainerNote(container);
                 }));
+        if (mode !== "auto") {
+            actions.addButton(btn => btn
+                .setButtonText("Reflect now")
+                .onClick(async () => {
+                    await this.plugin.runPRContainerReflection(container);
+                }));
+        }
     }
 
     displayAlignmentsStub(containerEl) {
