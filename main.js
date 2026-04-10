@@ -1228,7 +1228,9 @@ const DEFAULT_SETTINGS = {
     dailyNotesFolder: "",
 
     calendarTimezone: "America/New_York",
-    calendarNoteFolder: "",
+    calendarNoteFolder: "",        // legacy, kept for backward compat (used as fallback)
+    calendarSolarNoteFolder: "",   // where the Zodiac Calendar links solar / sign-period notes
+    calendarLunarNoteFolder: "",   // where the Zodiac Calendar links lunar phase notes
     calendarNoteNaming: "\u2600\uFE0F Sun in {{sign}}",
     lunarNoteNaming: {
         "New Moon": "\uD83C\uDF11 {{phase-name}} Moon in {{moon-sign}}",
@@ -1811,7 +1813,7 @@ class MonthlyRitualPlugin extends Plugin {
         this.registerCommands();
 
         this.registerView(CALENDAR_VIEW_TYPE, (leaf) => new RitualCalendarView(leaf, this));
-        this.addRibbonIcon("calendar-days", "Ritual Calendar", () => this.activateCalendarView());
+        this.addRibbonIcon("calendar-days", "Zodiac Calendar", () => this.activateCalendarView());
 
         // Phase 3: auto-generation on load. Boundary-driven catch-up for any
         // enabled Periodic Ritual containers whose periods have crossed since
@@ -4029,11 +4031,11 @@ class MonthlyRitualPlugin extends Plugin {
     // ─── Commands ───
 
     registerCommands() {
-        // The Calendar View command stays — the lunisolar sidebar grid is
+        // The Zodiac Calendar command stays — the lunisolar sidebar grid is
         // independent of the legacy mode/reflection pipeline.
         this.addCommand({
             id: "open-calendar",
-            name: "Open Ritual Calendar",
+            name: "Open Zodiac Calendar",
             callback: () => this.activateCalendarView(),
         });
 
@@ -4353,7 +4355,7 @@ class RitualCalendarView extends ItemView {
     }
 
     getViewType() { return CALENDAR_VIEW_TYPE; }
-    getDisplayText() { return "Ritual Calendar"; }
+    getDisplayText() { return "Zodiac Calendar"; }
     getIcon() { return "calendar-days"; }
 
     async onOpen() {
@@ -4508,7 +4510,11 @@ class RitualCalendarView extends ItemView {
     async openSignNote(signPeriod) {
         const naming = this.plugin.settings.calendarNoteNaming || "\u2600\uFE0F Sun in {{sign}}";
         const fileName = this.resolveCalendarNoteName(naming, { sign: signPeriod.sign, glyph: signPeriod.glyph, year: String(signPeriod.start.getFullYear()) });
-        const folder = this.plugin.settings.calendarNoteFolder || "";
+        // Solar folder first; fall back to the legacy unified folder for users
+        // who haven't split their config yet.
+        const folder = this.plugin.settings.calendarSolarNoteFolder
+            || this.plugin.settings.calendarNoteFolder
+            || "";
         const filePath = folder ? `${folder}/${fileName}.md` : `${fileName}.md`;
 
         const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
@@ -4528,7 +4534,10 @@ class RitualCalendarView extends ItemView {
             "moon-sign": moonSign || "",
             "moon-glyph": moonSign ? (SIGN_GLYPHS[moonSign] || "") : "",
         });
-        const folder = this.plugin.settings.calendarNoteFolder || "";
+        // Lunar folder first; fall back to the legacy unified folder.
+        const folder = this.plugin.settings.calendarLunarNoteFolder
+            || this.plugin.settings.calendarNoteFolder
+            || "";
         const filePath = folder ? `${folder}/${fileName}.md` : `${fileName}.md`;
 
         const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
@@ -4582,7 +4591,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             { id: "containers", label: "Containers" },
             { id: "boundaries", label: "Boundaries" },
             { id: "reflection", label: "Reflection" },
-            { id: "alignments", label: "Alignments" },
+            { id: "alignments", label: "Alignment" },
             { id: "llm",        label: "LLM" },
             { id: "general",    label: "General" },
         ];
@@ -4624,7 +4633,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const intro = containerEl.createEl("p");
         intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
-        intro.setText("Each container is an independently configured periodic note type. Phase 1 supports Calendar Week. More boundary detectors land in later phases.");
+        intro.setText("Each container is an independently configured periodic note type. Pick a boundary (calendar, lunar, solar, or your own custom JS module), point at a template and save folder, optionally attach an LLM service + system prompt, reflection profile, and alignments. Containers can also read from each other for hierarchical roll-up — see the Boundaries tab and the Data source field on each card.");
 
         if (s.prContainers.length === 0) {
             const empty = containerEl.createEl("p");
@@ -5349,12 +5358,12 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         }
     }
 
-    // Phase 7: real Alignments tab. List of alignments with full edit UI.
+    // Phase 7: real Alignment tab. List of alignments with full edit UI.
     displayAlignmentsStub(containerEl) {
         const s = this.plugin.settings;
         if (!Array.isArray(s.prAlignments)) s.prAlignments = [];
 
-        containerEl.createEl("h2", { text: "Alignments" });
+        containerEl.createEl("h2", { text: "Alignment" });
         const intro = containerEl.createEl("p");
         intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
         intro.setText("Measurable anchors attached to a container. Each alignment names a daily field to read, a description of what is being measured, and an output frontmatter key. The plugin runs an LLM pass per alignment after the main aggregation, surfacing patterns of consistency, drift, and absence — not compliance scoring.");
@@ -5923,15 +5932,15 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        // ── Calendar view (sidebar lunisolar grid) ──
-        containerEl.createEl("h3", { text: "Calendar view" }).style.marginTop = "24px";
+        // ── Zodiac Calendar (sidebar lunisolar grid) ──
+        containerEl.createEl("h3", { text: "Zodiac Calendar" }).style.marginTop = "24px";
         const calIntro = containerEl.createEl("p");
         calIntro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch;";
-        calIntro.setText("The Ritual Calendar is a sidebar view showing the current zodiac sign with lunar phase rows. Open it via the ribbon or the 'Open Ritual Calendar' command.");
+        calIntro.setText("Sidebar view showing the current zodiac sign with lunar phase rows. Open it via the ribbon or the 'Open Zodiac Calendar' command.");
 
         new Setting(containerEl)
             .setName("Timezone")
-            .setDesc("Timezone for the calendar view's date math")
+            .setDesc("Timezone for the calendar's date math")
             .addText(t => t
                 .setPlaceholder("America/New_York")
                 .setValue(s.calendarTimezone || "America/New_York")
@@ -5940,13 +5949,14 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
+        // Solar / sign-period notes folder
         new Setting(containerEl)
-            .setName("Note folder")
-            .setDesc("Where the calendar view links to / creates solar and lunar notes. Click the header or moon emoji in the calendar to navigate.")
+            .setName("Solar note folder")
+            .setDesc("Where the calendar links to sign-period (solar) notes. Click the calendar header to open one.")
             .addButton(btn => {
-                btn.setButtonText(s.calendarNoteFolder ? "Change" : "Choose").onClick(() => {
+                btn.setButtonText(s.calendarSolarNoteFolder ? "Change" : "Choose").onClick(() => {
                     new FolderSuggestModal(this.app, async (folder) => {
-                        s.calendarNoteFolder = folder.path;
+                        s.calendarSolarNoteFolder = folder.path;
                         await this.plugin.saveSettings();
                         this.display();
                     }).open();
@@ -5954,18 +5964,42 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             })
             .addExtraButton(btn => {
                 btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
-                    s.calendarNoteFolder = "";
+                    s.calendarSolarNoteFolder = "";
                     await this.plugin.saveSettings();
                     this.display();
                 });
             });
-        const calFolderNote = containerEl.createEl("p");
-        calFolderNote.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 4px 0 0 0;";
-        calFolderNote.setText(`Currently: ${s.calendarNoteFolder || "(none)"}`);
+        const solarFolderNote = containerEl.createEl("p");
+        solarFolderNote.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 4px 0 0 0;";
+        solarFolderNote.setText(`Currently: ${s.calendarSolarNoteFolder || s.calendarNoteFolder || "(none)"}`);
+
+        // Lunar phase notes folder
+        new Setting(containerEl)
+            .setName("Lunar note folder")
+            .setDesc("Where the calendar links to lunar phase notes. Click a moon emoji in the calendar to open one. Can be the same folder as solar notes if you want.")
+            .addButton(btn => {
+                btn.setButtonText(s.calendarLunarNoteFolder ? "Change" : "Choose").onClick(() => {
+                    new FolderSuggestModal(this.app, async (folder) => {
+                        s.calendarLunarNoteFolder = folder.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    s.calendarLunarNoteFolder = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+        const lunarFolderNote = containerEl.createEl("p");
+        lunarFolderNote.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 4px 0 0 0;";
+        lunarFolderNote.setText(`Currently: ${s.calendarLunarNoteFolder || s.calendarNoteFolder || "(none)"}`);
 
         new Setting(containerEl)
             .setName("Solar note naming")
-            .setDesc("Naming template for the zodiac sign note the calendar header links to. Tokens: {{sign}}, {{glyph}}, {{year}}.")
+            .setDesc("Naming template for the sign-period note the calendar header links to. Tokens: {{sign}}, {{glyph}}, {{year}}.")
             .addText(t => t
                 .setPlaceholder("☀️ Sun in {{sign}}")
                 .setValue(s.calendarNoteNaming || "")
