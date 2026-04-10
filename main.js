@@ -4452,17 +4452,23 @@ class PRGraphView extends ItemView {
             });
         }
 
-        // ── Boundary nodes (one per used detector) ──
+        // ── Boundary nodes ──
+        // Built-in boundaries: only those referenced by a container.
+        // Custom boundaries: always shown so newly created ones are visible
+        // even before they're wired up.
+        const customBoundaryIdsRendered = new Set();
         for (const detId of usedBoundaries) {
             if (detId.startsWith("custom:")) {
                 const cbId = detId.slice("custom:".length);
                 const cb = customBoundaries.find(c => c.id === cbId);
+                customBoundaryIdsRendered.add(cbId);
                 nodes.push({
                     id: `boundary-custom-${cbId}`,
                     kind: "boundary",
                     title: cb?.name || "(custom)",
                     subtitle: "Custom JS",
                     refKey: detId,
+                    primitive: cb,
                     primitiveTab: "boundaries",
                 });
             } else {
@@ -4476,6 +4482,18 @@ class PRGraphView extends ItemView {
                     primitiveTab: "boundaries",
                 });
             }
+        }
+        // Unattached custom boundaries (none of the containers reference them yet)
+        for (const cb of customBoundaries) {
+            if (customBoundaryIdsRendered.has(cb.id)) continue;
+            nodes.push({
+                id: `boundary-custom-${cb.id}`,
+                kind: "boundary",
+                title: cb.name || "(custom)",
+                subtitle: "Custom JS",
+                primitive: cb,
+                primitiveTab: "boundaries",
+            });
         }
 
         // ── Container nodes ──
@@ -5204,9 +5222,10 @@ class PRGraphView extends ItemView {
 
     renderReflectionExpanded(body, node, h) {
         const r = node.primitive;
+        const stop = (el) => el.addEventListener("mousedown", (e) => e.stopPropagation());
 
-        // useLLM and replaceAutoLLM toggles already shown in collapsed widgets;
-        // skip the duplicates here. Show prompt prepend and questions list.
+        // useLLM / replaceAutoLLM toggles already render in the collapsed
+        // widgets via renderNodeWidgets. Skip the duplicates here.
 
         h.addLabeledTextArea("Prompt prepend",
             "Optional markdown layered on top of the container's system prompt during reflection runs.",
@@ -5215,36 +5234,200 @@ class PRGraphView extends ItemView {
             3
         );
 
-        // Questions list — text only. Per-question inject/output config still
-        // lives in the settings tab (too much UI for a node).
+        // ── Questions ──
         if (!Array.isArray(r.questions)) r.questions = [];
-        const qWrap = body.createEl("div", { cls: "pr-graph-form-row" });
-        qWrap.createEl("div", { cls: "pr-graph-form-label", text: `Questions (${r.questions.length})` });
-        const qList = qWrap.createEl("div", { cls: "pr-graph-form-qlist" });
+        if (!this.prGraphQExpanded) this.prGraphQExpanded = {};
+
+        const qSection = body.createEl("div", { cls: "pr-graph-form-row" });
+        qSection.createEl("div", { cls: "pr-graph-form-label", text: `Questions (${r.questions.length})` });
+        const qList = qSection.createEl("div", { cls: "pr-graph-q-list" });
+
         for (let i = 0; i < r.questions.length; i++) {
             const q = r.questions[i];
-            const qRow = qList.createEl("div", { cls: "pr-graph-form-qrow" });
-            const input = qRow.createEl("input", { type: "text", value: q.text || "", cls: "pr-graph-form-text" });
-            input.placeholder = `Question ${i + 1}`;
-            input.addEventListener("mousedown", (e) => e.stopPropagation());
-            input.addEventListener("change", async () => { q.text = input.value; await this.plugin.saveSettings(); });
-            const delBtn = qRow.createEl("button", { text: "×", cls: "pr-graph-form-qdel" });
-            delBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-            delBtn.addEventListener("click", async (e) => {
+            const qKey = `${r.id}-${i}`;
+            const qExpanded = !!this.prGraphQExpanded[qKey];
+
+            const qWrap = qList.createEl("div", { cls: "pr-graph-q-wrap" });
+
+            // Question header row: chevron + text input + delete
+            const qHeader = qWrap.createEl("div", { cls: "pr-graph-q-header" });
+            const chev = qHeader.createEl("span", { cls: "pr-graph-q-chev", text: qExpanded ? "▼" : "▶" });
+            stop(chev);
+            chev.addEventListener("click", (e) => {
                 e.stopPropagation();
-                r.questions.splice(i, 1);
+                this.prGraphQExpanded[qKey] = !qExpanded;
+                this.render();
+            });
+
+            const qInput = qHeader.createEl("input", { type: "text", value: q.text || "", cls: "pr-graph-form-text" });
+            qInput.placeholder = `Question ${i + 1}`;
+            stop(qInput);
+            qInput.addEventListener("change", async () => { q.text = qInput.value; await this.plugin.saveSettings(); });
+
+            const upBtn = qHeader.createEl("button", { text: "↑", cls: "pr-graph-q-arrow" });
+            stop(upBtn);
+            upBtn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                if (i === 0) return;
+                [r.questions[i - 1], r.questions[i]] = [r.questions[i], r.questions[i - 1]];
                 await this.plugin.saveSettings();
                 this.render();
             });
+            const downBtn = qHeader.createEl("button", { text: "↓", cls: "pr-graph-q-arrow" });
+            stop(downBtn);
+            downBtn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                if (i === r.questions.length - 1) return;
+                [r.questions[i + 1], r.questions[i]] = [r.questions[i], r.questions[i + 1]];
+                await this.plugin.saveSettings();
+                this.render();
+            });
+            const delBtn = qHeader.createEl("button", { text: "×", cls: "pr-graph-form-qdel" });
+            stop(delBtn);
+            delBtn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                r.questions.splice(i, 1);
+                delete this.prGraphQExpanded[qKey];
+                await this.plugin.saveSettings();
+                this.render();
+            });
+
+            // Mark wrap when inject/output enabled so the user sees at a glance
+            if (q.injectVar) qWrap.classList.add("pr-graph-q-has-inject");
+            if (q.outputToField) qWrap.classList.add("pr-graph-q-has-output");
+
+            // Question detail panel — only when chevron expanded
+            if (qExpanded) {
+                this.renderQuestionDetail(qWrap, r, q);
+            }
         }
-        const addQBtn = qWrap.createEl("button", { text: "+ Question", cls: "pr-graph-form-button" });
-        addQBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-        addQBtn.addEventListener("click", async (e) => {
+
+        // + Add question
+        const addBtn = qSection.createEl("button", { text: "+ Question", cls: "pr-graph-form-button" });
+        stop(addBtn);
+        addBtn.addEventListener("click", async (e) => {
             e.stopPropagation();
             r.questions.push(makePRQuestion(""));
             await this.plugin.saveSettings();
             this.render();
         });
+    }
+
+    // Per-question detail panel: inject + output config, same fields as the
+    // settings tab card but rendered compactly for the node body.
+    renderQuestionDetail(parent, reflection, q) {
+        const s = this.plugin.settings;
+        const stop = (el) => el.addEventListener("mousedown", (e) => e.stopPropagation());
+        const reRender = () => this.render();
+        const save = async () => { await this.plugin.saveSettings(); };
+
+        const detail = parent.createEl("div", { cls: "pr-graph-q-detail" });
+
+        const addToggleRow = (label, get, set) => {
+            const row = detail.createEl("label", { cls: "pr-graph-q-row" });
+            const input = row.createEl("input", { type: "checkbox" });
+            input.checked = !!get();
+            stop(input);
+            input.addEventListener("change", async () => { set(input.checked); await save(); reRender(); });
+            row.createEl("span", { text: label });
+        };
+
+        const addLabeledText = (label, placeholder, get, set) => {
+            const row = detail.createEl("div", { cls: "pr-graph-q-field" });
+            row.createEl("div", { cls: "pr-graph-q-flabel", text: label });
+            const input = row.createEl("input", { type: "text", value: get() || "", cls: "pr-graph-form-text" });
+            input.placeholder = placeholder || "";
+            stop(input);
+            input.addEventListener("change", async () => { set(input.value); await save(); });
+        };
+
+        const addLabeledDropdown = (label, options, get, set) => {
+            const row = detail.createEl("div", { cls: "pr-graph-q-field" });
+            row.createEl("div", { cls: "pr-graph-q-flabel", text: label });
+            const sel = row.createEl("select", { cls: "pr-graph-form-select" });
+            for (const opt of options) {
+                const o = sel.createEl("option", { text: opt.label, value: opt.value });
+                if (opt.value === get()) o.selected = true;
+            }
+            stop(sel);
+            sel.addEventListener("change", async () => { set(sel.value); await save(); reRender(); });
+        };
+
+        // ── Inject panel ──
+        const injectHeader = detail.createEl("div", { cls: "pr-graph-q-section-label", text: "← Inject context" });
+        addToggleRow("Enable inject", () => q.injectVar, (v) => { q.injectVar = v; });
+
+        if (q.injectVar) {
+            const allContainers = s.prContainers || [];
+            addLabeledDropdown("Source",
+                [
+                    { value: "previous-period",  label: "Previous period (this container)" },
+                    { value: "note",             label: "Specific note" },
+                    { value: "container-current",  label: "Current note of another container" },
+                    { value: "container-previous", label: "Previous note of another container" },
+                ],
+                () => q.varSource || "previous-period",
+                (v) => { q.varSource = v; }
+            );
+
+            const src = q.varSource || "previous-period";
+            if (src === "note") {
+                const row = detail.createEl("div", { cls: "pr-graph-q-field" });
+                row.createEl("div", { cls: "pr-graph-q-flabel", text: "Source note" });
+                const value = row.createEl("div", { cls: "pr-graph-form-picker-value", text: q.varNotePath || "(none)" });
+                const btn = row.createEl("button", { text: q.varNotePath ? "Change" : "Choose", cls: "pr-graph-form-button" });
+                stop(btn);
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        q.varNotePath = file.path;
+                        await save();
+                        reRender();
+                    }).open();
+                });
+            } else if (src === "container-current" || src === "container-previous") {
+                addLabeledDropdown("Source container",
+                    [{ value: "", label: "— Pick one —" }, ...allContainers.map(c => ({ value: c.id, label: c.name || "(unnamed)" }))],
+                    () => q.varSourceContainerId || "",
+                    (v) => { q.varSourceContainerId = v; }
+                );
+            }
+
+            addLabeledText("Field name", "today", () => q.varField, (v) => { q.varField = v; });
+            addLabeledDropdown("Field type",
+                [
+                    { value: "inline",      label: "Inline (key:: value)" },
+                    { value: "frontmatter", label: "Frontmatter (key: value)" },
+                ],
+                () => q.varFieldType || "inline",
+                (v) => { q.varFieldType = v; }
+            );
+        }
+
+        // ── Output panel ──
+        const outputHeader = detail.createEl("div", { cls: "pr-graph-q-section-label", text: "→ Output answer" });
+        addToggleRow("Write answer to a field", () => q.outputToField, (v) => { q.outputToField = v; });
+
+        if (q.outputToField) {
+            addLabeledDropdown("Target",
+                [
+                    { value: "",            label: "Active container (default)" },
+                    { value: "daily-today", label: "Today's daily note" },
+                    ...((s.prContainers || []).map(c => ({ value: c.id, label: c.name || "(unnamed)" }))),
+                ],
+                () => q.outputTargetContainer || "",
+                (v) => { q.outputTargetContainer = v; }
+            );
+            addLabeledText("Field name", "non_negotiable", () => q.outputFieldName, (v) => { q.outputFieldName = v; });
+            addLabeledDropdown("Field type",
+                [
+                    { value: "inline",      label: "Inline (key:: value)" },
+                    { value: "frontmatter", label: "Frontmatter (key: value)" },
+                ],
+                () => q.outputFieldType || "inline",
+                (v) => { q.outputFieldType = v; }
+            );
+        }
     }
 
     renderAlignmentExpanded(body, node, h) {
@@ -6001,12 +6184,12 @@ class PRGraphView extends ItemView {
         this.render();
     }
 
-    // ─── Click to edit (Phase 10a-3) ───
+    // ─── Click to edit ───
     //
-    // Clicking a node opens Obsidian's settings modal scrolled to the
-    // Periodic Ritual plugin tab and switches the outer tab to the one
-    // that owns that primitive's edit card. The user is dropped exactly
-    // where they need to be to edit the thing they clicked.
+    // Double-clicking a node opens Obsidian's settings modal, switches to
+    // the Periodic Ritual plugin tab, sets the outer tab to the one that
+    // owns the primitive, AND scrolls to the specific card with a brief
+    // flash highlight so the user lands exactly on the thing they clicked.
     onNodeClick(node) {
         if (!node || !node.primitiveTab) {
             // Daily / built-in boundary nodes have no primitive to edit
@@ -6030,10 +6213,22 @@ class PRGraphView extends ItemView {
         // through the plugin's setting tab list.
         const settingTabs = setting.settingTabs || [];
         const ourTab = settingTabs.find(t => t.id === "monthly-ritual" || t.plugin === this.plugin);
-        if (ourTab && typeof ourTab.display === "function") {
-            ourTab.outerTab = tab;
-            ourTab.display();
-        }
+        if (!ourTab || typeof ourTab.display !== "function") return;
+        ourTab.outerTab = tab;
+        ourTab.display();
+
+        // Scroll to and flash the matching card. Defer until display() has
+        // painted — requestAnimationFrame is enough in most cases, but a
+        // 50ms setTimeout is more reliable for the modal's layout.
+        const targetId = node.primitive?.id;
+        if (!targetId) return;
+        setTimeout(() => {
+            const card = ourTab.containerEl.querySelector(`[data-pr-card-id="${targetId}"]`);
+            if (!card) return;
+            card.scrollIntoView({ behavior: "smooth", block: "center" });
+            card.classList.add("pr-card-flash");
+            setTimeout(() => card.classList.remove("pr-card-flash"), 1500);
+        }, 60);
     }
 
     // ─── Pan, zoom, drag (Phase 10a-2) ───
@@ -6542,6 +6737,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // to the inner body wrapper so subsequent `new Setting(card)` calls
         // append to the right place.
         let card = parent.createDiv({ cls: "mr-pr-card" });
+        card.dataset.prCardId = container.id;
 
         // ── Header row: chevron + name + enabled toggle + delete ──
         const header = card.createDiv({ cls: "mr-pr-card-header" });
@@ -6923,6 +7119,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const s = this.plugin.settings;
 
         const card = parent.createDiv({ cls: "mr-pr-card" });
+        card.dataset.prCardId = reflection.id;
 
         // Header: name input + delete
         const header = card.createDiv({ cls: "mr-pr-card-header" });
@@ -7266,6 +7463,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const s = this.plugin.settings;
 
         const card = parent.createDiv({ cls: "mr-pr-card" });
+        card.dataset.prCardId = alignment.id;
 
         // Header: name input + delete
         const header = card.createDiv({ cls: "mr-pr-card-header" });
@@ -7395,6 +7593,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const card = parent.createDiv();
         card.style.cssText = "border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;";
+        card.dataset.prCardId = service.id;
 
         // Header: name + delete
         const header = card.createDiv();
@@ -7660,6 +7859,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const s = this.plugin.settings;
 
         const card = parent.createDiv({ cls: "mr-pr-card" });
+        card.dataset.prCardId = cb.id;
 
         // Header: name input + delete
         const header = card.createDiv({ cls: "mr-pr-card-header" });

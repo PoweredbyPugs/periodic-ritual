@@ -72,6 +72,17 @@
     margin-bottom: 12px;
     background: var(--background-secondary);
     overflow: hidden;
+    transition: box-shadow 0.3s, border-color 0.3s;
+}
+
+@keyframes pr-card-flash-anim {
+    0%   { box-shadow: 0 0 0 0 var(--interactive-accent); border-color: var(--interactive-accent); }
+    50%  { box-shadow: 0 0 0 4px var(--interactive-accent); border-color: var(--interactive-accent); }
+    100% { box-shadow: 0 0 0 0 transparent; border-color: var(--background-modifier-border); }
+}
+
+.pr-card-flash {
+    animation: pr-card-flash-anim 1.5s ease-out;
 }
 
 .mr-pr-card-header {
@@ -645,6 +656,94 @@
 .pr-graph-form-qdel:hover {
     background: var(--background-modifier-error, #7c2222);
     color: white;
+}
+
+/* Per-question detail (inject + output) inside the reflection node body */
+.pr-graph-q-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 4px 0;
+}
+
+.pr-graph-q-wrap {
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 2px;
+}
+
+.pr-graph-q-has-inject  { border-left: 2px solid var(--interactive-accent); }
+.pr-graph-q-has-output  { border-right: 2px solid var(--interactive-accent); }
+
+.pr-graph-q-header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pr-graph-q-chev {
+    color: var(--text-muted);
+    font-size: 0.65em;
+    cursor: pointer;
+    user-select: none;
+    padding: 2px 4px;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.pr-graph-q-chev:hover { color: var(--text-normal); }
+
+.pr-graph-q-arrow {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    font-size: 0.85em;
+    flex: 0 0 18px;
+}
+
+.pr-graph-q-arrow:hover { color: var(--text-normal); }
+
+.pr-graph-q-detail {
+    margin: 6px 0 6px 18px;
+    padding: 6px 8px;
+    background: var(--background-primary);
+    border-radius: 4px;
+    border: 1px solid var(--background-modifier-border);
+}
+
+.pr-graph-q-section-label {
+    color: var(--text-faint);
+    font-size: 0.65em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 8px;
+    margin-bottom: 4px;
+}
+
+.pr-graph-q-section-label:first-child { margin-top: 0; }
+
+.pr-graph-q-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    color: var(--text-normal);
+    font-size: 0.78em;
+    cursor: pointer;
+}
+
+.pr-graph-q-field {
+    margin-top: 4px;
+}
+
+.pr-graph-q-flabel {
+    color: var(--text-faint);
+    font-size: 0.62em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 2px;
 }
 
 /* Filter popover (Phase 10c-3) */
