@@ -725,6 +725,24 @@ class PRTokenReferenceModal extends Modal {
                 { token: "{{year-start}}", desc: "ISO date of January 1" },
                 { token: "{{year-end}}", desc: "ISO date of December 31" },
             ],
+            "lunar-cycle": [
+                { token: "{{phase}}", desc: "Phase name (always \"New Moon\" — cycle starts here)" },
+                { token: "{{phase-short}}", desc: "Short phase id (\"new\")" },
+                { token: "{{sign}}", desc: "Moon's zodiac sign at cycle start (if astrology toggle on)" },
+                { token: "{{sign-glyph}}", desc: "Sign glyph, e.g. ♈" },
+            ],
+            "lunar-phase": [
+                { token: "{{phase}}", desc: "New Moon / First Quarter / Full Moon / Last Quarter" },
+                { token: "{{phase-short}}", desc: "new / q1 / full / q3" },
+                { token: "{{sign}}", desc: "Moon's zodiac sign at phase start (if astrology toggle on)" },
+                { token: "{{sign-glyph}}", desc: "Sign glyph" },
+            ],
+            "sun-ingress": [
+                { token: "{{sign}}", desc: "Zodiac sign of the Sun, e.g. Aries (if astrology toggle on)" },
+                { token: "{{sign-glyph}}", desc: "Sign glyph, e.g. ♈" },
+                { token: "{{term}}", desc: "Solar term name (English), e.g. Spring Equinox" },
+                { token: "{{term-cn}}", desc: "Solar term name (Chinese), e.g. 春分" },
+            ],
         };
 
         const all = [...COMMON, ...(PER_DETECTOR[this.detectorId] || [])];
@@ -1498,16 +1516,27 @@ class MonthlyRitualPlugin extends Plugin {
     //  PERIODIC RITUAL — Container generation (Phase 1+)
     // ═══════════════════════════════════════════════════════════════
 
-    // Boundary detector dispatcher. Phase 4a adds calendar month/quarter/year.
-    // Phase 4b will add helios-backed sun-ingress / lunar-phase / lunar-cycle.
-    // Phase 4c will add custom JS module backends.
-    getPRBoundaryData(detector, date) {
+    // Boundary detector dispatcher. Async because helios-backed detectors
+    // (lunar / solar) hit a local server. Calendar detectors are sync but
+    // returned wrapped in a resolved promise via async.
+    //
+    // Phase 4a: calendar week/month/quarter/year (pure date math).
+    // Phase 4b: lunar-cycle, lunar-phase, sun-ingress (helios-backed).
+    // Phase 4c: custom JS module backends.
+    async getPRBoundaryData(detector, date) {
         const d = date || new Date();
         switch (detector) {
             case "calendar-week":    return this.getCurrentWeekData(d);
             case "calendar-month":   return this.getCurrentCalendarMonthData(d);
             case "calendar-quarter": return this.getCurrentCalendarQuarterData(d);
             case "calendar-year":    return this.getCurrentCalendarYearData(d);
+            // Helios-backed (Phase 4b). These reuse the existing legacy
+            // helpers verbatim — same shape, same fields. Gating on
+            // hasMoonPlugin() happens in the dropdown so the user can't
+            // pick these without the dependency installed.
+            case "lunar-cycle":      return await this.getLunarContainerData(d);
+            case "lunar-phase":      return await this.getCurrentPhaseData(d);
+            case "sun-ingress":      return await this.getSolarContainerData(d);
             default:
                 throw new Error(`Boundary detector "${detector}" is not implemented yet`);
         }
@@ -1516,13 +1545,23 @@ class MonthlyRitualPlugin extends Plugin {
     // List of detectors available in the current build, for the settings dropdown.
     // Adding a detector = adding an entry here + a case in getPRBoundaryData.
     // Labels are deliberately neutral — the user names containers themselves.
+    // Helios-backed detectors are gated on the Moon Phase plugin being
+    // installed. Without it the dropdown only shows the calendar detectors.
     getPRAvailableBoundaryDetectors() {
-        return [
+        const list = [
             { id: "calendar-week",    label: "Calendar Week" },
             { id: "calendar-month",   label: "Calendar Month" },
             { id: "calendar-quarter", label: "Calendar Quarter" },
             { id: "calendar-year",    label: "Calendar Year" },
         ];
+        if (this.hasMoonPlugin()) {
+            list.push(
+                { id: "lunar-cycle",  label: "Lunar Cycle (new moon → new moon)" },
+                { id: "lunar-phase",  label: "Lunar Phase (one quarter of a moon cycle)" },
+                { id: "sun-ingress",  label: "Sun Ingress (one zodiac sign)" },
+            );
+        }
+        return list;
     }
 
     // Generate a single container note from its config.
@@ -1544,7 +1583,7 @@ class MonthlyRitualPlugin extends Plugin {
         }
 
         try {
-            const data = this.getPRBoundaryData(container.boundaryDetector, dateOverride);
+            const data = await this.getPRBoundaryData(container.boundaryDetector, dateOverride);
             const fileName = this.resolveTokens(container.naming, data.tokens);
             const folderPath = container.saveDir || "";
             const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
@@ -1860,7 +1899,7 @@ class MonthlyRitualPlugin extends Plugin {
         }
 
         const now = new Date();
-        const currentRange = this.getPRBoundaryData(container.boundaryDetector, now);
+        const currentRange = await this.getPRBoundaryData(container.boundaryDetector, now);
         if (!currentRange) return;
 
         const generateAt = container.generateAt || "start";
@@ -1876,7 +1915,7 @@ class MonthlyRitualPlugin extends Plugin {
                 // (the one before today's period). Gives the user immediate
                 // feedback instead of waiting an entire cycle.
                 const previousPeriodDate = addDays(currentRange.start, -1);
-                const previousRange = this.getPRBoundaryData(container.boundaryDetector, previousPeriodDate);
+                const previousRange = await this.getPRBoundaryData(container.boundaryDetector, previousPeriodDate);
                 if (previousRange) {
                     await this.generatePRContainerNote(container, previousPeriodDate);
                 }
@@ -1910,7 +1949,7 @@ class MonthlyRitualPlugin extends Plugin {
         let safety = 0;
         while (cursor <= now && safety < 100) {
             safety++;
-            const range = this.getPRBoundaryData(container.boundaryDetector, cursor);
+            const range = await this.getPRBoundaryData(container.boundaryDetector, cursor);
             if (!range) break;
             // End mode: skip periods that haven't fully ended yet.
             if (generateAt === "end" && range.end > now) {
@@ -3023,17 +3062,6 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             });
 
         // ── Naming convention ──
-        // Compute a live preview against the current period's tokens so the
-        // user sees what their format string will produce right now.
-        let previewText = "";
-        try {
-            const previewData = this.plugin.getPRBoundaryData(container.boundaryDetector, new Date());
-            previewText = container.naming
-                ? this.plugin.resolveTokens(container.naming, previewData.tokens)
-                : "(empty)";
-        } catch (e) {
-            previewText = "(detector not yet implemented)";
-        }
         const namingSetting = new Setting(card)
             .setName("Naming convention")
             .addText(t => t
@@ -3055,7 +3083,19 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         namingSetting.descEl.createEl("br");
         const previewLabel = namingSetting.descEl.createSpan({ text: "Currently looks like: " });
         previewLabel.style.color = "var(--text-faint)";
-        const previewVal = namingSetting.descEl.createSpan({ text: previewText, cls: "mr-pr-preview" });
+        // Async preview: start with a placeholder, resolve in the background.
+        // getPRBoundaryData is async because helios-backed detectors hit a
+        // local server. The preview span gets updated when the promise resolves.
+        const previewVal = namingSetting.descEl.createSpan({ text: "…", cls: "mr-pr-preview" });
+        this.plugin.getPRBoundaryData(container.boundaryDetector, new Date())
+            .then(previewData => {
+                previewVal.setText(container.naming
+                    ? this.plugin.resolveTokens(container.naming, previewData.tokens)
+                    : "(empty)");
+            })
+            .catch(() => {
+                previewVal.setText("(unable to compute preview)");
+            });
 
         // ── Metadata placement ──
         new Setting(card)
