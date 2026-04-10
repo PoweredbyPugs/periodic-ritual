@@ -544,27 +544,34 @@ function makePRContainer(overrides = {}) {
 }
 
 // Periodic Ritual question factory. Same shape as Daily Ritual's question
-// so each question can optionally:
+// plus cross-container pull/push (Phase 8b):
 //   - Inject a value from another note as context above the question prompt
 //   - Write its answer to a specific inline or frontmatter field on the
-//     container note (in addition to feeding the LLM)
+//     active container OR on a sibling PR container's current note
 function makePRQuestion(text) {
     return {
         text: text || "",
         // Variable injection — show a value from another note above the
-        // question prompt before asking. Lets you frame a question with
-        // context like "last week's answer was X — what about this week?"
+        // question prompt before asking.
         injectVar: false,
         varField: "",                  // field name to read
         varFieldType: "inline",        // "inline" | "frontmatter"
-        varSource: "previous-period",  // "previous-period" | "note"
-        varNotePath: "",               // path to a specific .md file when varSource = "note"
-        // Output to field — write the answer directly to a field on the
-        // container note, in addition to passing it to the LLM. Makes the
-        // raw answer visible and queryable, not just the LLM's synthesis.
+        // Source options:
+        //   "previous-period"   — previous note of the SAME container
+        //   "note"              — a specific .md file by path
+        //   "container-current" — current corresponding note of another container
+        //   "container-previous"— previous note of another container
+        varSource: "previous-period",
+        varNotePath: "",               // for "note"
+        varSourceContainerId: "",      // for "container-current" / "container-previous"
+        // Output to field — write the answer directly to a field. Default
+        // target is the active container note. Setting outputTargetContainer
+        // to a PR container id pushes the answer to that container's
+        // current corresponding note instead.
         outputToField: false,
         outputFieldName: "",
         outputFieldType: "inline",     // "inline" | "frontmatter"
+        outputTargetContainer: "",     // empty = active container; otherwise PR container id
     };
 }
 
@@ -2879,14 +2886,28 @@ class MonthlyRitualPlugin extends Plugin {
     // Resolve a single question's variable injection. Returns the string to
     // show above the question, or empty string if no injection or if the
     // referenced field/note doesn't exist.
+    //
+    // Source resolution (Phase 8b):
+    //   "previous-period"   — previous note of the SAME container
+    //   "note"              — a specific .md file by path
+    //   "container-current" — current corresponding note of another container
+    //                         (uses findMostRecentPRContainerNote on that container)
+    //   "container-previous"— previous note of another container
     async resolvePRInjectedVar(question, container) {
         if (!question || !question.injectVar || !question.varField) return "";
         let sourceFile = null;
-        if (question.varSource === "note" && question.varNotePath) {
+        const src = question.varSource || "previous-period";
+        if (src === "note" && question.varNotePath) {
             const f = this.app.vault.getAbstractFileByPath(question.varNotePath);
             if (f && f instanceof TFile) sourceFile = f;
+        } else if (src === "container-current" && question.varSourceContainerId) {
+            const otherContainer = (this.settings.prContainers || []).find(c => c.id === question.varSourceContainerId);
+            if (otherContainer) sourceFile = await this.findMostRecentPRContainerNote(otherContainer);
+        } else if (src === "container-previous" && question.varSourceContainerId) {
+            const otherContainer = (this.settings.prContainers || []).find(c => c.id === question.varSourceContainerId);
+            if (otherContainer) sourceFile = await this.findPreviousPRContainerNote(otherContainer);
         } else {
-            // Default: previous-period
+            // Default: previous-period of THIS container
             sourceFile = await this.findPreviousPRContainerNote(container);
         }
         if (!sourceFile) return "";
@@ -2908,13 +2929,33 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
-    // Write a single answer to its configured output field on the container
-    // note. Inline fields go in the body; frontmatter fields go via
-    // processFrontMatter so we don't hand-edit YAML.
-    async writePRAnswerToField(file, question, answer) {
-        if (!file || !question || !question.outputToField || !question.outputFieldName) return;
+    // Write a single answer to its configured output field. Default target
+    // is the active container's file. When question.outputTargetContainer
+    // is set, the answer goes to the corresponding current note of that
+    // other PR container instead. Inline fields go in the body; frontmatter
+    // fields go via processFrontMatter so we don't hand-edit YAML.
+    async writePRAnswerToField(activeFile, question, answer) {
+        if (!question || !question.outputToField || !question.outputFieldName) return;
         const ans = (answer || "").trim();
         if (!ans) return;
+
+        // Resolve target file: active container by default, or another
+        // container's current note when outputTargetContainer is set.
+        let file = activeFile;
+        if (question.outputTargetContainer) {
+            const targetContainer = (this.settings.prContainers || []).find(c => c.id === question.outputTargetContainer);
+            if (targetContainer) {
+                const targetFile = await this.findMostRecentPRContainerNote(targetContainer);
+                if (targetFile) {
+                    file = targetFile;
+                } else {
+                    new Notice(`Question "${question.text}": target container "${targetContainer.name}" has no recent note. Skipping output.`);
+                    return;
+                }
+            }
+        }
+        if (!file) return;
+
         const fieldName = question.outputFieldName;
         const fieldType = question.outputFieldType || "inline";
         try {
@@ -4821,11 +4862,14 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         }));
 
                 if (q.injectVar) {
+                    const allContainers = s.prContainers || [];
                     new Setting(panel)
                         .setName("Source")
                         .addDropdown(dd => {
-                            dd.addOption("previous-period", "Previous period's container note");
+                            dd.addOption("previous-period", "Previous period of THIS container");
                             dd.addOption("note", "A specific note");
+                            dd.addOption("container-current", "Current note of ANOTHER container");
+                            dd.addOption("container-previous", "Previous note of ANOTHER container");
                             dd.setValue(q.varSource || "previous-period");
                             dd.onChange(async v => {
                                 q.varSource = v;
@@ -4834,7 +4878,8 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                             });
                         });
 
-                    if ((q.varSource || "previous-period") === "note") {
+                    const src = q.varSource || "previous-period";
+                    if (src === "note") {
                         new Setting(panel)
                             .setName("Source note")
                             .setDesc(q.varNotePath || "None selected")
@@ -4845,6 +4890,19 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                                         await this.plugin.saveSettings();
                                         this.display();
                                     }).open();
+                                });
+                            });
+                    } else if (src === "container-current" || src === "container-previous") {
+                        new Setting(panel)
+                            .setName("Source container")
+                            .setDesc(allContainers.length === 0 ? "No containers defined yet" : "Which container to read from")
+                            .addDropdown(dd => {
+                                dd.addOption("", "— Pick one —");
+                                for (const c of allContainers) dd.addOption(c.id, c.name || "(unnamed)");
+                                dd.setValue(q.varSourceContainerId || "");
+                                dd.onChange(async v => {
+                                    q.varSourceContainerId = v;
+                                    await this.plugin.saveSettings();
                                 });
                             });
                     }
@@ -4891,6 +4949,19 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         }));
 
                 if (q.outputToField) {
+                    new Setting(panel)
+                        .setName("Target")
+                        .setDesc("Where to write the answer. Default is the active container's note. Picking another container pushes the answer to that container's current corresponding note instead.")
+                        .addDropdown(dd => {
+                            dd.addOption("", "Active container (default)");
+                            for (const c of (s.prContainers || [])) dd.addOption(c.id, c.name || "(unnamed)");
+                            dd.setValue(q.outputTargetContainer || "");
+                            dd.onChange(async v => {
+                                q.outputTargetContainer = v;
+                                await this.plugin.saveSettings();
+                            });
+                        });
+
                     new Setting(panel)
                         .setName("Field name")
                         .addText(t => t
