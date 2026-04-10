@@ -83,6 +83,7 @@ const SYNODIC_PERIOD = 29.53059;
 
 const MOON_PHASES = ["New Moon", "First Quarter", "Full Moon", "Last Quarter"];
 const MOON_PHASE_SHORT = { "New Moon": "new", "First Quarter": "q1", "Full Moon": "full", "Last Quarter": "q3" };
+const MOON_PHASE_EMOJI = { "New Moon": "\u{1F311}", "First Quarter": "\u{1F313}", "Full Moon": "\u{1F315}", "Last Quarter": "\u{1F317}" };
 
 const SIGN_GLYPHS = {
     Aries: "\u2648", Taurus: "\u2649", Gemini: "\u264A", Cancer: "\u264B",
@@ -1403,15 +1404,25 @@ class PRTokenReferenceModal extends Modal {
             ],
             "lunar-cycle": [
                 { token: "{{phase}}", desc: "Phase name (always \"New Moon\" — cycle starts here)" },
+                { token: "{{phase-name}}", desc: "Same as phase" },
                 { token: "{{phase-short}}", desc: "Short phase id (\"new\")" },
+                { token: "{{phase-emoji}}", desc: "🌑 (always — cycle starts at new moon)" },
                 { token: "{{sign}}", desc: "Moon's zodiac sign at cycle start (if astrology toggle on)" },
-                { token: "{{sign-glyph}}", desc: "Sign glyph, e.g. ♈" },
+                { token: "{{sign-glyph}}", desc: "Sign glyph (if astrology toggle on)" },
+                { token: "{{moon-sign}}", desc: "Moon's zodiac sign (always, no toggle)" },
+                { token: "{{moon-glyph}}", desc: "Moon's sign glyph (always, no toggle)" },
+                { token: "{{sun-sign}}", desc: "Sun's zodiac sign at cycle start" },
+                { token: "{{sun-glyph}}", desc: "Sun's sign glyph at cycle start" },
             ],
             "lunar-phase": [
                 { token: "{{phase}}", desc: "New Moon / First Quarter / Full Moon / Last Quarter" },
+                { token: "{{phase-name}}", desc: "Same as phase" },
                 { token: "{{phase-short}}", desc: "new / q1 / full / q3" },
-                { token: "{{sign}}", desc: "Moon's zodiac sign at phase start (if astrology toggle on)" },
-                { token: "{{sign-glyph}}", desc: "Sign glyph" },
+                { token: "{{phase-emoji}}", desc: "🌑 / 🌓 / 🌕 / 🌗 — varies by phase" },
+                { token: "{{sign}}", desc: "Moon's zodiac sign (if astrology toggle on)" },
+                { token: "{{sign-glyph}}", desc: "Sign glyph (if astrology toggle on)" },
+                { token: "{{moon-sign}}", desc: "Moon's zodiac sign (always, no toggle)" },
+                { token: "{{moon-glyph}}", desc: "Moon's sign glyph (always, no toggle)" },
             ],
             "solar-cycle": [
                 { token: "{{cycle}}", desc: "Year of the Aries ingress, e.g. 2026" },
@@ -1875,9 +1886,15 @@ class MonthlyRitualPlugin extends Plugin {
                 date: formatDate(lastNew),
                 cycle: this.getLunarCycleNumber(lastNew),
                 phase: "New Moon",
+                "phase-name": "New Moon",
                 "phase-short": "new",
+                "phase-emoji": MOON_PHASE_EMOJI["New Moon"],
                 sign: this.settings.includeSignGlyphs ? sign : "",
                 "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+                "moon-sign": sign,
+                "moon-glyph": SIGN_GLYPHS[sign] || "",
+                "sun-sign": sunSign,
+                "sun-glyph": SIGN_GLYPHS[sunSign] || "",
                 eclipse: "",
             },
         };
@@ -1946,9 +1963,13 @@ class MonthlyRitualPlugin extends Plugin {
                 day: String(phaseStart.getDate()).padStart(2, "0"),
                 date: formatDate(phaseStart),
                 phase: phase,
+                "phase-name": phase,             // alias for naming clarity
                 "phase-short": MOON_PHASE_SHORT[phase],
+                "phase-emoji": MOON_PHASE_EMOJI[phase] || "",
                 sign: this.settings.includeSignGlyphs ? sign : "",
                 "sign-glyph": this.settings.includeSignGlyphs ? (SIGN_GLYPHS[sign] || "") : "",
+                "moon-sign": sign,                // raw moon sign without astrology toggle
+                "moon-glyph": SIGN_GLYPHS[sign] || "",
                 eclipse: "",
             },
         };
@@ -3878,8 +3899,7 @@ class MonthlyRitualPlugin extends Plugin {
 // ═══════════════════════════════════════════════════════════════
 
 const CALENDAR_VIEW_TYPE = "monthly-ritual-calendar";
-
-const MOON_PHASE_EMOJI = { "New Moon": "\u{1F311}", "First Quarter": "\u{1F313}", "Full Moon": "\u{1F315}", "Last Quarter": "\u{1F317}" };
+// MOON_PHASE_EMOJI is defined at the top of the file alongside MOON_PHASES.
 
 // Approximate zodiac date ranges for solar term lookup without Helios
 const ZODIAC_DATES = [
