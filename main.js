@@ -6126,7 +6126,9 @@ class PRGraphView extends ItemView {
                 return;
             }
 
-            // Input socket — reverse drag (only if empty)
+            // Input socket — reverse drag (works on both empty AND connected
+            // inputs; connected ones detach immediately so the wire follows
+            // the cursor and can be re-routed).
             const inSocket = e.target.closest(".pr-graph-socket-in");
             if (inSocket) {
                 const nodeEl = inSocket.closest(".pr-graph-node");
@@ -6134,10 +6136,25 @@ class PRGraphView extends ItemView {
                 const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
                 if (!node) return;
                 const socketId = inSocket.dataset.socketId;
-                // Check if this input already has a wire — if so, don't start
-                // a reverse drag (use right-click delete on the wire instead).
-                const hasWire = this.wires.some(w => w.to === node.id && w.toSocket === socketId);
-                if (hasWire) return;
+
+                // Check for an existing wire on this input
+                const existingWire = this.wires.find(w => w.to === node.id && w.toSocket === socketId);
+                let isRewire = false;
+                if (existingWire) {
+                    // Boundary inputs can't be detached — every container
+                    // needs a boundary. Block the drag entirely.
+                    if (socketId === "in-boundary") {
+                        new Notice("Boundary is required. Drop a different boundary on the input or change it in settings.");
+                        return;
+                    }
+                    // Detach in place (synchronous). Settings save is kicked
+                    // off as a background promise so the drag can begin
+                    // immediately without awaiting.
+                    this.applyDetachInPlace(existingWire);
+                    this.plugin.saveSettings().catch(err => console.error("Periodic Ritual: detach save failed", err));
+                    isRewire = true;
+                }
+
                 // Determine the wire color from the input socket type
                 const wireKind = (socketId || "").replace(/^in-/, "") || "data-source";
                 const ghost = document.createElementNS(SVG_NS, "path");
@@ -6149,6 +6166,7 @@ class PRGraphView extends ItemView {
                     toNode: node,
                     toSocketId: socketId,
                     ghost,
+                    isRewire,
                 };
                 e.preventDefault();
                 e.stopPropagation();
@@ -6202,9 +6220,9 @@ class PRGraphView extends ItemView {
                 return;
             }
 
-            // Reverse drag from an empty input socket. If we dropped on an
-            // existing compatible source node, wire it up. Otherwise, open
-            // a "create source" menu so the user can spawn a new node here.
+            // Reverse drag — either a fresh drag from an empty input
+            // (open the create-source menu on empty drop), or a rewire of
+            // an existing connection (just stay disconnected on empty drop).
             const dropOnNodeEl = target?.closest(".pr-graph-node");
             if (dropOnNodeEl) {
                 const fromNode = this.nodes.find(n => n.id === dropOnNodeEl.dataset.nodeId);
@@ -6213,7 +6231,14 @@ class PRGraphView extends ItemView {
                     return;
                 }
             }
-            // Empty / incompatible drop → open the source-create menu
+            if (drag.isRewire) {
+                // The wire was already detached on mousedown. Empty drop
+                // means the user wanted to disconnect — re-render to show
+                // the final state.
+                this.render();
+                return;
+            }
+            // Fresh drag from an empty input → offer to create a new source
             this.openInputDragMenu(e, drag.toNode, drag.toSocketId);
         };
 
@@ -6409,6 +6434,44 @@ class PRGraphView extends ItemView {
         };
         this.wireSvg.addEventListener("click", onClick);
         this._wireClickCleanup = () => this.wireSvg?.removeEventListener("click", onClick);
+    }
+
+    // Synchronous "detach" used by the rewire flow. Same logic as deleteWire
+    // for the underlying field, but skips the saveSettings + render and
+    // instead pops the wire out of this.wires + redraws just the SVG layer
+    // so the visual wire disappears immediately while the drag begins.
+    // saveSettings is fired in the background by the caller.
+    applyDetachInPlace(wire) {
+        const containers = this.plugin.settings.prContainers || [];
+        const target = containers.find(c => `container-${c.id}` === wire.to);
+
+        switch (wire.kind) {
+            case "data-source":
+                // Data source can't really be "empty" — every container has
+                // one. Detach means revert to daily, which is the default.
+                if (target) target.dataSource = { type: "daily" };
+                break;
+            case "boundary":
+                // Boundary detaches are blocked at mousedown, but defensive.
+                return false;
+            case "llm":
+                if (target) target.llmServiceId = "";
+                break;
+            case "reflection":
+                if (target) target.reflectionId = "";
+                break;
+            case "alignment":
+                {
+                    const alignmentId = wire.from.replace(/^alignment-/, "");
+                    const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
+                    if (al) al.containerId = "";
+                }
+                break;
+        }
+        // Pop the wire out of the model and redraw just the wires
+        this.wires = this.wires.filter(w => w !== wire);
+        this.renderWires();
+        return true;
     }
 
     // Clear the relationship that this wire represents.
