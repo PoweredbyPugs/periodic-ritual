@@ -3771,54 +3771,12 @@ class MonthlyRitualPlugin extends Plugin {
     // ─── Commands ───
 
     registerCommands() {
-        const labels = this.getModeLabels();
-
-        this.cmdGenerateContainer = this.addCommand({
-            id: "generate-container",
-            name: `Generate ${labels.containerNote}`,
-            callback: () => this.generateContainer(),
-        });
-
-        this.cmdGenerateSubdivision = this.addCommand({
-            id: "generate-subdivision",
-            name: `Generate ${labels.subdivisionNote}`,
-            callback: () => this.generateSubdivision(),
-        });
-
-        this.cmdContainerReflection = this.addCommand({
-            id: "container-reflection",
-            name: `${labels.container} Reflection`,
-            callback: () => this.runReflection("container"),
-        });
-
-        this.cmdSubdivisionReflection = this.addCommand({
-            id: "subdivision-reflection",
-            name: `${labels.subdivision} Reflection`,
-            callback: () => this.runReflection("subdivision"),
-        });
-
-        this.addCommand({
-            id: "collect-fields",
-            name: "Collect Fields",
-            callback: () => this.collectFields(),
-        });
-
+        // The Calendar View command stays — the lunisolar sidebar grid is
+        // independent of the legacy mode/reflection pipeline.
         this.addCommand({
             id: "open-calendar",
             name: "Open Ritual Calendar",
             callback: () => this.activateCalendarView(),
-        });
-
-        this.cmdTestContainer = this.addCommand({
-            id: "test-container-reflection",
-            name: `Test ${labels.container} Reflection`,
-            callback: () => this.runTestReflection("container"),
-        });
-
-        this.cmdTestSubdivision = this.addCommand({
-            id: "test-subdivision-reflection",
-            name: `Test ${labels.subdivision} Reflection`,
-            callback: () => this.runTestReflection("subdivision"),
         });
 
         // ─── Periodic Ritual commands (Phase 1+) ───
@@ -4273,9 +4231,9 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         this.reflectionTab = "container";
         this.expandedInput = {};
         this.expandedOutput = {};
-        // Outer tab for Periodic Ritual rebuild. Legacy is the default until
-        // the new Containers/Alignments/LLM tabs have content.
-        this.outerTab = "legacy";
+        // Outer tab default. The legacy "Existing" tab has been removed; new
+        // and existing installs land on Containers.
+        this.outerTab = "containers";
         // Per-id expanded state for collapsible PR cards. Not persisted —
         // resets to expanded (true) on every fresh display() call for ids
         // that haven't been seen yet.
@@ -4296,7 +4254,6 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             { id: "reflection", label: "Reflection" },
             { id: "alignments", label: "Alignments" },
             { id: "llm",        label: "LLM" },
-            { id: "legacy",     label: "Existing" },
             { id: "general",    label: "General" },
         ];
 
@@ -4320,8 +4277,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             case "alignments":  this.displayAlignmentsStub(body); break;
             case "llm":         this.displayLLMStub(body); break;
             case "general":     this.displayGeneral(body); break;
-            case "legacy":
-            default:            this.displayLegacySettings(body); break;
+            default:            this.displayContainersStub(body); break;
         }
     }
 
