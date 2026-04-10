@@ -122,13 +122,30 @@ const MODE_LABELS = {
 //  LLM PROVIDERS (from Daily Ritual)
 // ═══════════════════════════════════════════════════════════════
 
+// PROVIDERS contract:
+//   buildUrl(s)         -> string
+//   buildBody(p, s, sys)-> object
+//   extractText(d)      -> string
+//   headers(s)          -> object  (optional)
+//   listModels(s)       -> Promise<string[]>  (takes the whole service config so
+//                         providers that need baseUrl can read it; legacy
+//                         providers ignore everything but s.apiKey)
+//   needsBaseUrl        -> boolean (UI hint)
+//   defaultBaseUrl      -> string  (UI hint)
+//
+// New providers added in Phase 2 polish: openrouter, lmstudio, openclaw.
+// All three are OpenAI-compatible chat/completions schemas with different
+// auth conventions and base URLs. OpenClaw uses the model field for agent
+// selection (e.g. "openclaw/default" or "openclaw/<agentId>") and listing
+// /v1/models returns those agent targets as model ids.
 const PROVIDERS = {
     gemini: {
         name: "Google Gemini",
         buildUrl(s) { return `https://generativelanguage.googleapis.com/v1beta/models/${s.model}:generateContent?key=${s.apiKey}`; },
         buildBody(prompt, s, sys) { return { system_instruction: { parts: [{ text: sys }] }, contents: [{ role: "user", parts: [{ text: prompt }] }] }; },
         extractText(d) { return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""; },
-        async listModels(key) {
+        async listModels(s) {
+            const key = typeof s === "string" ? s : s.apiKey;
             const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
             if (!r.ok) throw new Error(`${r.status}`);
             const d = await r.json();
@@ -141,7 +158,8 @@ const PROVIDERS = {
         buildBody(prompt, s, sys) { return { model: s.model, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }] }; },
         extractText(d) { return d.choices?.[0]?.message?.content?.trim() || ""; },
         headers(s) { return { Authorization: `Bearer ${s.apiKey}` }; },
-        async listModels(key) {
+        async listModels(s) {
+            const key = typeof s === "string" ? s : s.apiKey;
             const r = await fetch("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${key}` } });
             if (!r.ok) throw new Error(`${r.status}`);
             const d = await r.json();
@@ -154,8 +172,87 @@ const PROVIDERS = {
         buildBody(prompt, s, sys) { return { model: s.model, max_tokens: 1024, system: sys, messages: [{ role: "user", content: prompt }] }; },
         extractText(d) { return d.content?.[0]?.text?.trim() || ""; },
         headers(s) { return { "x-api-key": s.apiKey, "anthropic-version": "2023-06-01" }; },
-        async listModels(key) {
+        async listModels(s) {
+            const key = typeof s === "string" ? s : s.apiKey;
             const r = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": key, "anthropic-version": "2023-06-01" } });
+            if (!r.ok) throw new Error(`${r.status}`);
+            const d = await r.json();
+            return (d.data || []).map(m => m.id).sort();
+        },
+    },
+    openrouter: {
+        name: "OpenRouter",
+        buildUrl() { return "https://openrouter.ai/api/v1/chat/completions"; },
+        buildBody(prompt, s, sys) { return { model: s.model, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }] }; },
+        extractText(d) { return d.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) {
+            return {
+                Authorization: `Bearer ${s.apiKey}`,
+                // OpenRouter likes these for attribution but they're optional.
+                "HTTP-Referer": "https://github.com/poweredbypugs/monthly-ritual",
+                "X-Title": "Periodic Ritual (Obsidian)",
+            };
+        },
+        async listModels(s) {
+            const key = typeof s === "string" ? s : s.apiKey;
+            const r = await fetch("https://openrouter.ai/api/v1/models", { headers: { Authorization: `Bearer ${key}` } });
+            if (!r.ok) throw new Error(`${r.status}`);
+            const d = await r.json();
+            return (d.data || []).map(m => m.id).sort();
+        },
+    },
+    lmstudio: {
+        name: "LM Studio (local)",
+        needsBaseUrl: true,
+        defaultBaseUrl: "http://localhost:1234/v1",
+        buildUrl(s) {
+            const base = (s.baseUrl || "http://localhost:1234/v1").replace(/\/+$/, "");
+            return `${base}/chat/completions`;
+        },
+        buildBody(prompt, s, sys) { return { model: s.model, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }] }; },
+        extractText(d) { return d.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) {
+            // LM Studio ignores auth by default. Send the key only if provided.
+            return s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
+        },
+        async listModels(s) {
+            if (typeof s === "string") s = { apiKey: s };
+            const base = (s.baseUrl || "http://localhost:1234/v1").replace(/\/+$/, "");
+            const headers = s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
+            const r = await fetch(`${base}/models`, { headers });
+            if (!r.ok) throw new Error(`${r.status}`);
+            const d = await r.json();
+            return (d.data || []).map(m => m.id).sort();
+        },
+    },
+    openclaw: {
+        name: "OpenClaw (local agent)",
+        needsBaseUrl: true,
+        defaultBaseUrl: "http://127.0.0.1:18789",
+        buildUrl(s) {
+            const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            return `${base}/v1/chat/completions`;
+        },
+        // OpenClaw selects the agent via the `model` field. The user picks
+        // a model id like "openclaw/default" or "openclaw/<agentId>" from the
+        // listModels picker — we just pass it through unchanged.
+        buildBody(prompt, s, sys) {
+            return {
+                model: s.model || "openclaw/default",
+                messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+            };
+        },
+        extractText(d) { return d.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) {
+            // Auth depends on the gateway config (token/proxy/open).
+            // Send Bearer only if a key is set; open mode ignores it.
+            return s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
+        },
+        async listModels(s) {
+            if (typeof s === "string") s = { apiKey: s };
+            const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            const headers = s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
+            const r = await fetch(`${base}/v1/models`, { headers });
             if (!r.ok) throw new Error(`${r.status}`);
             const d = await r.json();
             return (d.data || []).map(m => m.id).sort();
@@ -192,6 +289,203 @@ function makeReflectionConfig() {
     };
 }
 
+// ─── Periodic Ritual: Starter system prompts (Phase 2 polish) ───
+// Embedded copies of prompts/*.md from the source repo. Shipped with main.js
+// so users can drop a starter prompt into their vault with one click without
+// needing to download anything separately. Edit the source files in
+// prompts/ when these need updating, and re-paste here.
+const PR_STARTER_PROMPTS = {
+    "calendar-week": {
+        label: "Calendar Week (7 days)",
+        filename: "pr-calendar-week-prompt.md",
+        content:
+`You are aggregating one calendar week of daily notes into a weekly review's frontmatter for an Obsidian vault.
+
+# Input format
+
+The user message contains:
+- A \`# Period\` header with \`start:\`, \`end:\`, and \`daily_count:\` fields.
+- A \`# Daily notes\` header followed by one section per day. Each section starts with \`## <filename>\` and contains the day's frontmatter keys and inline \`key:: value\` fields, one per line.
+
+Daily fields you may see:
+- **Records of what was done** (task lists, not ratings): \`study\`, \`creative\`, \`admin\`, \`work\`, \`links\`, possibly \`wealth\`
+- **Inline fields**: \`today::\` (the day's non-negotiable), \`health::\`, \`challenge::\`, \`lessons::\`
+- **Astro context**: \`season\`, \`Ki\`, \`lunar\`
+- **Habits**: \`egc\`, \`igc\` booleans, \`transits::\`
+
+# Output format
+
+Output ONLY a YAML frontmatter block. No code fences. No commentary.
+
+Required keys:
+- \`summary\`: One paragraph (3–5 sentences) synthesizing the week's arc, in second person. Look for momentum, themes, and friction. Treat goals as anchors, not prisons.
+- \`lessons\`: YAML list of 3–5 short observations.
+- \`health\`, \`study\`, \`links\`, \`work\`, \`creative\`, \`wealth\`: Pipe-separated chronological values from each day's matching field. Skip empty days. (Translate daily \`admin::\` into \`wealth\` at this level.)
+- \`highlights\`: YAML list of 2–4 standout moments.
+- \`challenges\`: YAML list of 1–3 frictions.
+
+# Rules
+
+- Skip days with no value — never write empty entries.
+- Do not invent data.
+- Do not lecture or moralize. Surface patterns without judgment.
+- Empty weeks still produce valid YAML with a brief \`summary\` and empty lists.
+- Output must be parseable YAML.
+
+Now produce the YAML.
+`,
+    },
+    "calendar-month": {
+        label: "Calendar Month (~30 days)",
+        filename: "pr-calendar-month-prompt.md",
+        content:
+`You are aggregating one calendar month of daily notes into a monthly review's frontmatter for an Obsidian vault. The month spans 28–31 days; the user message includes the exact range.
+
+# Input format
+
+The user message contains:
+- A \`# Period\` header with \`start:\`, \`end:\`, and \`daily_count:\`.
+- A \`# Daily notes\` header followed by one section per day with frontmatter and inline \`key:: value\` fields.
+
+# Output format
+
+Output ONLY a YAML frontmatter block. No code fences.
+
+Required keys:
+- \`summary\`: A paragraph (4–7 sentences) synthesizing the month's arc, in second person. Look for arcs across weeks and the relationship between intention and execution.
+- \`lessons\`: YAML list of 4–6 month-level observations. Bias toward things that needed a longer lens to see.
+- \`health\`, \`study\`, \`links\`, \`work\`, \`creative\`, \`wealth\`: Pipe-separated chronological values. Skip empty days.
+- \`highlights\`: YAML list of 3–6 month-level standouts.
+- \`challenges\`: YAML list of 2–4 frictions that recurred or compounded.
+- \`pattern_notes\`: A short paragraph (2–3 sentences) on patterns across the month — recurrences, avoidances, energy shifts.
+
+# Rules
+
+- Treat goals as anchors, not prisons.
+- Look for *patterns across days*, not just sums.
+- If \`today::\` is the user's primary measure of success, weight it accordingly.
+- Don't invent data.
+- Output must be parseable YAML.
+
+Now produce the YAML.
+`,
+    },
+    "chapter-quarter": {
+        label: "Chapter / Quarter (90 days)",
+        filename: "pr-chapter-prompt.md",
+        content:
+`You are aggregating one chapter (90 days) of daily notes into a chapter review's frontmatter for an Obsidian vault.
+
+A **Chapter** is a 90-day container — long enough to see something form, short enough to feel.
+
+# Input format
+
+The user message contains:
+- A \`# Period\` header with \`start:\`, \`end:\`, and \`daily_count:\`.
+- A \`# Daily notes\` header followed by ~90 daily sections.
+
+# Output format
+
+Output ONLY a YAML frontmatter block. No code fences.
+
+Required keys:
+- \`summary\`: A paragraph (5–8 sentences) on the chapter's arc, in second person. What was this chapter about? What changed in you?
+- \`chapter_arc\`: A short phrase (under 12 words) naming the chapter's emergent theme. Not what you intended — what actually happened.
+- \`lessons\`: YAML list of 5–8 chapter-level learnings.
+- \`health\`, \`study\`, \`links\`, \`work\`, \`creative\`, \`wealth\`: Pipe-separated phrases — one or two per ~30 days, not per day.
+- \`highlights\`: YAML list of 4–8 standout moments across the whole chapter.
+- \`challenges\`: YAML list of 3–5 frictions that persisted or compounded.
+- \`arc_observations\`: A paragraph (3–5 sentences) on patterns across the 90 days.
+- \`pillars_status\`: YAML object with one line per pillar describing where that pillar is *now* compared to chapter start. Honest, not optimistic.
+
+# Rules
+
+- The point is pattern recognition, not compliance scoring.
+- Look for *emergence*. What showed up that wasn't in the original intention?
+- Focus on systems that did or didn't form.
+- If 30 days are missing, name the gap.
+- Output must be parseable YAML.
+
+Now produce the YAML.
+`,
+    },
+    "sun-ingress": {
+        label: "Sun Ingress (~30 days, one zodiac sign)",
+        filename: "pr-sun-ingress-prompt.md",
+        content:
+`You are aggregating one Sun-ingress period (~30 days) into the frontmatter of a sign-period note for an Obsidian vault.
+
+This is a thematic reflection on the energy of the period, framed by the natal chart and the sign the Sun is currently in. The container note is named something like "♈ Aries 2026". Not a calendar month review.
+
+# Input format
+
+The user message contains:
+- A \`# Period\` header with \`start:\`, \`end:\`, and \`daily_count:\`.
+- A \`# Daily notes\` header followed by ~30 daily sections. Daily notes may have \`season\`, \`lunar\`, or \`transits::\` fields.
+
+# Output format
+
+Output ONLY a YAML frontmatter block. No code fences.
+
+Required keys:
+- \`theme\`: A short phrase (under 15 words) naming the *felt* theme of the sign period.
+- \`summary\`: A paragraph (4–7 sentences) reflecting on the energy of the period, in second person. Reference the sign's archetype lightly when it illuminates the daily data.
+- \`archetypal_resonance\`: A short paragraph (2–4 sentences) on where the user's life this period did or didn't align with the sign's traditional themes. Plain language.
+- \`transit_notes\`: Short paragraph or YAML list summarizing significant astrological events from \`transits::\` fields, if any.
+- \`recurring_motifs\`: YAML list of 2–5 motifs that recurred — words, images, frustrations, joys.
+- \`pillars_during_period\`: YAML object with one line per pillar (\`health\`, \`study\`, \`links\`, \`work\`, \`creative\`, \`wealth\`) noting how that pillar showed up. Brief.
+- \`emergence\`: A paragraph (2–4 sentences) on what emerged in the user during this period that wasn't there at the start.
+
+# Rules
+
+- Use astrology as a lens, not a script.
+- Don't predict. Don't prescribe. Don't moralize.
+- If the user logged little astrological context, lean on the daily data.
+- Look for what *emerged*, not what was *missed*.
+- Output must be parseable YAML.
+
+Now produce the YAML.
+`,
+    },
+    "lunar-phase": {
+        label: "Lunar Phase (~7 days, one quarter of a moon cycle)",
+        filename: "pr-lunar-phase-prompt.md",
+        content:
+`You are aggregating one lunar phase (~7 days) into the frontmatter of a phase note for an Obsidian vault.
+
+The user's lunar weeks are organized into four phases: **detach / plan / execute / share**. The container note is named something like "🌑 New Moon in Pisces 2026". This is a *short* container — surface mood and texture, not enumeration.
+
+# Input format
+
+The user message contains:
+- A \`# Period\` header with \`start:\`, \`end:\`, and \`daily_count:\`.
+- A \`# Daily notes\` header followed by ~7 daily sections.
+
+# Output format
+
+Output ONLY a YAML frontmatter block. No code fences.
+
+Required keys:
+- \`mood\`: A short phrase (under 12 words) naming the felt mood of the phase. Drawn from data, not astrological convention.
+- \`summary\`: A short paragraph (3–5 sentences) on what this phase felt like, in second person.
+- \`phase_intent\`: One sentence on what the phase seemed oriented around.
+- \`pillars_active\`: YAML list naming which of the user's six pillars (\`health\`, \`study\`, \`links\`, \`work\`, \`creative\`, \`wealth\`) showed activity.
+- \`notable\`: YAML list of 1–4 notable moments.
+- \`carry_forward\`: A short paragraph (1–3 sentences) on what feels worth carrying into the next phase. Observation, not advice.
+
+# Rules
+
+- Be brief. This is a small container.
+- Don't pad. Two days of data → two-day summary.
+- Don't moralize about missed days.
+- Let the data show what the phase actually was.
+- Output must be parseable YAML.
+
+Now produce the YAML.
+`,
+    },
+};
+
 // ─── Periodic Ritual: Container factory (Phase 1+) ───
 function makePRContainer(overrides = {}) {
     return Object.assign({
@@ -223,9 +517,10 @@ function makePRLLMService(overrides = {}) {
     return Object.assign({
         id: "lsv-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
         name: "New service",
-        provider: "gemini",  // gemini | openai | anthropic
+        provider: "gemini",  // gemini | openai | anthropic | openrouter | lmstudio | openclaw
         apiKey: "",
         model: "",
+        baseUrl: "",  // only used by providers with needsBaseUrl: true (lmstudio, openclaw)
     }, overrides);
 }
 
@@ -365,6 +660,18 @@ class PRModelPickerModal extends FuzzySuggestModal {
     getItems() { return this.models; }
     getItemText(m) { return m; }
     onChooseItem(m) { this.onChooseCallback(m); }
+}
+
+// Periodic Ritual: fuzzy picker for the starter system prompts embedded in main.js.
+class PRStarterPromptPickerModal extends FuzzySuggestModal {
+    constructor(app, onChoose) {
+        super(app);
+        this.onChooseCallback = onChoose;
+        this.setPlaceholder("Pick a starter system prompt…");
+    }
+    getItems() { return Object.keys(PR_STARTER_PROMPTS); }
+    getItemText(key) { return PR_STARTER_PROMPTS[key].label; }
+    onChooseItem(key) { this.onChooseCallback(key); }
 }
 
 class MarkdownFileSuggestModal extends FuzzySuggestModal {
@@ -2403,7 +2710,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         llmIntro.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 0 0 8px 0;";
         llmIntro.setText("When a service and a system prompt are both set, the plugin will collect daily notes in this container's range, send them to the LLM with the prompt, and merge the YAML response into this note's frontmatter.");
 
-        // System prompt MD picker
+        // System prompt MD picker (with starter-prompt creation)
         new Setting(card)
             .setName("System prompt")
             .setDesc(container.systemPromptFile || "None selected")
@@ -2414,6 +2721,44 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                         this.display();
                     }).open();
+                });
+            })
+            .addButton(btn => {
+                // Create a starter prompt by picking a template + a save folder.
+                // Drops the embedded starter content in the chosen folder and
+                // wires the container's systemPromptFile to the new path.
+                btn.setButtonText("Create starter").setTooltip("Create a starter system prompt MD file in your vault").onClick(async () => {
+                    const picker = new PRStarterPromptPickerModal(this.app, async (key) => {
+                        const starter = PR_STARTER_PROMPTS[key];
+                        if (!starter) return;
+                        new FolderSuggestModal(this.app, async (folder) => {
+                            const folderPath = folder.path || "";
+                            const filePath = folderPath ? `${folderPath}/${starter.filename}` : starter.filename;
+                            try {
+                                const existing = this.app.vault.getAbstractFileByPath(filePath);
+                                if (existing) {
+                                    new Notice(`File already exists: ${filePath}`);
+                                    container.systemPromptFile = filePath;
+                                    await this.plugin.saveSettings();
+                                    this.display();
+                                    return;
+                                }
+                                if (folderPath) {
+                                    const folderFile = this.app.vault.getAbstractFileByPath(folderPath);
+                                    if (!folderFile) await this.app.vault.createFolder(folderPath);
+                                }
+                                await this.app.vault.create(filePath, starter.content);
+                                container.systemPromptFile = filePath;
+                                await this.plugin.saveSettings();
+                                new Notice(`Created starter prompt: ${filePath}`);
+                                this.display();
+                            } catch (e) {
+                                new Notice(`Failed to create starter: ${e.message}`);
+                                console.error(e);
+                            }
+                        }).open();
+                    });
+                    picker.open();
                 });
             })
             .addExtraButton(btn => {
@@ -2530,16 +2875,40 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 dd.onChange(async v => {
                     service.provider = v;
                     service.model = "";
+                    // Auto-populate baseUrl with the provider's default if it
+                    // needs one and the user hasn't set anything yet.
+                    const newProv = PROVIDERS[v];
+                    if (newProv?.needsBaseUrl && !service.baseUrl) {
+                        service.baseUrl = newProv.defaultBaseUrl || "";
+                    }
                     await this.plugin.saveSettings();
                     this.display();
                 });
             });
 
+        // Base URL (only for providers that need it: LM Studio, OpenClaw)
+        const provDef = PROVIDERS[service.provider];
+        if (provDef?.needsBaseUrl) {
+            new Setting(card)
+                .setName("Base URL")
+                .setDesc(`Where this provider's HTTP gateway is reachable. Default: ${provDef.defaultBaseUrl}`)
+                .addText(t => {
+                    t.setPlaceholder(provDef.defaultBaseUrl || "http://localhost:1234/v1")
+                        .setValue(service.baseUrl || "")
+                        .onChange(async v => {
+                            service.baseUrl = v;
+                            await this.plugin.saveSettings();
+                        });
+                    t.inputEl.style.width = "320px";
+                });
+        }
+
         // API key (password)
         new Setting(card)
             .setName("API key")
+            .setDesc(provDef?.needsBaseUrl ? "Optional for local providers" : "")
             .addText(t => {
-                t.setPlaceholder("sk-... / AIza... / sk-ant-...")
+                t.setPlaceholder("sk-... / AIza... / sk-ant-... / sk-or-...")
                     .setValue(service.apiKey || "")
                     .onChange(async v => {
                         service.apiKey = v;
@@ -2551,46 +2920,48 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         // Model + fetch button
         new Setting(card)
-            .setName("Model")
+            .setName(service.provider === "openclaw" ? "Agent" : "Model")
             .setDesc(service.model || "Not selected")
             .addText(t => t
-                .setPlaceholder("gpt-4o / gemini-2.0-flash / claude-3-5-sonnet-...")
+                .setPlaceholder("gpt-4o / gemini-2.0-flash / openclaw/default / ...")
                 .setValue(service.model || "")
                 .onChange(async v => {
                     service.model = v;
                     await this.plugin.saveSettings();
                 }))
             .addExtraButton(btn => {
-                btn.setIcon("refresh-cw").setTooltip("Fetch available models from provider").onClick(async () => {
-                    if (!service.apiKey) {
-                        new Notice("Set the API key first");
-                        return;
-                    }
-                    const provider = PROVIDERS[service.provider];
-                    if (!provider) {
-                        new Notice(`Unknown provider: ${service.provider}`);
-                        return;
-                    }
-                    try {
-                        new Notice(`Fetching models from ${provider.name}…`);
-                        const models = await provider.listModels(service.apiKey);
-                        if (!models || models.length === 0) {
-                            new Notice("No models returned");
+                btn.setIcon("refresh-cw")
+                    .setTooltip(service.provider === "openclaw" ? "Fetch available agents" : "Fetch available models")
+                    .onClick(async () => {
+                        const provider = PROVIDERS[service.provider];
+                        if (!provider) {
+                            new Notice(`Unknown provider: ${service.provider}`);
                             return;
                         }
-                        // Open a fuzzy picker over the fetched models
-                        const picker = new PRModelPickerModal(this.app, models, async (chosen) => {
-                            service.model = chosen;
-                            await this.plugin.saveSettings();
-                            this.display();
-                            new Notice(`Selected ${chosen}`);
-                        });
-                        picker.open();
-                    } catch (e) {
-                        new Notice(`Model fetch failed: ${e.message}`);
-                        console.error(e);
-                    }
-                });
+                        // Local providers don't need an API key. Cloud providers do.
+                        if (!provider.needsBaseUrl && !service.apiKey) {
+                            new Notice("Set the API key first");
+                            return;
+                        }
+                        try {
+                            new Notice(`Fetching from ${provider.name}…`);
+                            const models = await provider.listModels(service);
+                            if (!models || models.length === 0) {
+                                new Notice("No models returned");
+                                return;
+                            }
+                            const picker = new PRModelPickerModal(this.app, models, async (chosen) => {
+                                service.model = chosen;
+                                await this.plugin.saveSettings();
+                                this.display();
+                                new Notice(`Selected ${chosen}`);
+                            });
+                            picker.open();
+                        } catch (e) {
+                            new Notice(`Fetch failed: ${e.message}`);
+                            console.error(e);
+                        }
+                    });
             });
     }
 

@@ -112,9 +112,56 @@ If any step fails, log to console and surface a notice with the actual error. Ne
 
 ---
 
+## Data the LLM sees
+
+The plugin sends two things to the configured LLM service when it aggregates a container: the **system prompt MD file** as the system role, and a generated **user message** built from the daily notes in the container's date range.
+
+The user message has this exact shape:
+
+```
+# Period
+start: 2026-04-06
+end: 2026-04-12
+daily_count: 7
+
+# Daily notes
+
+## Monday, April 6th 2026
+season: Spring
+Ki: ䷤ 9.4
+study: Worked through chapter 3 of the Go book
+work: Rewrote the auth middleware
+today:: Ship the migration before EOD
+health:: 30 min walk, lifted
+lessons:: Don't merge after 5pm
+
+---
+
+## Tuesday, April 7th 2026
+[ ... ]
+```
+
+Per-day rules:
+
+- **Section header** is `## <filename>` — the daily note's basename without extension.
+- **Frontmatter keys** appear as `key: value` lines, one per line. Plugin-internal keys (`periodic-ritual`, `position`) are filtered out. Nested objects and arrays are skipped.
+- **Inline fields** (`key:: value`) from the daily's body appear after the frontmatter on their own lines. Multiple values for the same key on the same day get joined with ` | `.
+- **Body content** (paragraphs, dataview blocks, headings) is **not** sent. Only frontmatter and inline fields. The user's templates have huge dataview blocks that aren't useful to the LLM and would burn tokens. If a future container needs the body, that's a per-container setting.
+- **Days with no fields** still appear with just their `## <filename>` header.
+- **Days outside the range** never appear.
+- **Sections are separated** by `\n\n---\n\n`.
+
+When writing system prompts, you can reference any field name you expect the daily notes to contain. The plugin doesn't filter or transform field names — it passes them through verbatim. Translation from daily field names to container frontmatter keys (e.g., daily `admin::` → container `wealth:`) is the prompt's job.
+
+Token cost is roughly proportional to `daily_count × (avg fields per day × ~10 tokens)`. A 7-day calendar week is small (~1k tokens). A 30-day month is moderate (~5k). A 90-day chapter is significant (~15k). A 365-day book run directly against dailies is too expensive — for that container, the recommendation is to have the system prompt aggregate from the chapter notes instead, which the plugin can do once Phase 4+ wires up parent-context reading.
+
 ## System prompt MD files
 
 The customization layer. One markdown file per container type, picked via fuzzy finder in settings. The file's contents are sent to the LLM as the system role on every aggregation pass for that container.
+
+**Starter prompts ship in `prompts/` in the source repo** and as embedded constants in `main.js` (`PR_STARTER_PROMPTS`). The container card has a "Create starter" button that drops the embedded content into a vault folder you pick and wires it as the container's system prompt. From there you edit the markdown to taste.
+
+Five starter prompts are provided in v1.1: `calendar-week`, `calendar-month`, `chapter-quarter`, `sun-ingress`, `lunar-phase`. Each is grounded in the user's six-pillar system (Health, Wealth, Work, Links, Creative, Study) and the anti-fragile philosophy (records, not ratings; patterns, not compliance; empty days are valid data).
 
 This is where the user encodes:
 - Which daily fields to read (`work::`, `study::`, `health::`, etc.)
