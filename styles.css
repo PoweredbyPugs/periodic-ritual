@@ -442,6 +442,27 @@
     z-index: 3;
 }
 
+/* Type badge above each node card */
+.pr-graph-node-kind {
+    position: absolute;
+    top: -16px;
+    left: 4px;
+    font-size: 0.65em;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+    user-select: none;
+    pointer-events: none;
+    font-family: var(--font-monospace);
+}
+
+.pr-graph-node-kind-container  { color: var(--interactive-accent); opacity: 0.7; }
+.pr-graph-node-kind-boundary   { color: #4a90e2; opacity: 0.7; }
+.pr-graph-node-kind-llm        { color: #5cb85c; opacity: 0.7; }
+.pr-graph-node-kind-reflection { color: #a06cd5; opacity: 0.7; }
+.pr-graph-node-kind-alignment  { color: #f0a04b; opacity: 0.7; }
+.pr-graph-node-kind-daily      { color: var(--text-faint); }
+
 .pr-graph-node:hover {
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
     border-color: var(--text-muted);

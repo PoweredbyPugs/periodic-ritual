@@ -4428,19 +4428,18 @@ class PRGraphView extends ItemView {
         const nodes = [];
         const wires = [];
 
-        // Track which boundaries / reflections / services / alignments are
-        // actually referenced — only show used ones to keep the graph clean.
+        // Track which boundaries are actually referenced — only built-in
+        // boundaries get this filter (otherwise we'd show all 7 detectors
+        // even when only one is used). Reflections / alignments / LLM
+        // services / custom boundaries always show, even when unattached,
+        // so newly created primitives are visible immediately.
         const usedBoundaries = new Set();
-        const usedServices = new Set();
-        const usedReflections = new Set();
         let anyDaily = false;
 
         for (const c of containers) {
             const ds = c.dataSource || { type: "daily" };
             if (ds.type === "daily") anyDaily = true;
             if (c.boundaryDetector) usedBoundaries.add(c.boundaryDetector);
-            if (c.llmServiceId) usedServices.add(c.llmServiceId);
-            if (c.reflectionId) usedReflections.add(c.reflectionId);
         }
 
         // ── Daily source node ──
@@ -4492,9 +4491,8 @@ class PRGraphView extends ItemView {
             });
         }
 
-        // ── LLM service nodes (only used ones) ──
+        // ── LLM service nodes (always shown, attached or not) ──
         for (const svc of services) {
-            if (!usedServices.has(svc.id)) continue;
             nodes.push({
                 id: `llm-${svc.id}`,
                 kind: "llm",
@@ -4505,9 +4503,8 @@ class PRGraphView extends ItemView {
             });
         }
 
-        // ── Reflection nodes (only used ones) ──
+        // ── Reflection nodes (always shown, attached or not) ──
         for (const r of reflections) {
-            if (!usedReflections.has(r.id)) continue;
             const flags = [];
             if (r.useLLM) flags.push("LLM");
             if (r.replaceAutoLLM) flags.push("replace");
@@ -4521,9 +4518,8 @@ class PRGraphView extends ItemView {
             });
         }
 
-        // ── Alignment nodes (only those with a containerId) ──
+        // ── Alignment nodes (always shown, attached or not) ──
         for (const a of alignments) {
-            if (!a.containerId) continue;
             nodes.push({
                 id: `alignment-${a.id}`,
                 kind: "alignment",
@@ -4834,6 +4830,21 @@ class PRGraphView extends ItemView {
         );
     }
 
+    // Short, human-readable kind labels for the type badge above each node.
+    nodeKindLabel(node) {
+        if (node.kind === "boundary") {
+            if (node.id.startsWith("boundary-custom-")) return "custom boundary";
+            return "boundary";
+        }
+        return {
+            container:  "container",
+            reflection: "reflection",
+            alignment:  "alignment",
+            llm:        "llm service",
+            daily:      "source",
+        }[node.kind] || node.kind;
+    }
+
     renderNode(parent, node) {
         const expanded = this.isNodeExpanded(node);
         const el = parent.createEl("div", { cls: `pr-graph-node pr-graph-node-${node.kind}${expanded ? " pr-graph-node-expanded" : ""}` });
@@ -4841,6 +4852,10 @@ class PRGraphView extends ItemView {
         el.style.top = `${node.y}px`;
         el.dataset.nodeId = node.id;
         node.el = el;
+
+        // Type badge — small label sitting just above the card so the user
+        // can read at a glance what kind of node this is.
+        const kindLabel = el.createEl("div", { cls: `pr-graph-node-kind pr-graph-node-kind-${node.kind}`, text: this.nodeKindLabel(node) });
 
         // Header — title is editable for primitive nodes; chevron toggles
         // the expanded body. Daily / built-in boundary nodes get a static
@@ -5497,23 +5512,28 @@ class PRGraphView extends ItemView {
         setTimeout(() => document.addEventListener("mousedown", dismiss, true), 0);
     }
 
-    // ─── Double-click (Phase 10c-1) ───
+    // ─── Double-click ───
     //
-    // - On empty canvas: open the same Add menu as right-click, positioned
-    //   at the click point.
-    // - On a node: toggle the node's expanded state.
+    // - On empty canvas: open the Add menu at the click point.
+    // - On a node: open settings to that primitive's tab. Also cancels any
+    //   pending single-click "toggle expand" so the actions don't fight.
     setupDoubleClick() {
         if (!this.canvasEl) return;
         const canvas = this.canvasEl;
-        const onDblClick = async (e) => {
+        const onDblClick = (e) => {
             // Sockets reserved for wire drag
             if (e.target.closest(".pr-graph-socket")) return;
+            // Cancel any pending single-click action triggered by the first
+            // click of this double-click sequence.
+            if (this._pendingNodeTap) {
+                clearTimeout(this._pendingNodeTap);
+                this._pendingNodeTap = null;
+            }
             const nodeEl = e.target.closest(".pr-graph-node");
             if (nodeEl) {
                 const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
-                if (!node || !this.nodeIsPrimitive(node)) return;
-                await this.setNodeExpanded(node, !this.isNodeExpanded(node));
-                this.render();
+                if (!node) return;
+                this.onNodeClick(node);  // opens settings to the primitive's tab
                 return;
             }
             // Empty canvas → open the add menu at this position
@@ -6136,12 +6156,23 @@ class PRGraphView extends ItemView {
             if (moved) {
                 // Persist the new position
                 if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
-                this.plugin.settings.prGraphLayout[node.id] = { x: node.x, y: node.y };
+                const cur = this.plugin.settings.prGraphLayout[node.id] || {};
+                cur.x = node.x;
+                cur.y = node.y;
+                this.plugin.settings.prGraphLayout[node.id] = cur;
                 await this.plugin.saveSettings();
             }
-            // If not moved, treat as a click — Phase 10a-3 wires this up
-            if (!moved && this.onNodeClick) {
-                this.onNodeClick(node);
+            // Single click on a node → toggle expand (deferred 250ms so a
+            // double click can cancel and open settings instead).
+            if (!moved) {
+                if (this._pendingNodeTap) clearTimeout(this._pendingNodeTap);
+                const clickedNode = node;
+                this._pendingNodeTap = setTimeout(async () => {
+                    this._pendingNodeTap = null;
+                    if (!this.nodeIsPrimitive(clickedNode)) return;
+                    await this.setNodeExpanded(clickedNode, !this.isNodeExpanded(clickedNode));
+                    this.render();
+                }, 250);
             }
         };
 
@@ -6163,6 +6194,10 @@ class PRGraphView extends ItemView {
         if (this._wireClickCleanup) this._wireClickCleanup();
         if (this._ctxMenuCleanup) this._ctxMenuCleanup();
         if (this._dblClickCleanup) this._dblClickCleanup();
+        if (this._pendingNodeTap) {
+            clearTimeout(this._pendingNodeTap);
+            this._pendingNodeTap = null;
+        }
         // Close any leftover floating menu
         const menu = document.querySelector(".pr-graph-ctx-menu");
         if (menu) menu.remove();
