@@ -1292,6 +1292,66 @@ class PRModelPickerModal extends FuzzySuggestModal {
     onChooseItem(m) { this.onChooseCallback(m); }
 }
 
+// Periodic Ritual: debug modal showing the last LLM call's full payload.
+// Triggered by the "Show last LLM call" command. Useful when YAML parsing
+// fails or the model returns weird output — you can see exactly what went
+// over the wire.
+class PRDebugModal extends Modal {
+    constructor(app, data) {
+        super(app);
+        this.data = data;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h3", { text: "Periodic Ritual — last LLM call" });
+
+        if (!this.data) {
+            const empty = contentEl.createEl("p");
+            empty.style.cssText = "color: var(--text-muted);";
+            empty.setText("No LLM call has been made since the plugin loaded.");
+            return;
+        }
+
+        const meta = contentEl.createEl("div");
+        meta.style.cssText = "color: var(--text-muted); font-size: 0.9em; margin-bottom: 12px;";
+        meta.createEl("div", { text: `When: ${this.data.timestamp}` });
+        meta.createEl("div", { text: `Container: ${this.data.container}` });
+        meta.createEl("div", { text: `Service: ${this.data.service} (${this.data.provider})` });
+        meta.createEl("div", { text: `Model: ${this.data.model}` });
+        meta.createEl("div", { text: `Status: ${this.data.responseStatus}` });
+        meta.createEl("div", { text: `URL: ${this.data.url}` });
+
+        const sections = [
+            { label: "System prompt", body: this.data.systemPrompt },
+            { label: "User message", body: this.data.userMessage },
+            { label: "Request body (JSON)", body: JSON.stringify(this.data.requestBody, null, 2) },
+            { label: "Raw response", body: this.data.responseRaw },
+        ];
+        for (const s of sections) {
+            const h = contentEl.createEl("h4", { text: s.label });
+            h.style.cssText = "margin: 16px 0 4px 0;";
+            const wrap = contentEl.createDiv();
+            wrap.style.cssText = "display: flex; gap: 8px; align-items: flex-start;";
+            const pre = wrap.createEl("pre");
+            pre.style.cssText = "flex: 1; background: var(--background-secondary); padding: 8px 12px; border-radius: 6px; max-height: 30vh; overflow: auto; font-size: 0.8em; user-select: text; -webkit-user-select: text; cursor: text; white-space: pre-wrap; word-break: break-word; margin: 0;";
+            pre.setText(s.body || "(empty)");
+            const copyBtn = wrap.createEl("button", { text: "Copy" });
+            copyBtn.style.cssText = "flex-shrink: 0;";
+            copyBtn.addEventListener("click", async () => {
+                try {
+                    await navigator.clipboard.writeText(s.body || "");
+                    copyBtn.setText("Copied ✓");
+                    setTimeout(() => copyBtn.setText("Copy"), 1500);
+                } catch {
+                    copyBtn.setText("Failed");
+                }
+            });
+        }
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
 // Periodic Ritual: modal that displays a built-in boundary's source code in
 // a scrollable code block. Triggered from the View source button on a
 // built-in boundary card in the Boundaries tab. Selectable + copy button.
@@ -2685,6 +2745,12 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
+    // Capture the last LLM call (system prompt + user message + raw response)
+    // for the Debug modal. Updated by runPRLLMAggregation on every call.
+    recordPRLastLLMCall(payload) {
+        this.lastPRLLMCall = payload;
+    }
+
     async runPRLLMAggregation(container, file, range, opts = {}) {
         const service = this.getPRLLMService(container.llmServiceId);
         if (!service) {
@@ -2805,6 +2871,8 @@ class MonthlyRitualPlugin extends Plugin {
         }
 
         let responseText;
+        let responseStatus = 0;
+        let responseRawText = "";
         try {
             if (!opts.silent) new Notice(`${container.name}: aggregating ${payload.count} daily note(s) via ${service.name}…`);
             const url = provider.buildUrl(service);
@@ -2821,6 +2889,23 @@ class MonthlyRitualPlugin extends Plugin {
                 headers,
                 body: JSON.stringify(body),
                 throw: false,
+            });
+            responseStatus = r.status;
+            responseRawText = r.text || "";
+            // Capture for the debug modal regardless of success/failure
+            this.recordPRLastLLMCall({
+                timestamp: new Date().toISOString(),
+                container: container.name,
+                service: service.name,
+                provider: service.provider,
+                model: service.model,
+                url,
+                requestHeaders: headers,
+                requestBody: body,
+                responseStatus,
+                responseRaw: responseRawText,
+                systemPrompt,
+                userMessage,
             });
             if (r.status < 200 || r.status >= 300) {
                 throw new Error(`${r.status}: ${(r.text || "").slice(0, 300)}`);
@@ -3801,6 +3886,13 @@ class MonthlyRitualPlugin extends Plugin {
             id: "pr-reflect",
             name: "Periodic Ritual: Reflect on container",
             callback: () => this.pickAndReflectPRContainer(),
+        });
+
+        // Phase 9: debug — show the last LLM call's full payload.
+        this.addCommand({
+            id: "pr-debug-last-llm",
+            name: "Periodic Ritual: Show last LLM call",
+            callback: () => new PRDebugModal(this.app, this.lastPRLLMCall).open(),
         });
     }
 
