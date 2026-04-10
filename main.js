@@ -4439,10 +4439,14 @@ class PRGraphView extends ItemView {
         this.wires = [];      // built from settings on render
         // Phase 10c-3 view filters — in-memory only, reset on view close.
         this.filters = {
-            hiddenKinds: new Set(),       // kinds to hide ("container", "reflection", ...)
-            focusContainerId: "",         // when set, show only this container's dependency graph
-            enabledOnly: false,           // when true, hide containers with enabled=false
+            hiddenKinds: new Set(),
+            focusContainerId: "",
+            enabledOnly: false,
         };
+        // Multi-select state — Set of node ids. Reset on view close.
+        this.selection = new Set();
+        // In-memory clipboard for copy/paste of primitives
+        this.clipboard = null;
     }
 
     getViewType() { return PR_GRAPH_VIEW_TYPE; }
@@ -4859,6 +4863,8 @@ class PRGraphView extends ItemView {
         this.setupContextMenus();
         // Double-click: empty canvas → add menu, node → toggle expand (Phase 10c-1)
         this.setupDoubleClick();
+        // Multi-select keyboard shortcuts (Delete, Cmd+C, Cmd+V)
+        this.setupKeyboard();
     }
 
     // Per-node expanded state lives in prGraphLayout[id].expanded so it
@@ -4903,7 +4909,9 @@ class PRGraphView extends ItemView {
 
     renderNode(parent, node) {
         const expanded = this.isNodeExpanded(node);
-        const el = parent.createEl("div", { cls: `pr-graph-node pr-graph-node-${node.kind}${expanded ? " pr-graph-node-expanded" : ""}` });
+        const selected = this.selection.has(node.id);
+        const cls = `pr-graph-node pr-graph-node-${node.kind}${expanded ? " pr-graph-node-expanded" : ""}${selected ? " pr-graph-node-selected" : ""}`;
+        const el = parent.createEl("div", { cls });
         el.style.left = `${node.x}px`;
         el.style.top = `${node.y}px`;
         el.dataset.nodeId = node.id;
@@ -5654,6 +5662,167 @@ class PRGraphView extends ItemView {
     applyTransform() {
         if (!this.viewportEl) return;
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+
+    // ─── Multi-select keyboard ───
+    //
+    // Delete / Backspace → delete every selected primitive
+    // Cmd/Ctrl + C → copy selected primitives to in-memory clipboard
+    // Cmd/Ctrl + V → paste from clipboard (new ids, offset positions)
+    // Cmd/Ctrl + A → select all primitive nodes
+    // Escape → clear selection
+    setupKeyboard() {
+        if (!this.canvasEl) return;
+        // Make the canvas focusable so it receives keyboard events.
+        this.canvasEl.setAttribute("tabindex", "0");
+        this.canvasEl.addEventListener("mouseenter", () => this.canvasEl.focus());
+
+        const onKeyDown = async (e) => {
+            // Don't hijack typing in an input/textarea
+            const tag = (e.target?.tagName || "").toLowerCase();
+            if (tag === "input" || tag === "textarea" || tag === "select") return;
+
+            const isMod = e.metaKey || e.ctrlKey;
+
+            if ((e.key === "Delete" || e.key === "Backspace") && this.selection.size > 0) {
+                e.preventDefault();
+                await this.deleteSelectedNodes();
+                return;
+            }
+            if (e.key === "Escape" && this.selection.size > 0) {
+                e.preventDefault();
+                this.selection.clear();
+                this.render();
+                return;
+            }
+            if (isMod && (e.key === "a" || e.key === "A")) {
+                e.preventDefault();
+                this.selection = new Set(this.nodes.filter(n => this.nodeIsPrimitive(n)).map(n => n.id));
+                this.render();
+                return;
+            }
+            if (isMod && (e.key === "c" || e.key === "C") && this.selection.size > 0) {
+                e.preventDefault();
+                this.copySelectedToClipboard();
+                new Notice(`Copied ${this.clipboard.items.length} node(s)`);
+                return;
+            }
+            if (isMod && (e.key === "v" || e.key === "V") && this.clipboard) {
+                e.preventDefault();
+                await this.pasteFromClipboard();
+                return;
+            }
+        };
+
+        this.canvasEl.addEventListener("keydown", onKeyDown);
+        this._keyboardCleanup = () => this.canvasEl?.removeEventListener("keydown", onKeyDown);
+    }
+
+    // Delete every primitive node currently in the selection set. Also
+    // clears references to the deleted primitives on other primitives
+    // (mirrors the per-node delete logic from the right-click menu).
+    async deleteSelectedNodes() {
+        if (this.selection.size === 0) return;
+        // Snapshot to a list — we'll mutate settings while iterating.
+        const ids = Array.from(this.selection);
+        let deleted = 0;
+        for (const id of ids) {
+            const node = this.nodes.find(n => n.id === id);
+            if (!node || !node.primitive) continue;
+            await this.deletePrimitiveNode(node);
+            deleted++;
+        }
+        this.selection.clear();
+        new Notice(`Deleted ${deleted} node(s)`);
+        // deletePrimitiveNode already calls render() each time. Final
+        // render is implicit via the last call.
+    }
+
+    // Copy selected primitives to in-memory clipboard. Stores deep clones
+    // by kind so the paste can recreate them with new ids.
+    copySelectedToClipboard() {
+        const items = [];
+        for (const id of this.selection) {
+            const node = this.nodes.find(n => n.id === id);
+            if (!node || !node.primitive) continue;
+            // Custom boundary nodes have kind "boundary" but live in
+            // prCustomBoundaries. Built-in boundaries are not copyable
+            // (they have no primitive — handled above).
+            const kind = (node.kind === "boundary") ? "custom-boundary" : node.kind;
+            items.push({
+                kind,
+                data: JSON.parse(JSON.stringify(node.primitive)),
+                originalX: node.x,
+                originalY: node.y,
+            });
+        }
+        // Compute the centroid so paste positions are relative to the
+        // group, not absolute.
+        let cx = 0, cy = 0;
+        for (const it of items) { cx += it.originalX; cy += it.originalY; }
+        if (items.length > 0) { cx /= items.length; cy /= items.length; }
+        this.clipboard = { items, centroidX: cx, centroidY: cy };
+    }
+
+    // Paste clipboard items as new primitives with fresh ids and positions
+    // offset by 30/30 from where they were originally. Selects the newly
+    // pasted nodes after render.
+    async pasteFromClipboard() {
+        if (!this.clipboard || !Array.isArray(this.clipboard.items)) return;
+        const s = this.plugin.settings;
+        const newIds = [];
+        const idPrefix = (kind) => ({
+            container: "pr",
+            reflection: "rf",
+            alignment: "al",
+            llm: "lsv",
+            "custom-boundary": "cb",
+        })[kind] || "x";
+
+        for (const it of this.clipboard.items) {
+            const fresh = JSON.parse(JSON.stringify(it.data));
+            fresh.id = `${idPrefix(it.kind)}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            fresh.name = `${fresh.name || "(unnamed)"} (copy)`;
+            // Reset per-instance state that shouldn't be cloned
+            if (it.kind === "container") fresh.lastGeneratedEnd = "";
+
+            // Push into the right settings array
+            let nodeIdPrefix;
+            if (it.kind === "container") {
+                if (!Array.isArray(s.prContainers)) s.prContainers = [];
+                s.prContainers.push(fresh);
+                nodeIdPrefix = "container";
+            } else if (it.kind === "reflection") {
+                if (!Array.isArray(s.prReflections)) s.prReflections = [];
+                s.prReflections.push(fresh);
+                nodeIdPrefix = "reflection";
+            } else if (it.kind === "alignment") {
+                if (!Array.isArray(s.prAlignments)) s.prAlignments = [];
+                s.prAlignments.push(fresh);
+                nodeIdPrefix = "alignment";
+            } else if (it.kind === "llm") {
+                if (!Array.isArray(s.prLLMServices)) s.prLLMServices = [];
+                s.prLLMServices.push(fresh);
+                nodeIdPrefix = "llm";
+            } else if (it.kind === "custom-boundary") {
+                if (!Array.isArray(s.prCustomBoundaries)) s.prCustomBoundaries = [];
+                s.prCustomBoundaries.push(fresh);
+                nodeIdPrefix = "boundary-custom";
+            } else {
+                continue;
+            }
+
+            const nodeId = `${nodeIdPrefix}-${fresh.id}`;
+            newIds.push(nodeId);
+            // Seed position 30/30 offset from the original
+            if (!s.prGraphLayout) s.prGraphLayout = {};
+            s.prGraphLayout[nodeId] = { x: it.originalX + 30, y: it.originalY + 30 };
+        }
+
+        await this.plugin.saveSettings();
+        this.selection = new Set(newIds);
+        this.render();
+        new Notice(`Pasted ${newIds.length} node(s)`);
     }
 
     // ─── Filter popover (Phase 10c-3) ───
@@ -6578,38 +6747,113 @@ class PRGraphView extends ItemView {
             this.applyTransform();
         }, { passive: false });
 
-        // Drag to pan — only when starting on empty canvas (not on a node)
+        // Drag to pan — only when starting on empty canvas (not on a node).
+        // Holding Ctrl/Cmd starts a marquee selection instead.
         let panning = false;
         let panStartX = 0;
         let panStartY = 0;
         let panOriginX = 0;
         let panOriginY = 0;
 
+        // Marquee selection state
+        let marquee = null;  // { startX, startY, el }
+
         canvas.addEventListener("mousedown", (e) => {
             // If the target is a node or inside one, let node-drag handle it
             if (e.target.closest(".pr-graph-node")) return;
-            if (e.button !== 0 && e.button !== 1) return; // left or middle only
+            if (e.button !== 0 && e.button !== 1) return;
+
+            // Ctrl/Cmd + drag on empty canvas → marquee selection
+            if (e.button === 0 && (e.ctrlKey || e.metaKey)) {
+                const rect = canvas.getBoundingClientRect();
+                const startX = e.clientX - rect.left;
+                const startY = e.clientY - rect.top;
+                const marqueeEl = canvas.createEl("div", { cls: "pr-graph-marquee" });
+                marqueeEl.style.left = `${startX}px`;
+                marqueeEl.style.top = `${startY}px`;
+                marqueeEl.style.width = "0px";
+                marqueeEl.style.height = "0px";
+                marquee = { startX, startY, el: marqueeEl };
+                e.preventDefault();
+                return;
+            }
+
+            // Plain drag → pan. Also clears any active selection.
             panning = true;
             panStartX = e.clientX;
             panStartY = e.clientY;
             panOriginX = this.panX;
             panOriginY = this.panY;
             canvas.style.cursor = "grabbing";
+            if (this.selection.size > 0) {
+                this.selection.clear();
+                this.render();
+            }
             e.preventDefault();
         });
 
         const onMouseMove = (e) => {
+            if (marquee) {
+                const rect = canvas.getBoundingClientRect();
+                const curX = e.clientX - rect.left;
+                const curY = e.clientY - rect.top;
+                const x = Math.min(marquee.startX, curX);
+                const y = Math.min(marquee.startY, curY);
+                const w = Math.abs(curX - marquee.startX);
+                const h = Math.abs(curY - marquee.startY);
+                marquee.el.style.left = `${x}px`;
+                marquee.el.style.top = `${y}px`;
+                marquee.el.style.width = `${w}px`;
+                marquee.el.style.height = `${h}px`;
+                return;
+            }
             if (!panning) return;
             this.panX = panOriginX + (e.clientX - panStartX);
             this.panY = panOriginY + (e.clientY - panStartY);
             this.applyTransform();
         };
-        const onMouseUp = () => {
+
+        const onMouseUp = (e) => {
+            if (marquee) {
+                // Compute selection: convert the screen-space rectangle to
+                // viewport coordinates and intersect with each node's bbox.
+                const rect = canvas.getBoundingClientRect();
+                const curX = e.clientX - rect.left;
+                const curY = e.clientY - rect.top;
+                const x1 = Math.min(marquee.startX, curX);
+                const y1 = Math.min(marquee.startY, curY);
+                const x2 = Math.max(marquee.startX, curX);
+                const y2 = Math.max(marquee.startY, curY);
+                // Convert to viewport coords
+                const vx1 = (x1 - this.panX) / this.zoom;
+                const vy1 = (y1 - this.panY) / this.zoom;
+                const vx2 = (x2 - this.panX) / this.zoom;
+                const vy2 = (y2 - this.panY) / this.zoom;
+
+                const newSel = new Set();
+                for (const n of this.nodes) {
+                    if (!n.el) continue;
+                    const nw = n.el.offsetWidth;
+                    const nh = n.el.offsetHeight;
+                    const nx1 = n.x;
+                    const ny1 = n.y;
+                    const nx2 = n.x + nw;
+                    const ny2 = n.y + nh;
+                    const intersects = nx1 < vx2 && nx2 > vx1 && ny1 < vy2 && ny2 > vy1;
+                    if (intersects) newSel.add(n.id);
+                }
+                this.selection = newSel;
+                marquee.el.remove();
+                marquee = null;
+                this.render();
+                return;
+            }
             if (panning) {
                 panning = false;
                 canvas.style.cursor = "";
             }
         };
+
         window.addEventListener("mousemove", onMouseMove);
         window.addEventListener("mouseup", onMouseUp);
 
@@ -6624,16 +6868,20 @@ class PRGraphView extends ItemView {
         if (!this.viewportEl) return;
         const viewport = this.viewportEl;
 
-        let dragging = null;       // the node being dragged
-        let dragStartX = 0;        // mouse start x (screen)
-        let dragStartY = 0;        // mouse start y (screen)
-        let nodeStartX = 0;        // node original x (viewport)
-        let nodeStartY = 0;        // node original y (viewport)
-        let moved = false;         // distinguish click from drag
+        // Single-node fields (legacy single-drag)
+        let dragging = null;
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let dragStartNodeX = 0;
+        let dragStartNodeY = 0;
+        let moved = false;
+
+        // Group-drag state when the user grabs a selected node — every
+        // selected node moves by the same delta.
+        let groupStarts = null;  // Map<nodeId, {x, y}> snapshot at mousedown
 
         const onMouseDown = (e) => {
-            if (e.button !== 0) return; // left only
-            // Sockets get their own drag handler (setupWireDrag) — bail
+            if (e.button !== 0) return;
             if (e.target.closest(".pr-graph-socket")) return;
             const nodeEl = e.target.closest(".pr-graph-node");
             if (!nodeEl) return;
@@ -6642,11 +6890,41 @@ class PRGraphView extends ItemView {
             const node = this.nodes.find(n => n.id === id);
             if (!node) return;
 
+            // Ctrl/Cmd + click on a node → toggle its membership in the
+            // selection set, no drag.
+            if (e.ctrlKey || e.metaKey) {
+                if (this.selection.has(id)) this.selection.delete(id);
+                else this.selection.add(id);
+                this.render();
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+
+            // If the clicked node is part of an existing selection, drag
+            // the whole group together. Otherwise clear the selection and
+            // start a single-node drag.
+            if (this.selection.has(id) && this.selection.size > 1) {
+                groupStarts = new Map();
+                for (const sid of this.selection) {
+                    const n = this.nodes.find(n => n.id === sid);
+                    if (n) groupStarts.set(sid, { x: n.x, y: n.y });
+                }
+            } else {
+                if (this.selection.size > 0) {
+                    this.selection.clear();
+                    // Defer the render to after we set dragging so the new
+                    // single-node drag still works
+                    requestAnimationFrame(() => this.render());
+                }
+                groupStarts = null;
+            }
+
             dragging = node;
             dragStartX = e.clientX;
             dragStartY = e.clientY;
-            nodeStartX = node.x;
-            nodeStartY = node.y;
+            dragStartNodeX = node.x;
+            dragStartNodeY = node.y;
             moved = false;
             nodeEl.style.zIndex = "10";
             e.preventDefault();
@@ -6658,10 +6936,24 @@ class PRGraphView extends ItemView {
             const dx = (e.clientX - dragStartX) / this.zoom;
             const dy = (e.clientY - dragStartY) / this.zoom;
             if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
-            dragging.x = nodeStartX + dx;
-            dragging.y = nodeStartY + dy;
-            dragging.el.style.left = `${dragging.x}px`;
-            dragging.el.style.top = `${dragging.y}px`;
+
+            if (groupStarts) {
+                // Move every selected node by the same delta
+                for (const [sid, start] of groupStarts) {
+                    const n = this.nodes.find(n => n.id === sid);
+                    if (!n || !n.el) continue;
+                    n.x = start.x + dx;
+                    n.y = start.y + dy;
+                    n.el.style.left = `${n.x}px`;
+                    n.el.style.top = `${n.y}px`;
+                }
+            } else {
+                // Single-node drag — apply delta to remembered start.
+                dragging.x = dragStartNodeX + dx;
+                dragging.y = dragStartNodeY + dy;
+                dragging.el.style.left = `${dragging.x}px`;
+                dragging.el.style.top = `${dragging.y}px`;
+            }
             this.renderWires();
         };
 
@@ -6671,12 +6963,23 @@ class PRGraphView extends ItemView {
             dragging = null;
             node.el.style.zIndex = "";
             if (moved) {
-                // Persist the new position
                 if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
-                const cur = this.plugin.settings.prGraphLayout[node.id] || {};
-                cur.x = node.x;
-                cur.y = node.y;
-                this.plugin.settings.prGraphLayout[node.id] = cur;
+                if (groupStarts) {
+                    // Persist every moved node's new position
+                    for (const sid of groupStarts.keys()) {
+                        const n = this.nodes.find(n => n.id === sid);
+                        if (!n) continue;
+                        const cur = this.plugin.settings.prGraphLayout[sid] || {};
+                        cur.x = n.x;
+                        cur.y = n.y;
+                        this.plugin.settings.prGraphLayout[sid] = cur;
+                    }
+                } else {
+                    const cur = this.plugin.settings.prGraphLayout[node.id] || {};
+                    cur.x = node.x;
+                    cur.y = node.y;
+                    this.plugin.settings.prGraphLayout[node.id] = cur;
+                }
                 await this.plugin.saveSettings();
             }
             // Single click on a node → toggle expand (deferred 250ms so a
@@ -6691,6 +6994,7 @@ class PRGraphView extends ItemView {
                     this.render();
                 }, 250);
             }
+            groupStarts = null;
         };
 
         viewport.addEventListener("mousedown", onMouseDown);
@@ -6711,6 +7015,7 @@ class PRGraphView extends ItemView {
         if (this._wireClickCleanup) this._wireClickCleanup();
         if (this._ctxMenuCleanup) this._ctxMenuCleanup();
         if (this._dblClickCleanup) this._dblClickCleanup();
+        if (this._keyboardCleanup) this._keyboardCleanup();
         if (this._pendingNodeTap) {
             clearTimeout(this._pendingNodeTap);
             this._pendingNodeTap = null;

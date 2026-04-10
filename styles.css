@@ -453,6 +453,27 @@
     z-index: 3;
 }
 
+/* Multi-select highlight: nodes in the selection set get a tinted ring */
+.pr-graph-node-selected {
+    box-shadow: 0 0 0 2px var(--interactive-accent), 0 4px 14px rgba(0, 0, 0, 0.28);
+    border-color: var(--interactive-accent);
+}
+
+/* Marquee rectangle drawn while ctrl/cmd-dragging on empty canvas */
+.pr-graph-marquee {
+    position: absolute;
+    border: 1px solid var(--interactive-accent);
+    background: rgba(80, 140, 200, 0.12);
+    pointer-events: none;
+    z-index: 50;
+}
+
+/* Make sure the canvas can take focus for keyboard events without
+   showing a default outline */
+.pr-graph-canvas:focus {
+    outline: none;
+}
+
 /* Type badge above each node card */
 .pr-graph-node-kind {
     position: absolute;
