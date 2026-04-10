@@ -490,6 +490,37 @@ Now produce the YAML.
     },
 };
 
+// Normalize a container's dataSource into the array form, regardless of
+// whether it was saved in the legacy single-source shape or the multi-
+// source shape. Always returns at least one source. Helper used by every
+// place that reads dataSource so the rest of the code can assume an array.
+//
+// Legacy shapes:
+//   { type: "daily" }
+//   { type: "container", containerId: "..." }
+// New shape:
+//   { sources: [{ type: "daily" }, { type: "container", containerId }, ...] }
+function getContainerDataSources(container) {
+    const ds = container?.dataSource;
+    if (!ds) return [{ type: "daily" }];
+    if (Array.isArray(ds.sources)) {
+        return ds.sources.length > 0 ? ds.sources : [{ type: "daily" }];
+    }
+    if (ds.type === "daily") return [{ type: "daily" }];
+    if (ds.type === "container" && ds.containerId) {
+        return [{ type: "container", containerId: ds.containerId }];
+    }
+    return [{ type: "daily" }];
+}
+
+// Stable string identity for a single source — used to dedupe and to
+// match wires against sources.
+function dataSourceKey(source) {
+    if (!source || source.type === "daily") return "daily";
+    if (source.type === "container") return `container:${source.containerId || ""}`;
+    return `unknown`;
+}
+
 // ─── Periodic Ritual: Container factory (Phase 1+) ───
 function makePRContainer(overrides = {}) {
     return Object.assign({
@@ -532,15 +563,14 @@ function makePRContainer(overrides = {}) {
         // runs at boundary, no Q&A modal).
         reflectionId: "",
         // Phase 8a+ data source. Controls what the auto-LLM aggregation
-        // pass reads from. Default is daily notes in the container's range
-        // (current behavior). Alternative: another PR container, in which
-        // case the LLM reads that container's generated notes that fall
-        // inside this container's range. Enables hierarchical roll-ups
-        // like Lunar Phase → Lunar Cycle → Solar Year without each level
-        // re-reading the raw dailies.
+        // pass reads from. Default is daily notes in the container's range.
+        // Multiple sources can be combined — e.g., daily + a sibling
+        // container's notes — to feed everything into one LLM call.
         //
-        // Shape: { type: "daily" } or { type: "container", containerId: "..." }
-        dataSource: { type: "daily" },
+        // Shape: { sources: [{ type: "daily" }, { type: "container", containerId }, ...] }
+        // Legacy shapes (single { type, containerId }) are accepted via
+        // getContainerDataSources() and normalized on next save.
+        dataSource: { sources: [{ type: "daily" }] },
     }, overrides);
 }
 
@@ -1388,14 +1418,16 @@ class PRHierarchyModal extends Modal {
             lines.push(`  ${id}["${name}<br/><i>${detector}</i>${enabledMark}"]`);
         }
 
-        // dataSource wires
+        // dataSource wires (one per source)
         for (const c of containers) {
             const id = safe(c.id);
-            const ds = c.dataSource || { type: "daily" };
-            if (ds.type === "container" && ds.containerId) {
-                lines.push(`  ${safe(ds.containerId)} -->|source| ${id}`);
-            } else if (anyDaily) {
-                lines.push(`  daily -->|source| ${id}`);
+            const sources = getContainerDataSources(c);
+            for (const src of sources) {
+                if (src.type === "container" && src.containerId) {
+                    lines.push(`  ${safe(src.containerId)} -->|source| ${id}`);
+                } else {
+                    lines.push(`  daily -->|source| ${id}`);
+                }
             }
         }
 
@@ -2764,21 +2796,34 @@ class MonthlyRitualPlugin extends Plugin {
     //   { type: "container", containerId: "..." } — another PR container's
     //     notes whose pr-start falls in [start, end]
     async buildPRSourcePayload(container, start, end) {
-        const ds = container?.dataSource || { type: "daily" };
+        const sources = getContainerDataSources(container);
 
-        let sourceFiles = [];
-        let sourceLabel = "daily notes";
-        if (ds.type === "container" && ds.containerId) {
-            const sourceContainer = (this.settings.prContainers || []).find(c => c.id === ds.containerId);
-            if (sourceContainer) {
-                sourceFiles = await this.findPRContainerNotesInRange(sourceContainer, start, end);
-                sourceLabel = `${sourceContainer.name || "container"} notes`;
+        // Walk every configured source. Files are deduped by path so two
+        // sources that happen to overlap don't duplicate sections.
+        const sourceFiles = [];
+        const seenPaths = new Set();
+        const labelParts = [];
+        for (const source of sources) {
+            let theseFiles = [];
+            if (source.type === "container" && source.containerId) {
+                const sourceContainer = (this.settings.prContainers || []).find(c => c.id === source.containerId);
+                if (sourceContainer) {
+                    theseFiles = await this.findPRContainerNotesInRange(sourceContainer, start, end);
+                    labelParts.push(`${sourceContainer.name || "container"} notes`);
+                }
+            } else {
+                const endInclusive = new Date(end);
+                endInclusive.setHours(23, 59, 59, 999);
+                theseFiles = this.findDailyNotesInRange(start, endInclusive);
+                labelParts.push("daily notes");
             }
-        } else {
-            const endInclusive = new Date(end);
-            endInclusive.setHours(23, 59, 59, 999);
-            sourceFiles = this.findDailyNotesInRange(start, endInclusive);
+            for (const f of theseFiles) {
+                if (seenPaths.has(f.path)) continue;
+                seenPaths.add(f.path);
+                sourceFiles.push(f);
+            }
         }
+        const sourceLabel = labelParts.length > 0 ? labelParts.join(" + ") : "daily notes";
 
         if (sourceFiles.length === 0) {
             return { count: 0, text: `(no ${sourceLabel} in range)`, label: sourceLabel };
@@ -3591,13 +3636,14 @@ class MonthlyRitualPlugin extends Plugin {
                 return;
             }
             visiting.add(c.id);
-            const ds = c.dataSource;
-            if (ds && ds.type === "container" && ds.containerId) {
-                const dep = byId.get(ds.containerId);
-                if (dep) visit(dep);
-                // If the dep is disabled or not in the enabled set, we just
-                // skip — A will read whatever is on disk for B even if B
-                // wasn't generated this run.
+            // Multi-source: walk every container source. Daily sources have
+            // no dependency to wait for.
+            const sources = getContainerDataSources(c);
+            for (const source of sources) {
+                if (source.type === "container" && source.containerId) {
+                    const dep = byId.get(source.containerId);
+                    if (dep) visit(dep);
+                }
             }
             visiting.delete(c.id);
             visited.add(c.id);
@@ -4479,8 +4525,10 @@ class PRGraphView extends ItemView {
         let anyDaily = false;
 
         for (const c of containers) {
-            const ds = c.dataSource || { type: "daily" };
-            if (ds.type === "daily") anyDaily = true;
+            const sources = getContainerDataSources(c);
+            for (const src of sources) {
+                if (src.type === "daily") anyDaily = true;
+            }
             if (c.boundaryDetector) usedBoundaries.add(c.boundaryDetector);
         }
 
@@ -4592,25 +4640,28 @@ class PRGraphView extends ItemView {
 
         // ── Wires ──
 
-        // dataSource wires
+        // dataSource wires — one per configured source so multi-source
+        // containers show all their feeds.
         for (const c of containers) {
-            const ds = c.dataSource || { type: "daily" };
-            if (ds.type === "container" && ds.containerId) {
-                wires.push({
-                    from: `container-${ds.containerId}`,
-                    to: `container-${c.id}`,
-                    fromSocket: "out",
-                    toSocket: "in-data",
-                    kind: "data-source",
-                });
-            } else if (anyDaily) {
-                wires.push({
-                    from: "daily",
-                    to: `container-${c.id}`,
-                    fromSocket: "out",
-                    toSocket: "in-data",
-                    kind: "data-source",
-                });
+            const sources = getContainerDataSources(c);
+            for (const src of sources) {
+                if (src.type === "container" && src.containerId) {
+                    wires.push({
+                        from: `container-${src.containerId}`,
+                        to: `container-${c.id}`,
+                        fromSocket: "out",
+                        toSocket: "in-data",
+                        kind: "data-source",
+                    });
+                } else {
+                    wires.push({
+                        from: "daily",
+                        to: `container-${c.id}`,
+                        fromSocket: "out",
+                        toSocket: "in-data",
+                        kind: "data-source",
+                    });
+                }
             }
         }
 
@@ -5225,21 +5276,52 @@ class PRGraphView extends ItemView {
             );
         }
 
-        // Data source
-        const dsOpts = [{ value: "daily", label: "Daily notes" }];
-        for (const other of (s.prContainers || [])) {
-            if (other.id === c.id) continue;
-            dsOpts.push({ value: `container:${other.id}`, label: other.name || "(unnamed)" });
-        }
-        const ds = c.dataSource || { type: "daily" };
-        const dsCurrent = ds.type === "container" && ds.containerId ? `container:${ds.containerId}` : "daily";
-        h.addLabeledDropdown("Data source", dsOpts,
-            () => dsCurrent,
-            (v) => {
-                if (v === "daily") c.dataSource = { type: "daily" };
-                else if (v.startsWith("container:")) c.dataSource = { type: "container", containerId: v.slice("container:".length) };
+        // Data sources (multi-source) — list with add/remove
+        const dsList = body.createEl("div", { cls: "pr-graph-form-row" });
+        dsList.createEl("div", { cls: "pr-graph-form-label", text: "Data sources" });
+        const sourceList = getContainerDataSources(c);
+        for (let i = 0; i < sourceList.length; i++) {
+            const source = sourceList[i];
+            const row = dsList.createEl("div");
+            row.style.cssText = "display: flex; gap: 4px; margin-top: 4px;";
+            const sel = row.createEl("select", { cls: "pr-graph-form-select" });
+            sel.createEl("option", { value: "daily", text: "Daily notes" });
+            for (const other of (s.prContainers || [])) {
+                if (other.id === c.id) continue;
+                sel.createEl("option", { value: `container:${other.id}`, text: other.name || "(unnamed)" });
             }
-        );
+            sel.value = dataSourceKey(source);
+            sel.addEventListener("mousedown", (e) => e.stopPropagation());
+            sel.addEventListener("change", async () => {
+                const sources = getContainerDataSources(c);
+                const v = sel.value;
+                if (v === "daily") sources[i] = { type: "daily" };
+                else if (v.startsWith("container:")) sources[i] = { type: "container", containerId: v.slice("container:".length) };
+                c.dataSource = { sources };
+                await this.plugin.saveSettings();
+                this.render();
+            });
+            const remBtn = row.createEl("button", { text: "×", cls: "pr-graph-form-qdel" });
+            remBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+            remBtn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                const sources = getContainerDataSources(c);
+                sources.splice(i, 1);
+                c.dataSource = { sources: sources.length > 0 ? sources : [{ type: "daily" }] };
+                await this.plugin.saveSettings();
+                this.render();
+            });
+        }
+        const dsAddBtn = dsList.createEl("button", { text: "+ Add source", cls: "pr-graph-form-button" });
+        dsAddBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+        dsAddBtn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            const sources = getContainerDataSources(c);
+            sources.push({ type: "daily" });
+            c.dataSource = { sources };
+            await this.plugin.saveSettings();
+            this.render();
+        });
 
         // LLM service
         const llmOpts = [{ value: "", label: "— None —" }];
@@ -6225,12 +6307,23 @@ class PRGraphView extends ItemView {
         if (!target) return;
 
         if (toSocket === "in-data") {
+            // Multi-source: ADD the new source instead of replacing.
+            // Dedupe via dataSourceKey so two of the same don't pile up.
+            const sources = getContainerDataSources(target);
+            let toAdd = null;
             if (fromNode.id === "daily") {
-                target.dataSource = { type: "daily" };
+                toAdd = { type: "daily" };
             } else if (fromNode.kind === "container") {
                 const sourceId = fromNode.id.replace(/^container-/, "");
                 if (sourceId === target.id) return; // can't self-reference
-                target.dataSource = { type: "container", containerId: sourceId };
+                toAdd = { type: "container", containerId: sourceId };
+            }
+            if (toAdd) {
+                const key = dataSourceKey(toAdd);
+                if (!sources.some(s => dataSourceKey(s) === key)) {
+                    sources.push(toAdd);
+                }
+                target.dataSource = { sources };
             }
         } else if (toSocket === "in-boundary") {
             if (fromNode.kind === "boundary") {
@@ -6306,22 +6399,27 @@ class PRGraphView extends ItemView {
                 if (!node) return;
                 const socketId = inSocket.dataset.socketId;
 
-                // Check for an existing wire on this input
-                const existingWire = this.wires.find(w => w.to === node.id && w.toSocket === socketId);
+                // Check for existing wires on this input. With multi-source
+                // and multi-alignment, an input can have more than one. We
+                // only allow rewire-drag when there's exactly one wire — for
+                // multiples, the user should right-click delete the specific
+                // wire they want to remove.
+                const existingWires = this.wires.filter(w => w.to === node.id && w.toSocket === socketId);
                 let isRewire = false;
-                if (existingWire) {
-                    // Boundary inputs can't be detached — every container
-                    // needs a boundary. Block the drag entirely.
+                if (existingWires.length === 1) {
+                    const existingWire = existingWires[0];
                     if (socketId === "in-boundary") {
                         new Notice("Boundary is required. Drop a different boundary on the input or change it in settings.");
                         return;
                     }
-                    // Detach in place (synchronous). Settings save is kicked
-                    // off as a background promise so the drag can begin
-                    // immediately without awaiting.
                     this.applyDetachInPlace(existingWire);
                     this.plugin.saveSettings().catch(err => console.error("Periodic Ritual: detach save failed", err));
                     isRewire = true;
+                } else if (existingWires.length > 1) {
+                    // Multi-wire input — don't auto-detach. Let the user
+                    // start a fresh drag from this socket to ADD another
+                    // source / connection.
+                    isRewire = false;
                 }
 
                 // Determine the wire color from the input socket type
@@ -6454,10 +6552,16 @@ class PRGraphView extends ItemView {
         };
 
         if (toSocketId === "in-data") {
+            const addSource = (newSource) => {
+                const sources = getContainerDataSources(toNode.primitive);
+                const key = dataSourceKey(newSource);
+                if (!sources.some(s => dataSourceKey(s) === key)) sources.push(newSource);
+                toNode.primitive.dataSource = { sources };
+            };
             items.push({
                 label: "Daily notes",
                 onClick: async () => {
-                    toNode.primitive.dataSource = { type: "daily" };
+                    addSource({ type: "daily" });
                     await wireUp();
                 },
             });
@@ -6467,7 +6571,7 @@ class PRGraphView extends ItemView {
                     const c = makePRContainer({ name: "New container" });
                     this.plugin.settings.prContainers.push(c);
                     seedPosition(`container-${c.id}`);
-                    toNode.primitive.dataSource = { type: "container", containerId: c.id };
+                    addSource({ type: "container", containerId: c.id });
                     await wireUp();
                 },
             });
@@ -6480,7 +6584,7 @@ class PRGraphView extends ItemView {
                     items.push({
                         label: c.name || "(unnamed)",
                         onClick: async () => {
-                            toNode.primitive.dataSource = { type: "container", containerId: c.id };
+                            addSource({ type: "container", containerId: c.id });
                             await wireUp();
                         },
                     });
@@ -6616,9 +6720,19 @@ class PRGraphView extends ItemView {
 
         switch (wire.kind) {
             case "data-source":
-                // Data source can't really be "empty" — every container has
-                // one. Detach means revert to daily, which is the default.
-                if (target) target.dataSource = { type: "daily" };
+                // Multi-source: remove just the one source this wire
+                // represents. If that leaves the list empty, default back
+                // to daily.
+                if (target) {
+                    const sources = getContainerDataSources(target);
+                    let removeKey;
+                    if (wire.from === "daily") removeKey = "daily";
+                    else if (wire.from.startsWith("container-")) {
+                        removeKey = `container:${wire.from.replace(/^container-/, "")}`;
+                    }
+                    const filtered = sources.filter(s => dataSourceKey(s) !== removeKey);
+                    target.dataSource = { sources: filtered.length > 0 ? filtered : [{ type: "daily" }] };
+                }
                 break;
             case "boundary":
                 // Boundary detaches are blocked at mousedown, but defensive.
@@ -6651,7 +6765,17 @@ class PRGraphView extends ItemView {
 
         switch (wire.kind) {
             case "data-source":
-                if (target) target.dataSource = { type: "daily" };
+                if (target) {
+                    // Multi-source: remove just the one source.
+                    const sources = getContainerDataSources(target);
+                    let removeKey;
+                    if (wire.from === "daily") removeKey = "daily";
+                    else if (wire.from.startsWith("container-")) {
+                        removeKey = `container:${wire.from.replace(/^container-/, "")}`;
+                    }
+                    const filtered = sources.filter(s => dataSourceKey(s) !== removeKey);
+                    target.dataSource = { sources: filtered.length > 0 ? filtered : [{ type: "daily" }] };
+                }
                 break;
             case "boundary":
                 // Don't allow disconnecting the boundary — every container needs one.
@@ -7436,34 +7560,59 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 });
             });
 
-        // ── Data source (Phase 8a) ──
-        // What the auto-LLM aggregation reads from. Default: daily notes
-        // in the container's range. Alternative: another PR container's
-        // notes whose pr-start falls in this container's range. Enables
-        // hierarchical roll-ups (Lunar Phase → Lunar Cycle → Solar Year).
-        const ds = container.dataSource || { type: "daily" };
-        const currentDsValue = ds.type === "container" && ds.containerId
-            ? `container:${ds.containerId}`
-            : "daily";
-        new Setting(card)
-            .setName("Data source")
-            .setDesc("What this container's auto-LLM reads from. Default is daily notes. Picking another container makes this one read its notes instead — used for roll-up chains like Lunar Phase → Lunar Cycle → Solar Year.")
-            .addDropdown(dd => {
-                dd.addOption("daily", "Daily notes (default)");
-                for (const c of (s.prContainers || [])) {
-                    if (c.id === container.id) continue; // can't reference self
-                    dd.addOption(`container:${c.id}`, `${c.name || "(unnamed)"} (container)`);
-                }
-                dd.setValue(currentDsValue);
-                dd.onChange(async v => {
-                    if (v === "daily") {
-                        container.dataSource = { type: "daily" };
-                    } else if (v.startsWith("container:")) {
-                        container.dataSource = { type: "container", containerId: v.slice("container:".length) };
-                    }
-                    await this.plugin.saveSettings();
-                });
+        // ── Data sources (multi-source) ──
+        // What the auto-LLM aggregation reads from. Default: daily notes.
+        // Multiple sources can be combined — the LLM reads everything
+        // merged into one user message. Enables roll-up chains and lateral
+        // joins (e.g., daily + a sibling container in the same period).
+        const sourceList = getContainerDataSources(container);
+        const sourcesHeader = new Setting(card)
+            .setName("Data sources")
+            .setDesc("What this container's auto-LLM reads from. Add as many as you need — files are merged and deduped before going to the LLM.");
+        const sourcesWrap = card.createDiv();
+        sourcesWrap.style.cssText = "padding-left: 16px; margin-bottom: 8px;";
+        for (let i = 0; i < sourceList.length; i++) {
+            const source = sourceList[i];
+            const row = sourcesWrap.createDiv();
+            row.style.cssText = "display: flex; gap: 6px; align-items: center; margin-bottom: 4px;";
+            const sel = row.createEl("select");
+            sel.style.cssText = "flex: 1;";
+            const dailyOpt = sel.createEl("option", { value: "daily", text: "Daily notes" });
+            for (const other of (s.prContainers || [])) {
+                if (other.id === container.id) continue;
+                sel.createEl("option", { value: `container:${other.id}`, text: other.name || "(unnamed)" });
+            }
+            sel.value = dataSourceKey(source);
+            sel.addEventListener("change", async () => {
+                const sources = getContainerDataSources(container);
+                const v = sel.value;
+                if (v === "daily") sources[i] = { type: "daily" };
+                else if (v.startsWith("container:")) sources[i] = { type: "container", containerId: v.slice("container:".length) };
+                container.dataSource = { sources };
+                await this.plugin.saveSettings();
+                this.display();
             });
+            const removeBtn = row.createEl("button", { text: "×" });
+            removeBtn.style.cssText = "background: var(--interactive-normal); border: none; border-radius: 3px; width: 24px; cursor: pointer;";
+            removeBtn.addEventListener("click", async () => {
+                const sources = getContainerDataSources(container);
+                sources.splice(i, 1);
+                container.dataSource = { sources: sources.length > 0 ? sources : [{ type: "daily" }] };
+                await this.plugin.saveSettings();
+                this.display();
+            });
+        }
+        const addRow = sourcesWrap.createDiv();
+        addRow.style.cssText = "margin-top: 4px;";
+        const addBtn = addRow.createEl("button", { text: "+ Add source" });
+        addBtn.style.cssText = "background: var(--interactive-normal); border: none; border-radius: 3px; padding: 4px 10px; cursor: pointer; font-size: 0.85em;";
+        addBtn.addEventListener("click", async () => {
+            const sources = getContainerDataSources(container);
+            sources.push({ type: "daily" });
+            container.dataSource = { sources };
+            await this.plugin.saveSettings();
+            this.display();
+        });
 
         // ── Template ──
         new Setting(card)
