@@ -526,18 +526,10 @@ function makePRContainer(overrides = {}) {
         // First-run containers have an empty string and only generate the
         // current period (no historical backfill).
         lastGeneratedEnd: "",
-        // Phase 6+ reflection
-        // "auto"   — at boundary, the LLM runs against daily data only.
-        //            No user interaction.
-        // "manual" — at boundary, the note is created with template content
-        //            only (no LLM call). The user runs the reflection
-        //            command later to fill the frontmatter via Q&A + LLM.
-        // "both"   — auto LLM runs at boundary as in "auto" mode. The
-        //            reflection command can be run any time after to
-        //            re-summarize with answers AND the existing frontmatter
-        //            as additional context.
-        reflectionMode: "auto",
-        questions: [],   // [{ text: string }]
+        // Phase 6+ reflection. Reference to a reflection profile in
+        // prReflections by id. Empty string = no reflection (only auto-LLM
+        // runs at boundary, no Q&A modal).
+        reflectionId: "",
     }, overrides);
 }
 
@@ -548,6 +540,32 @@ function makePRContainer(overrides = {}) {
 // because the LLM handles output.
 function makePRQuestion(text) {
     return { text: text || "" };
+}
+
+// ─── Periodic Ritual: Reflection profile factory (Phase 6 rework) ───
+// A Reflection is a reusable Q&A profile that containers reference by id.
+// Same artifact pattern as LLM services and alignments. Lives in its own
+// settings tab so questions don't crowd the container card.
+function makePRReflection(overrides = {}) {
+    return Object.assign({
+        id: "rf-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New reflection",
+        questions: [],   // [{ text: string }]
+        // How this reflection interacts with auto-aggregation when attached
+        // to a container:
+        // "manual" — replaces auto LLM. The container's auto-LLM is skipped
+        //            at boundary; the user runs the reflection command to
+        //            fill the frontmatter via Q&A + LLM.
+        // "both"   — auto LLM still runs at boundary. The reflection command
+        //            can be run later to re-summarize with answers AND the
+        //            existing frontmatter as additional context.
+        mode: "manual",
+        // Optional markdown text prepended to the container's system prompt
+        // during reflection runs (only). Lets the user say e.g. "Weight the
+        // user's answers more heavily than the daily data, and quote at
+        // least one phrase from each answer in the summary."
+        promptPrepend: "",
+    }, overrides);
 }
 
 // ─── Periodic Ritual: LLM service factory (Phase 2+) ───
@@ -1179,7 +1197,8 @@ const DEFAULT_SETTINGS = {
     // New first-class primitives. Empty defaults; no behavior wired up yet.
     // The legacy keys above continue to work — these are purely additive.
     prContainers: [],          // Container[] — see PROJECT.md "Container config"
-    prAlignments: [],          // Alignment[] — see PROJECT.md "Alignment module"
+    prAlignments: [],          // Alignment[] — measurable anchors per container
+    prReflections: [],         // Reflection[] — Q&A profiles per container
     prLLMServices: [],         // LLMService[] — { name, provider, apiKey, model }
     prCustomBoundaries: [],    // CustomBoundary[] — { id, name, scriptPath, description }
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
@@ -2396,22 +2415,22 @@ class MonthlyRitualPlugin extends Plugin {
             // merge the parsed YAML response into the file's frontmatter.
             // Skipped silently when not configured.
             //
-            // Phase 6: also skipped when reflectionMode is "manual" — in that
-            // mode, the user runs the reflection command later to fill the
-            // frontmatter via Q&A + LLM. "auto" and "both" both run the LLM
-            // here at boundary; "both" lets the user re-run later with answers.
-            const reflectionMode = container.reflectionMode || "auto";
+            // Phase 6 (rework): also skipped when the attached reflection
+            // profile is in "manual" mode — in that case the user runs
+            // reflection later to fill the frontmatter via Q&A + LLM. No
+            // attached reflection or "both" mode = auto-LLM still runs here.
+            const reflection = this.getPRReflectionForContainer(container);
+            const skipAutoLLM = reflection && (reflection.mode || "manual") === "manual";
             const range = { start: data.start, end: data.end };
-            if (container.llmServiceId && container.systemPromptFile && reflectionMode !== "manual") {
+            if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM) {
                 await this.runPRLLMAggregation(container, file, range, opts);
             }
 
             // Phase 7: alignment passes. Run after main aggregation so the
-            // alignment writes don't get clobbered. Each alignment is one
-            // additional LLM call. Like the main aggregation, alignments are
-            // skipped in "manual" reflection mode and run by runPRContainerReflection
-            // along with the manual reflection pass.
-            if (reflectionMode !== "manual") {
+            // alignment writes don't get clobbered. Skipped when the attached
+            // reflection is in "manual" mode — runPRContainerReflection runs
+            // them then so manual-mode containers still get alignments.
+            if (!skipAutoLLM) {
                 await this.runPRAlignmentsForContainer(container, file, range, opts);
             }
 
@@ -2545,6 +2564,12 @@ class MonthlyRitualPlugin extends Plugin {
             systemPrompt = `# Period type\n${boundaryDesc.trim()}\n\n---\n\n${systemPrompt}`;
         }
 
+        // Phase 6 (rework): if a reflection profile is in play and it has
+        // a promptPrepend, layer it on top during reflection runs only.
+        if (opts.reflection && opts.reflection.promptPrepend && opts.reflection.promptPrepend.trim()) {
+            systemPrompt = `# Reflection guidance\n${opts.reflection.promptPrepend.trim()}\n\n---\n\n${systemPrompt}`;
+        }
+
         // Build the daily payload
         const payload = await this.buildPRDailyPayload(range.start, range.end);
 
@@ -2565,12 +2590,16 @@ class MonthlyRitualPlugin extends Plugin {
             "",
         ];
 
-        if (Array.isArray(opts.answers) && opts.answers.length > 0 && Array.isArray(container.questions)) {
+        // Reflection answers section. The questions live on the reflection
+        // profile (passed in via opts.reflection) since Phase 6 rework moved
+        // them out of the container.
+        const reflectionQuestions = opts.reflection?.questions || [];
+        if (Array.isArray(opts.answers) && opts.answers.length > 0 && reflectionQuestions.length > 0) {
             parts.push("# Reflection answers", "");
-            for (let i = 0; i < container.questions.length; i++) {
+            for (let i = 0; i < reflectionQuestions.length; i++) {
                 const ans = (opts.answers[i] || "").trim();
                 if (!ans) continue;
-                parts.push(`**${container.questions[i].text}**`);
+                parts.push(`**${reflectionQuestions[i].text}**`);
                 parts.push(ans);
                 parts.push("");
             }
@@ -2684,14 +2713,26 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
+    // Look up the reflection profile attached to a container.
+    getPRReflectionForContainer(container) {
+        if (!container || !container.reflectionId) return null;
+        return (this.settings.prReflections || []).find(r => r.id === container.reflectionId) || null;
+    }
+
     // Open the reflection modal for a container, then on submit re-run LLM
     // aggregation with the answers attached. In "both" mode, also pass the
     // file's existing frontmatter as additional context so the LLM builds
     // on the previous auto-summary instead of starting fresh.
     async runPRContainerReflection(container) {
         if (!container) { new Notice("No container provided"); return; }
-        if (!Array.isArray(container.questions) || container.questions.length === 0) {
-            new Notice(`${container.name}: no questions configured. Add some in the container settings.`);
+
+        const reflection = this.getPRReflectionForContainer(container);
+        if (!reflection) {
+            new Notice(`${container.name}: no reflection profile attached. Pick one in the container settings.`);
+            return;
+        }
+        if (!Array.isArray(reflection.questions) || reflection.questions.length === 0) {
+            new Notice(`Reflection "${reflection.name}" has no questions. Add some in the Reflection tab.`);
             return;
         }
         if (!container.llmServiceId || !container.systemPromptFile) {
@@ -2716,16 +2757,18 @@ class MonthlyRitualPlugin extends Plugin {
 
         // Reuse the existing ReflectionModal class — it only reads q.text
         // from each question and onSubmit gets an array of answer strings.
-        const injectedVars = container.questions.map(() => "");
-        new ReflectionModal(this.app, container.questions, injectedVars, async (answers) => {
-            const includePreviousFrontmatter = (container.reflectionMode || "auto") === "both";
+        const injectedVars = reflection.questions.map(() => "");
+        new ReflectionModal(this.app, reflection.questions, injectedVars, async (answers) => {
+            const includePreviousFrontmatter = (reflection.mode || "manual") === "both";
             await this.runPRLLMAggregation(container, file, range, {
                 answers,
                 includePreviousFrontmatter,
+                reflection,
             });
             // Phase 7: also run any alignments attached to this container.
             // In manual mode this is the only place alignments fire, since
-            // generatePRContainerNote skips them when reflectionMode is "manual".
+            // generatePRContainerNote skips them when the attached reflection
+            // is in manual mode.
             await this.runPRAlignmentsForContainer(container, file, range, {});
         }).open();
     }
@@ -3441,10 +3484,9 @@ class MonthlyRitualPlugin extends Plugin {
     }
 
     pickAndReflectPRContainer() {
-        const containers = (this.settings.prContainers || [])
-            .filter(c => (c.reflectionMode || "auto") !== "auto");
+        const containers = (this.settings.prContainers || []).filter(c => !!c.reflectionId);
         if (containers.length === 0) {
-            new Notice("No Periodic Ritual containers have reflection enabled. Set a container's reflection mode to manual or both in the Containers tab.");
+            new Notice("No Periodic Ritual containers have a reflection profile attached. Define one in the Reflection tab and pick it on a container in the Containers tab.");
             return;
         }
         const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
@@ -3889,6 +3931,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const tabs = [
             { id: "containers", label: "Containers" },
             { id: "boundaries", label: "Boundaries" },
+            { id: "reflection", label: "Reflection" },
             { id: "alignments", label: "Alignments" },
             { id: "llm",        label: "LLM" },
             { id: "legacy",     label: "Existing" },
@@ -3911,6 +3954,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         switch (this.outerTab) {
             case "containers":  this.displayContainersStub(body); break;
             case "boundaries":  this.displayBoundaries(body); break;
+            case "reflection":  this.displayReflections(body); break;
             case "alignments":  this.displayAlignmentsStub(body); break;
             case "llm":         this.displayLLMStub(body); break;
             case "general":     this.displayGeneral(body); break;
@@ -4247,80 +4291,31 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 });
             });
 
-        // ── Reflection mode (Phase 6) ──
+        // ── Reflection picker (Phase 6 rework) ──
+        // Single dropdown referencing a reflection profile from the
+        // Reflection tab. None = no reflection (auto-LLM only). Picking a
+        // profile activates Q&A; the profile's mode controls whether
+        // auto-LLM still runs or is replaced.
+        const reflections = s.prReflections || [];
         new Setting(card)
             .setName("Reflection")
-            .setDesc("Auto: LLM runs at boundary against daily data only. Manual: note is created without an LLM call; you run the reflection command later to fill it. Both: LLM runs at boundary AND you can re-run reflection later with answers + existing frontmatter as context.")
+            .setDesc(reflections.length === 0 ? "Define a reflection profile in the Reflection tab to enable Q&A flows." : "Pick a reflection profile to attach to this container. Profiles are defined in the Reflection tab.")
             .addDropdown(dd => {
-                dd.addOption("auto", "Auto (LLM at boundary)");
-                dd.addOption("manual", "Manual (Q&A on demand)");
-                dd.addOption("both", "Both");
-                dd.setValue(container.reflectionMode || "auto");
+                dd.addOption("", "— None —");
+                for (const r of reflections) {
+                    const modeLabel = (r.mode || "manual") === "both" ? "both" : "manual";
+                    dd.addOption(r.id, `${r.name || "(unnamed)"} (${modeLabel})`);
+                }
+                dd.setValue(container.reflectionId || "");
                 dd.onChange(async v => {
-                    container.reflectionMode = v;
+                    container.reflectionId = v;
                     await this.plugin.saveSettings();
                     this.display();
                 });
             });
 
-        // Show questions list + Reflect now button only when reflection is enabled
-        const mode = container.reflectionMode || "auto";
-        if (mode !== "auto") {
-            // Questions list
-            const qHeader = new Setting(card)
-                .setName("Reflection questions")
-                .setDesc("Asked one at a time when you run reflection. Answers are sent to the LLM along with the daily data.");
-            qHeader.addButton(btn => btn
-                .setButtonText("+ Add")
-                .onClick(async () => {
-                    if (!Array.isArray(container.questions)) container.questions = [];
-                    container.questions.push(makePRQuestion(""));
-                    await this.plugin.saveSettings();
-                    this.display();
-                }));
-
-            const questions = Array.isArray(container.questions) ? container.questions : [];
-            for (let i = 0; i < questions.length; i++) {
-                const q = questions[i];
-                const row = new Setting(card)
-                    .addText(t => {
-                        t.setPlaceholder(`Question ${i + 1}`)
-                            .setValue(q.text || "")
-                            .onChange(async v => {
-                                q.text = v;
-                                await this.plugin.saveSettings();
-                            });
-                        t.inputEl.style.width = "100%";
-                    })
-                    .addExtraButton(btn => {
-                        btn.setIcon("up-chevron-glyph").setTooltip("Move up").onClick(async () => {
-                            if (i === 0) return;
-                            [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]];
-                            await this.plugin.saveSettings();
-                            this.display();
-                        });
-                    })
-                    .addExtraButton(btn => {
-                        btn.setIcon("down-chevron-glyph").setTooltip("Move down").onClick(async () => {
-                            if (i === questions.length - 1) return;
-                            [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]];
-                            await this.plugin.saveSettings();
-                            this.display();
-                        });
-                    })
-                    .addExtraButton(btn => {
-                        btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
-                            questions.splice(i, 1);
-                            await this.plugin.saveSettings();
-                            this.display();
-                        });
-                    });
-                // Strip the setting-item-info side so the text input takes the full width
-                row.infoEl.style.display = "none";
-            }
-        }
-
         // ── Generate / Reflect buttons ──
+        const hasReflection = !!container.reflectionId && reflections.some(r => r.id === container.reflectionId);
         const actions = new Setting(card)
             .addButton(btn => btn
                 .setButtonText("Generate now")
@@ -4328,12 +4323,170 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .onClick(async () => {
                     await this.plugin.generatePRContainerNote(container);
                 }));
-        if (mode !== "auto") {
+        if (hasReflection) {
             actions.addButton(btn => btn
                 .setButtonText("Reflect now")
                 .onClick(async () => {
                     await this.plugin.runPRContainerReflection(container);
                 }));
+        }
+    }
+
+    // Phase 6 (rework): Reflection tab. List of reusable reflection profiles
+    // that containers reference by id. Same artifact pattern as LLM services
+    // and alignments. Lives here so questions don't crowd container cards.
+    displayReflections(containerEl) {
+        const s = this.plugin.settings;
+        if (!Array.isArray(s.prReflections)) s.prReflections = [];
+
+        containerEl.createEl("h2", { text: "Reflection" });
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        intro.setText("Reflection profiles are reusable Q&A flows. Define one here, then attach it to a container in the Containers tab. When you run reflection on that container, the questions are asked one at a time (same modal Daily Ritual uses) and the answers are sent to the LLM along with the daily data.");
+
+        const purpose = containerEl.createEl("p");
+        purpose.style.cssText = "color: var(--text-faint); max-width: 60ch; font-size: 0.9em;";
+        purpose.setText("Reflection is bottom-up: your answers feed the summary. Alignments are top-down: your goals measure the data. Both fire after the container's main aggregation.");
+
+        if (s.prReflections.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); margin: 16px 0;";
+            empty.setText("No reflection profiles yet. Click below to add one.");
+        } else {
+            for (let i = 0; i < s.prReflections.length; i++) {
+                this.renderPRReflectionCard(containerEl, s.prReflections[i], i);
+            }
+        }
+
+        new Setting(containerEl)
+            .addButton(btn => btn
+                .setButtonText("+ Add reflection")
+                .setCta()
+                .onClick(async () => {
+                    s.prReflections.push(makePRReflection());
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+    }
+
+    renderPRReflectionCard(parent, reflection, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv({ cls: "mr-pr-card" });
+
+        // Header: name input + delete
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+        const nameInput = header.createEl("input", { type: "text", value: reflection.name || "", cls: "mr-pr-name-input" });
+        nameInput.placeholder = "Reflection name";
+        nameInput.addEventListener("change", async () => {
+            reflection.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
+        deleteBtn.title = "Delete reflection";
+        deleteBtn.addEventListener("click", async () => {
+            s.prReflections.splice(idx, 1);
+            // Also clear references on any container that pointed at this reflection
+            for (const c of (s.prContainers || [])) {
+                if (c.reflectionId === reflection.id) c.reflectionId = "";
+            }
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const body = card.createDiv({ cls: "mr-pr-card-body" });
+
+        // Mode dropdown
+        new Setting(body)
+            .setName("Mode")
+            .setDesc("Manual: replaces the container's auto-LLM. The note is created from the template only at boundary; you run reflection later to fill the frontmatter via Q&A. Both: auto-LLM still runs at boundary; you can re-run reflection later to re-summarize with answers + previous frontmatter as context.")
+            .addDropdown(dd => {
+                dd.addOption("manual", "Manual (Q&A on demand, replaces auto-LLM)");
+                dd.addOption("both", "Both (auto-LLM at boundary + reflection on demand)");
+                dd.setValue(reflection.mode || "manual");
+                dd.onChange(async v => {
+                    reflection.mode = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // Optional system prompt prepend
+        new Setting(body)
+            .setName("Prompt prepend (optional)")
+            .setDesc("Markdown text layered on top of the container's system prompt during reflection runs. Use it to weight answers heavier than the daily data, override the output format, etc.")
+            .addTextArea(t => {
+                t.setValue(reflection.promptPrepend || "")
+                    .onChange(async v => {
+                        reflection.promptPrepend = v;
+                        await this.plugin.saveSettings();
+                    });
+                t.inputEl.rows = 3;
+                t.inputEl.style.width = "100%";
+            });
+
+        // Questions list
+        const qHeader = new Setting(body)
+            .setName("Questions")
+            .setDesc("Asked one at a time when you run reflection. Answers are sent to the LLM along with the daily data and the container's system prompt.");
+        qHeader.addButton(btn => btn
+            .setButtonText("+ Add")
+            .onClick(async () => {
+                if (!Array.isArray(reflection.questions)) reflection.questions = [];
+                reflection.questions.push(makePRQuestion(""));
+                await this.plugin.saveSettings();
+                this.display();
+            }));
+
+        const questions = Array.isArray(reflection.questions) ? reflection.questions : [];
+        for (let i = 0; i < questions.length; i++) {
+            const q = questions[i];
+            const row = new Setting(body)
+                .addText(t => {
+                    t.setPlaceholder(`Question ${i + 1}`)
+                        .setValue(q.text || "")
+                        .onChange(async v => {
+                            q.text = v;
+                            await this.plugin.saveSettings();
+                        });
+                    t.inputEl.style.width = "100%";
+                })
+                .addExtraButton(btn => {
+                    btn.setIcon("up-chevron-glyph").setTooltip("Move up").onClick(async () => {
+                        if (i === 0) return;
+                        [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]];
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+                })
+                .addExtraButton(btn => {
+                    btn.setIcon("down-chevron-glyph").setTooltip("Move down").onClick(async () => {
+                        if (i === questions.length - 1) return;
+                        [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]];
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+                })
+                .addExtraButton(btn => {
+                    btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
+                        questions.splice(i, 1);
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+                });
+            row.infoEl.style.display = "none";
+        }
+
+        // Where this reflection is currently attached
+        const attachedContainers = (s.prContainers || []).filter(c => c.reflectionId === reflection.id);
+        if (attachedContainers.length > 0) {
+            const attached = body.createEl("p");
+            attached.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin-top: 8px;";
+            attached.setText(`Attached to: ${attachedContainers.map(c => c.name || "(unnamed)").join(", ")}`);
+        } else {
+            const unattached = body.createEl("p");
+            unattached.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin-top: 8px; font-style: italic;";
+            unattached.setText("Not attached to any container yet. Pick this reflection in a container's Reflection dropdown to use it.");
         }
     }
 
