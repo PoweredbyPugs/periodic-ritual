@@ -3804,17 +3804,74 @@ class MonthlyRitualPlugin extends Plugin {
         });
     }
 
-    pickAndReflectPRContainer() {
-        const containers = (this.settings.prContainers || []).filter(c => !!c.reflectionId);
-        if (containers.length === 0) {
-            new Notice("No Periodic Ritual containers have a reflection profile attached. Define one in the Reflection tab and pick it on a container in the Containers tab.");
-            return;
+    // Phase 9: try to detect which container the active file belongs to
+    // before falling back to the picker. The plugin stamps each generated
+    // note with its container id (frontmatter or inline marker), so this is
+    // a direct lookup against settings.prContainers.
+    async detectPRContainerFromActiveFile() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) return null;
+        const containers = this.settings.prContainers || [];
+
+        // Try frontmatter first — fastest, no file read needed
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fmBlob = cache?.frontmatter?.["periodic-ritual"];
+        if (fmBlob) {
+            const meta = this.parsePRMetadataBlob(fmBlob);
+            if (meta?.id) {
+                const c = containers.find(c => c.id === meta.id);
+                if (c) return c;
+            }
         }
-        const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
-            await this.runPRContainerReflection(container);
+
+        // Inline marker fallback — search the file body for any PR marker
+        // matching any container's configured key
+        const seenKeys = new Set();
+        for (const c of containers) {
+            if ((c.metadataPlacement || "frontmatter") !== "inline") continue;
+            const key = c.metadataInlineKey || "periodic-ritual";
+            if (seenKeys.has(key)) continue;
+            seenKeys.add(key);
+        }
+        if (seenKeys.size > 0) {
+            try {
+                const content = await this.app.vault.read(file);
+                for (const key of seenKeys) {
+                    const re = new RegExp(`(?:^|\\s)${escapeRegex(key)}::\\s*([^\\n]+)`, "m");
+                    const m = content.match(re);
+                    if (m) {
+                        const meta = this.parsePRMetadataBlob(m[1]);
+                        if (meta?.id) {
+                            const c = containers.find(c => c.id === meta.id);
+                            if (c) return c;
+                        }
+                    }
+                }
+            } catch (_) { /* ignore */ }
+        }
+        return null;
+    }
+
+    pickAndReflectPRContainer() {
+        // Phase 9: if the active file belongs to a PR container with a
+        // reflection profile attached, run reflection on it directly
+        // instead of opening the picker. The picker is the fallback.
+        this.detectPRContainerFromActiveFile().then(detected => {
+            if (detected && detected.reflectionId) {
+                this.runPRContainerReflection(detected);
+                return;
+            }
+            const containers = (this.settings.prContainers || []).filter(c => !!c.reflectionId);
+            if (containers.length === 0) {
+                new Notice("No Periodic Ritual containers have a reflection profile attached. Define one in the Reflection tab and pick it on a container in the Containers tab.");
+                return;
+            }
+            const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
+                await this.runPRContainerReflection(container);
+            });
+            modal.setPlaceholder("Pick a container to reflect on…");
+            modal.open();
         });
-        modal.setPlaceholder("Pick a container to reflect on…");
-        modal.open();
     }
 
     // Fuzzy picker over all configured PR containers (enabled or not).
