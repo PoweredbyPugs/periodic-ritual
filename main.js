@@ -1292,6 +1292,149 @@ class PRModelPickerModal extends FuzzySuggestModal {
     onChooseItem(m) { this.onChooseCallback(m); }
 }
 
+// Periodic Ritual: hierarchy diagram modal. Renders a Mermaid flowchart
+// of the current container chain (dataSource arrows + reflection/alignment
+// attachments + LLM service references + boundary types). Read-only —
+// for visualizing the structure. Editing happens in the regular tabs.
+class PRHierarchyModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h3", { text: "Periodic Ritual — hierarchy" });
+
+        const note = contentEl.createEl("p");
+        note.style.cssText = "color: var(--text-muted); font-size: 0.9em;";
+        note.setText("Read-only view of how your containers, reflections, alignments, and LLM services connect. Edit the structure in the regular settings tabs.");
+
+        const mermaid = this.buildMermaidGraph();
+        // Render as a markdown code block — Obsidian's markdown processor
+        // will turn it into an actual Mermaid diagram.
+        const wrap = contentEl.createDiv();
+        wrap.style.cssText = "max-height: 70vh; overflow: auto; background: var(--background-secondary); padding: 12px; border-radius: 6px;";
+        const md = "```mermaid\n" + mermaid + "\n```";
+        // Render the markdown into the wrapper
+        const MarkdownRenderer = require("obsidian").MarkdownRenderer;
+        if (MarkdownRenderer && MarkdownRenderer.render) {
+            MarkdownRenderer.render(this.app, md, wrap, "", this.plugin);
+        } else if (MarkdownRenderer && MarkdownRenderer.renderMarkdown) {
+            // Fallback for older Obsidian API
+            MarkdownRenderer.renderMarkdown(md, wrap, "", this.plugin);
+        } else {
+            // Bare-bones fallback: show the source
+            const pre = wrap.createEl("pre");
+            pre.style.cssText = "user-select: text; white-space: pre-wrap;";
+            pre.setText(mermaid);
+        }
+
+        // Source view button — lets the user grab the Mermaid source
+        const sourceBtn = contentEl.createEl("button", { text: "Copy Mermaid source" });
+        sourceBtn.style.marginTop = "12px";
+        sourceBtn.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(mermaid);
+                sourceBtn.setText("Copied ✓");
+                setTimeout(() => sourceBtn.setText("Copy Mermaid source"), 1500);
+            } catch {
+                sourceBtn.setText("Failed");
+            }
+        });
+    }
+    onClose() { this.contentEl.empty(); }
+
+    // Generate a Mermaid flowchart string from the current settings.
+    // Layout: left-to-right. Containers are rectangles, reflections are
+    // rounded rects, alignments are hexagons, LLM services are stadium
+    // shapes, daily notes is a special source node.
+    buildMermaidGraph() {
+        const s = this.plugin.settings;
+        const containers = s.prContainers || [];
+        const reflections = s.prReflections || [];
+        const alignments = s.prAlignments || [];
+        const services = s.prLLMServices || [];
+
+        const lines = ["flowchart LR"];
+
+        // Helper: sanitize an id for mermaid (no spaces, no special chars)
+        const safe = (id) => id.replace(/[^a-zA-Z0-9_]/g, "_");
+        const escapeLabel = (s) => (s || "").replace(/"/g, "&quot;").replace(/\|/g, "\\|");
+
+        // Daily source as a single starting node — only emitted if any
+        // container actually reads from daily.
+        const anyDaily = containers.some(c => !c.dataSource || c.dataSource.type === "daily");
+        if (anyDaily) {
+            lines.push(`  daily[("Daily notes")]`);
+        }
+
+        // Containers
+        for (const c of containers) {
+            const id = safe(c.id);
+            const name = escapeLabel(c.name || "(unnamed)");
+            const detector = escapeLabel(c.boundaryDetector || "?");
+            const enabledMark = c.enabled ? "" : " 🔒";
+            lines.push(`  ${id}["${name}<br/><i>${detector}</i>${enabledMark}"]`);
+        }
+
+        // dataSource wires
+        for (const c of containers) {
+            const id = safe(c.id);
+            const ds = c.dataSource || { type: "daily" };
+            if (ds.type === "container" && ds.containerId) {
+                lines.push(`  ${safe(ds.containerId)} -->|source| ${id}`);
+            } else if (anyDaily) {
+                lines.push(`  daily -->|source| ${id}`);
+            }
+        }
+
+        // Reflection nodes + attachment wires
+        for (const r of reflections) {
+            const id = safe(r.id);
+            const name = escapeLabel(r.name || "(unnamed)");
+            const llmFlag = r.useLLM ? " 🤖" : "";
+            const replaceFlag = r.replaceAutoLLM ? " ⏸" : "";
+            lines.push(`  ${id}(("Reflection: ${name}${llmFlag}${replaceFlag}"))`);
+        }
+        for (const c of containers) {
+            if (!c.reflectionId) continue;
+            lines.push(`  ${safe(c.reflectionId)} -.->|reflection| ${safe(c.id)}`);
+        }
+
+        // Alignment nodes + attachment wires
+        for (const a of alignments) {
+            const id = safe(a.id);
+            const name = escapeLabel(a.name || "(unnamed)");
+            const field = escapeLabel(a.dataField || "?");
+            lines.push(`  ${id}{{"Alignment: ${name}<br/><i>${field}</i>"}}`);
+        }
+        for (const a of alignments) {
+            if (!a.containerId) continue;
+            lines.push(`  ${safe(a.id)} -.->|alignment| ${safe(a.containerId)}`);
+        }
+
+        // LLM service nodes + attachment wires (shown only if any container references them)
+        const usedServices = new Set();
+        for (const c of containers) {
+            if (c.llmServiceId) usedServices.add(c.llmServiceId);
+        }
+        for (const svc of services) {
+            if (!usedServices.has(svc.id)) continue;
+            const id = safe(svc.id);
+            const name = escapeLabel(svc.name || "(unnamed)");
+            const provider = escapeLabel(svc.provider || "?");
+            lines.push(`  ${id}(["LLM: ${name}<br/><i>${provider}</i>"])`);
+        }
+        for (const c of containers) {
+            if (!c.llmServiceId) continue;
+            lines.push(`  ${safe(c.llmServiceId)} -.->|llm| ${safe(c.id)}`);
+        }
+
+        return lines.join("\n");
+    }
+}
+
 // Periodic Ritual: debug modal showing the last LLM call's full payload.
 // Triggered by the "Show last LLM call" command. Useful when YAML parsing
 // fails or the model returns weird output — you can see exactly what went
@@ -3893,6 +4036,14 @@ class MonthlyRitualPlugin extends Plugin {
             id: "pr-debug-last-llm",
             name: "Periodic Ritual: Show last LLM call",
             callback: () => new PRDebugModal(this.app, this.lastPRLLMCall).open(),
+        });
+
+        // Phase 9: hierarchy diagram — show how containers / reflections /
+        // alignments / LLM services connect, as a Mermaid flowchart.
+        this.addCommand({
+            id: "pr-hierarchy",
+            name: "Periodic Ritual: Show hierarchy diagram",
+            callback: () => new PRHierarchyModal(this.app, this).open(),
         });
     }
 
