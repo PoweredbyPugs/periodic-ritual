@@ -2785,7 +2785,11 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             .setDesc(services.length === 0 ? "Define a service in the LLM tab first" : "Select which service handles this container's aggregation")
             .addDropdown(dd => {
                 dd.addOption("", "— None —");
-                for (const svc of services) dd.addOption(svc.id, `${svc.name} (${svc.provider})`);
+                for (const svc of services) {
+                    const provName = PROVIDERS[svc.provider]?.name || svc.provider;
+                    const modelLabel = svc.model || "no model selected";
+                    dd.addOption(svc.id, `${provName} (${modelLabel})`);
+                }
                 dd.setValue(container.llmServiceId || "");
                 dd.onChange(async v => {
                     container.llmServiceId = v;
