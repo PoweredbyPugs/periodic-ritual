@@ -505,13 +505,18 @@ function makePRContainer(overrides = {}) {
         //                 its line; if not found, append a hidden %% block
         //                 at the end of the file.
         // "none"        — don't write metadata at all. Phase 3 auto-generation
-        //                 won't be able to identify previously-generated notes
-        //                 from this container, but the user gets clean output.
+        //                 will still work via lastGeneratedEnd tracking.
         metadataPlacement: "frontmatter",
         metadataInlineKey: "periodic-ritual",
         // Phase 2+ LLM aggregation
         systemPromptFile: "",   // path to a .md file in the vault
         llmServiceId: "",       // references an entry in prLLMServices
+        // Phase 3+ auto-generation tracking. End date (ISO YYYY-MM-DD) of the
+        // most recent period this container has generated a note for. Used by
+        // catchUpPRContainer to figure out where to resume on plugin load.
+        // First-run containers have an empty string and only generate the
+        // current period (no historical backfill).
+        lastGeneratedEnd: "",
     }, overrides);
 }
 
@@ -820,6 +825,19 @@ class MonthlyRitualPlugin extends Plugin {
 
         this.registerView(CALENDAR_VIEW_TYPE, (leaf) => new RitualCalendarView(leaf, this));
         this.addRibbonIcon("calendar-days", "Ritual Calendar", () => this.activateCalendarView());
+
+        // Phase 3: auto-generation on load. Boundary-driven catch-up for any
+        // enabled Periodic Ritual containers whose periods have crossed since
+        // the last run. Deferred ~2 seconds so other plugins (Moon Phase /
+        // Helios) finish initializing first — boundary detectors in later
+        // phases will depend on them.
+        if (this.settings.prAutoGenerateOnLoad) {
+            setTimeout(() => {
+                this.runPRAutoGenerate().catch(e => {
+                    console.error("Periodic Ritual: auto-generate failed", e);
+                });
+            }, 2000);
+        }
     }
 
     async activateCalendarView() {
@@ -1355,15 +1373,20 @@ class MonthlyRitualPlugin extends Plugin {
     }
 
     // Generate a single container note from its config.
-    // Reads template, resolves tokens, writes file. No daily aggregation, no LLM.
-    async generatePRContainerNote(container, dateOverride) {
+    // Reads template, resolves tokens, writes file, optionally runs LLM
+    // aggregation, updates lastGeneratedEnd. Used by both manual "Generate
+    // now" and the Phase 3 catch-up walker.
+    //
+    // opts: { silent?: boolean } — if silent, suppress per-note success
+    // notices (used during multi-period catch-up to avoid notice spam).
+    async generatePRContainerNote(container, dateOverride, opts = {}) {
         if (!container) { new Notice("No container provided"); return; }
         if (!container.template) {
-            new Notice(`${container.name}: no template configured`);
+            if (!opts.silent) new Notice(`${container.name}: no template configured`);
             return;
         }
         if (!container.naming) {
-            new Notice(`${container.name}: no naming convention configured`);
+            if (!opts.silent) new Notice(`${container.name}: no naming convention configured`);
             return;
         }
 
@@ -1373,11 +1396,14 @@ class MonthlyRitualPlugin extends Plugin {
             const folderPath = container.saveDir || "";
             const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
 
-            // Don't clobber an existing note. Phase 3 will track last-generated
-            // timestamps so auto-generation skips duplicates without surfacing them.
+            // If a note for this period already exists, treat it as already
+            // generated for the purpose of auto-catch-up: update
+            // lastGeneratedEnd so subsequent runs skip past it.
             const existing = this.app.vault.getAbstractFileByPath(filePath);
             if (existing) {
-                new Notice(`Already exists: ${filePath}`);
+                if (!opts.silent) new Notice(`Already exists: ${filePath}`);
+                container.lastGeneratedEnd = formatDate(data.end);
+                await this.saveSettings();
                 return existing;
             }
 
@@ -1415,12 +1441,20 @@ class MonthlyRitualPlugin extends Plugin {
 
             const file = await this.app.vault.create(filePath, content);
 
+            // Update lastGeneratedEnd before any further work — the file
+            // exists, that's the durable state. If the LLM call below fails,
+            // catch-up next run won't try to recreate this file.
+            container.lastGeneratedEnd = formatDate(data.end);
+            await this.saveSettings();
+
             // Open the new file. Two reasons:
             //  1. The user clicked "Generate" — they expect to see the result.
             //  2. Templater scripts in the template that read
             //     app.workspace.getActiveFile() (instead of tp.file) will
             //     otherwise see whatever file was active when Generate was
             //     clicked, and fail with "wrong filename" errors.
+            // During silent catch-up runs we still open the file briefly so
+            // templater scripts can run; the user can navigate away after.
             try {
                 const leaf = this.app.workspace.getLeaf(false);
                 await leaf.openFile(file);
@@ -1428,7 +1462,7 @@ class MonthlyRitualPlugin extends Plugin {
                 console.error("Periodic Ritual: failed to open generated file", e);
             }
 
-            new Notice(`Created: ${fileName}`);
+            if (!opts.silent) new Notice(`Created: ${fileName}`);
 
             // Phase 2: LLM aggregation. If the container has both a service
             // and a system prompt configured, run the aggregation pass and
@@ -1439,12 +1473,12 @@ class MonthlyRitualPlugin extends Plugin {
                 await this.runPRLLMAggregation(container, file, {
                     start: data.start,
                     end: data.end,
-                });
+                }, opts);
             }
 
             return file;
         } catch (e) {
-            new Notice(`Error generating ${container.name}: ${e.message}`);
+            if (!opts.silent) new Notice(`Error generating ${container.name}: ${e.message}`);
             console.error("Periodic Ritual:", e);
         }
     }
@@ -1536,14 +1570,14 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
-    async runPRLLMAggregation(container, file, range) {
+    async runPRLLMAggregation(container, file, range, opts = {}) {
         const service = this.getPRLLMService(container.llmServiceId);
         if (!service) {
-            new Notice(`${container.name}: LLM service not found`);
+            if (!opts.silent) new Notice(`${container.name}: LLM service not found`);
             return;
         }
-        if (!service.apiKey || !service.model) {
-            new Notice(`${container.name}: LLM service "${service.name}" is missing API key or model`);
+        if (!service.model) {
+            if (!opts.silent) new Notice(`${container.name}: LLM service "${service.name}" has no model selected`);
             return;
         }
 
@@ -1552,12 +1586,12 @@ class MonthlyRitualPlugin extends Plugin {
         try {
             const promptFile = this.app.vault.getAbstractFileByPath(container.systemPromptFile);
             if (!promptFile || !(promptFile instanceof TFile)) {
-                new Notice(`${container.name}: system prompt file not found: ${container.systemPromptFile}`);
+                if (!opts.silent) new Notice(`${container.name}: system prompt file not found: ${container.systemPromptFile}`);
                 return;
             }
             systemPrompt = await this.app.vault.read(promptFile);
         } catch (e) {
-            new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
+            if (!opts.silent) new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
             return;
         }
 
@@ -1585,7 +1619,7 @@ class MonthlyRitualPlugin extends Plugin {
 
         let responseText;
         try {
-            new Notice(`${container.name}: aggregating ${payload.count} daily note(s) via ${service.name}…`);
+            if (!opts.silent) new Notice(`${container.name}: aggregating ${payload.count} daily note(s) via ${service.name}…`);
             const url = provider.buildUrl(service);
             const body = provider.buildBody(userMessage, service, systemPrompt);
             const headers = {
@@ -1606,13 +1640,15 @@ class MonthlyRitualPlugin extends Plugin {
             }
             responseText = provider.extractText(r.json);
         } catch (e) {
+            // Always surface LLM errors, even during silent catch-up — the
+            // user needs to know if their key expired or rate limit hit.
             new Notice(`${container.name}: LLM call failed — ${e.message}`);
             console.error("Periodic Ritual LLM error:", e);
             return;
         }
 
         if (!responseText) {
-            new Notice(`${container.name}: LLM returned an empty response`);
+            if (!opts.silent) new Notice(`${container.name}: LLM returned an empty response`);
             return;
         }
 
@@ -1620,7 +1656,7 @@ class MonthlyRitualPlugin extends Plugin {
         const parsed = this.parsePRLLMResponse(responseText);
         const keys = Object.keys(parsed);
         if (keys.length === 0) {
-            new Notice(`${container.name}: LLM response had no fields to write`);
+            if (!opts.silent) new Notice(`${container.name}: LLM response had no fields to write`);
             return;
         }
 
@@ -1628,10 +1664,107 @@ class MonthlyRitualPlugin extends Plugin {
             await this.app.fileManager.processFrontMatter(file, fm => {
                 for (const k of keys) fm[k] = parsed[k];
             });
-            new Notice(`${container.name}: wrote ${keys.length} field(s) from LLM`);
+            if (!opts.silent) new Notice(`${container.name}: wrote ${keys.length} field(s) from LLM`);
         } catch (e) {
-            new Notice(`${container.name}: failed to write frontmatter — ${e.message}`);
+            if (!opts.silent) new Notice(`${container.name}: failed to write frontmatter — ${e.message}`);
             console.error("Periodic Ritual processFrontMatter error:", e);
+        }
+    }
+
+    // ─── Periodic Ritual auto-generation (Phase 3) ───
+
+    // Walk all enabled containers and catch each one up to the current period.
+    // Called from onload when prAutoGenerateOnLoad is true, or manually via
+    // the "Catch up missed notes" command.
+    async runPRAutoGenerate() {
+        const containers = (this.settings.prContainers || []).filter(c => c.enabled);
+        if (containers.length === 0) {
+            new Notice("Periodic Ritual: no enabled containers");
+            return;
+        }
+        for (const container of containers) {
+            try {
+                await this.catchUpPRContainer(container);
+            } catch (e) {
+                console.error(`Periodic Ritual: catch-up failed for ${container.name}`, e);
+                new Notice(`Catch-up failed for ${container.name}: ${e.message}`);
+            }
+        }
+    }
+
+    // For one container: figure out which periods have been crossed since
+    // lastGeneratedEnd and generate one note per missed period in chronological
+    // order. Empty periods still produce a note — the existence of the note
+    // is itself data.
+    //
+    // First-run case (lastGeneratedEnd unset): generate ONLY the current
+    // period. Don't backfill the user's entire history — that's a separate
+    // explicit operation, not catch-up.
+    async catchUpPRContainer(container) {
+        if (!container.template || !container.naming) {
+            // Not yet configured — skip silently. The settings UI shows
+            // the missing fields; no need to nag from auto-generate.
+            return;
+        }
+
+        const now = new Date();
+        const currentRange = this.getPRBoundaryData(container.boundaryDetector, now);
+        if (!currentRange) return;
+
+        // First-run case: no history, no backfill, just the current period.
+        if (!container.lastGeneratedEnd) {
+            await this.generatePRContainerNote(container, now);
+            return;
+        }
+
+        const lastEnd = new Date(container.lastGeneratedEnd);
+        if (isNaN(lastEnd.getTime())) {
+            // Corrupt timestamp — fall back to generating the current period.
+            console.warn(`Periodic Ritual: ${container.name} has invalid lastGeneratedEnd "${container.lastGeneratedEnd}", falling back to current period`);
+            await this.generatePRContainerNote(container, now);
+            return;
+        }
+
+        // If lastGeneratedEnd is already at or past the end of the current
+        // period, we're up to date. Nothing to do.
+        if (lastEnd >= currentRange.end) return;
+
+        // Walk forward one period at a time. Collect period start dates first,
+        // then iterate so we know how many notices to suppress and what to
+        // report at the end.
+        const periodDates = [];
+        let cursor = addDays(lastEnd, 1);
+        let safety = 0;
+        while (cursor <= now && safety < 100) {
+            safety++;
+            const range = this.getPRBoundaryData(container.boundaryDetector, cursor);
+            if (!range) break;
+            periodDates.push(new Date(cursor));
+            const nextCursor = addDays(range.end, 1);
+            // Defensive: if the detector returned a period that doesn't
+            // advance the cursor, bail rather than infinite-loop.
+            if (nextCursor <= cursor) {
+                console.warn(`Periodic Ritual: ${container.name} boundary detector returned non-advancing range`, range);
+                break;
+            }
+            cursor = nextCursor;
+        }
+
+        if (periodDates.length === 0) return;
+
+        const multi = periodDates.length > 1;
+        if (multi) {
+            new Notice(`${container.name}: catching up ${periodDates.length} missed period(s)…`);
+        }
+
+        let created = 0;
+        for (const periodDate of periodDates) {
+            const result = await this.generatePRContainerNote(container, periodDate, { silent: multi });
+            if (result) created++;
+        }
+
+        if (multi) {
+            new Notice(`${container.name}: generated ${created} note(s)`);
         }
     }
 
@@ -2070,6 +2203,14 @@ class MonthlyRitualPlugin extends Plugin {
             id: "pr-generate-container",
             name: "Periodic Ritual: Generate container note",
             callback: () => this.pickAndGeneratePRContainer(),
+        });
+
+        // Phase 3: manual catch-up trigger. Useful for testing and for
+        // running catch-up after toggling auto-generate on without restarting.
+        this.addCommand({
+            id: "pr-catch-up",
+            name: "Periodic Ritual: Catch up missed notes",
+            callback: () => this.runPRAutoGenerate(),
         });
     }
 
