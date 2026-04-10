@@ -731,19 +731,222 @@ module.exports = function(date) {
         name: "Lunar Cycle",
         description: "One synodic month — new moon to next new moon (~29.5 days). The astrological/lunisolar equivalent of a calendar month. Requires the Moon Phase plugin (Helios server).",
         tokens: ["year", "month", "month-name", "day", "date", "cycle", "phase", "phase-short", "sign", "sign-glyph"],
-        source: null, // forking helios detectors requires a custom helios client
+        source:
+`// Lunar Cycle boundary detector — fork of the built-in.
+//
+// Reaches into the Moon Phase plugin to find the helios server URL,
+// then fetches the current moon data and computes the synodic month
+// containing the given date.
+//
+// Requires the Moon Phase plugin to be installed and its Helios server
+// (default: http://baratie:3000) to be reachable.
+
+const SYNODIC_PERIOD = 29.53059;
+
+async function fetchMoonNow(app) {
+    const moon = app.plugins.plugins["obsidian-moon"];
+    if (!moon) throw new Error("Moon Phase plugin required");
+    const base = (moon.settings.serverUrl || "http://baratie:3000").replace(/\\/+$/, "");
+    const obsidian = require("obsidian");
+    const r = await obsidian.requestUrl({ url: base + "/moon-now", method: "GET", throw: false });
+    if (r.status < 200 || r.status >= 300) throw new Error("helios " + r.status);
+    return r.json;
+}
+
+function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+function addDays(d, n) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+}
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = async function(date, app, plugin) {
+    const d = date || new Date();
+    const moonData = await fetchMoonNow(app);
+    const moonAge = moonData.moonAge || 0;
+
+    const lastNew = startOfDay(addDays(d, -Math.floor(moonAge)));
+    const nextNew = startOfDay(addDays(lastNew, Math.round(SYNODIC_PERIOD)));
+
+    return {
+        start: lastNew,
+        end: nextNew,
+        tokens: {
+            year: String(lastNew.getFullYear()),
+            month: String(lastNew.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(lastNew),
+            day: String(lastNew.getDate()).padStart(2, "0"),
+            date: fmt(lastNew),
+            cycle: "01",
+            phase: "New Moon",
+            "phase-short": "new",
+            sign: moonData.moonSign || "",
+            "sign-glyph": "",
+        },
+    };
+};
+`,
     },
     "lunar-phase": {
         name: "Lunar Phase",
         description: "One quarter of a lunar cycle (~7 days). The four phases are New Moon, First Quarter, Full Moon, Last Quarter — corresponding to Atlas's detach / plan / execute / share rhythm. Requires the Moon Phase plugin.",
         tokens: ["year", "month", "month-name", "day", "date", "phase", "phase-short", "sign", "sign-glyph"],
-        source: null,
+        source:
+`// Lunar Phase boundary detector — fork of the built-in.
+//
+// Determines which quarter of the synodic cycle (~7 days each) contains
+// the given date. The four phases are New Moon, First Quarter, Full Moon,
+// Last Quarter — each ~7.4 days.
+//
+// Requires the Moon Phase plugin and its Helios server.
+
+const SYNODIC_PERIOD = 29.53059;
+const PHASES = ["New Moon", "First Quarter", "Full Moon", "Last Quarter"];
+const PHASE_SHORT = { "New Moon": "new", "First Quarter": "q1", "Full Moon": "full", "Last Quarter": "q3" };
+
+async function fetchMoonNow(app) {
+    const moon = app.plugins.plugins["obsidian-moon"];
+    if (!moon) throw new Error("Moon Phase plugin required");
+    const base = (moon.settings.serverUrl || "http://baratie:3000").replace(/\\/+$/, "");
+    const obsidian = require("obsidian");
+    const r = await obsidian.requestUrl({ url: base + "/moon-now", method: "GET", throw: false });
+    if (r.status < 200 || r.status >= 300) throw new Error("helios " + r.status);
+    return r.json;
+}
+
+function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+function addDays(d, n) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+}
+function phaseFromAge(age) {
+    const q = SYNODIC_PERIOD / 4;
+    if (age < q) return "New Moon";
+    if (age < 2 * q) return "First Quarter";
+    if (age < 3 * q) return "Full Moon";
+    return "Last Quarter";
+}
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = async function(date, app, plugin) {
+    const d = date || new Date();
+    const moonData = await fetchMoonNow(app);
+    const moonAge = moonData.moonAge || 0;
+    const phase = phaseFromAge(moonAge);
+    const phaseIdx = PHASES.indexOf(phase);
+    const q = SYNODIC_PERIOD / 4;
+
+    const lastNew = startOfDay(addDays(d, -Math.floor(moonAge)));
+    const phaseStart = startOfDay(addDays(lastNew, Math.round(phaseIdx * q)));
+    const phaseEnd = phaseIdx < 3
+        ? startOfDay(addDays(lastNew, Math.round((phaseIdx + 1) * q) - 1))
+        : startOfDay(addDays(lastNew, Math.round(SYNODIC_PERIOD) - 1));
+
+    return {
+        start: phaseStart,
+        end: phaseEnd,
+        tokens: {
+            year: String(phaseStart.getFullYear()),
+            month: String(phaseStart.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(phaseStart),
+            day: String(phaseStart.getDate()).padStart(2, "0"),
+            date: fmt(phaseStart),
+            phase: phase,
+            "phase-short": PHASE_SHORT[phase],
+            sign: moonData.moonSign || "",
+            "sign-glyph": "",
+        },
+    };
+};
+`,
     },
     "sun-ingress": {
-        name: "Sun Ingress",
+        name: "Solar Zodiac",
         description: "The period the Sun spends in one zodiac sign (~30 days). Begins at the exact moment of ingress and ends when the Sun moves into the next sign. The astrological alternative to a calendar month — themed by sign archetype rather than calendar bookkeeping. Requires the Moon Phase plugin.",
         tokens: ["year", "month", "month-name", "day", "date", "cycle", "term", "term-cn", "sign", "sign-glyph"],
-        source: null,
+        source:
+`// Solar Zodiac boundary detector — fork of the built-in.
+//
+// Fetches Sun ingresses from helios in a window around the given date,
+// finds the most recent ingress before the date and the next one after,
+// and returns the period as the current zodiac sign window.
+//
+// Requires the Moon Phase plugin and its Helios server.
+
+async function fetchSunIngresses(app, start, end) {
+    const moon = app.plugins.plugins["obsidian-moon"];
+    if (!moon) throw new Error("Moon Phase plugin required");
+    const base = (moon.settings.serverUrl || "http://baratie:3000").replace(/\\/+$/, "");
+    const obsidian = require("obsidian");
+    const url = base + "/planetary-ingresses?planet=Sun&start=" + fmt(start) + "&end=" + fmt(end);
+    const r = await obsidian.requestUrl({ url, method: "GET", throw: false });
+    if (r.status < 200 || r.status >= 300) throw new Error("helios " + r.status);
+    return r.json;
+}
+
+function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+function addDays(d, n) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+}
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = async function(date, app, plugin) {
+    const d = date || new Date();
+    const searchStart = addDays(d, -45);
+    const searchEnd = addDays(d, 45);
+    const ingressesRaw = await fetchSunIngresses(app, searchStart, searchEnd);
+
+    const sorted = (Array.isArray(ingressesRaw) ? ingressesRaw : ingressesRaw.ingresses || [])
+        .map(ing => Object.assign({}, ing, { dateObj: new Date(ing.date || ing.exactDate || ing.timestamp) }))
+        .sort((a, b) => a.dateObj - b.dateObj);
+
+    let prevIng = null, nextIng = null;
+    for (const ing of sorted) {
+        if (ing.dateObj <= d) prevIng = ing;
+        else if (!nextIng) nextIng = ing;
+    }
+
+    if (!prevIng) throw new Error("No prior Sun ingress found in window");
+    const sign = prevIng.sign || prevIng.toSign || "";
+    const start = startOfDay(prevIng.dateObj);
+    const end = nextIng ? startOfDay(addDays(nextIng.dateObj, -1)) : addDays(start, 29);
+
+    return {
+        start, end,
+        tokens: {
+            year: String(start.getFullYear()),
+            month: String(start.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(start),
+            day: String(start.getDate()).padStart(2, "0"),
+            date: fmt(start),
+            cycle: "01",
+            term: "",
+            "term-cn": "",
+            sign: sign,
+            "sign-glyph": "",
+        },
+    };
+};
+`,
     },
 };
 
@@ -888,7 +1091,7 @@ class PRModelPickerModal extends FuzzySuggestModal {
 
 // Periodic Ritual: modal that displays a built-in boundary's source code in
 // a scrollable code block. Triggered from the View source button on a
-// built-in boundary card in the Boundaries tab.
+// built-in boundary card in the Boundaries tab. Selectable + copy button.
 class PRBoundarySourceModal extends Modal {
     constructor(app, name, source) {
         super(app);
@@ -898,15 +1101,38 @@ class PRBoundarySourceModal extends Modal {
     onOpen() {
         const { contentEl } = this;
         contentEl.empty();
-        contentEl.createEl("h3", { text: `${this.detectorName} — source` });
+
+        // Header row: title + copy button on the right
+        const header = contentEl.createDiv();
+        header.style.cssText = "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;";
+        header.createEl("h3", { text: `${this.detectorName} — source` }).style.margin = "0";
+
+        const copyBtn = header.createEl("button", { text: "Copy" });
+        copyBtn.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(this.source);
+                copyBtn.setText("Copied ✓");
+                setTimeout(() => copyBtn.setText("Copy"), 1500);
+            } catch (e) {
+                // Fallback: select the pre's text and let the user Cmd+C
+                const range = document.createRange();
+                range.selectNodeContents(pre);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                copyBtn.setText("Selected — Cmd+C");
+                setTimeout(() => copyBtn.setText("Copy"), 2000);
+            }
+        });
 
         const note = contentEl.createEl("p");
-        note.style.cssText = "color: var(--text-muted); font-size: 0.9em;";
-        note.setText("This is the standalone JS module form of the built-in detector. To modify it, click \"Fork as custom\" on the detector card to drop a copy into your vault as a custom boundary.");
+        note.style.cssText = "color: var(--text-muted); font-size: 0.9em; margin-top: 0;";
+        note.setText("Standalone JS module form of the built-in detector. Click Copy to grab it, or use \"Fork as custom\" on the detector card to drop a copy into your vault as a custom boundary you can edit.");
 
         const pre = contentEl.createEl("pre");
-        pre.style.cssText = "background: var(--background-secondary); padding: 12px; border-radius: 6px; max-height: 60vh; overflow: auto; font-size: 0.85em;";
+        pre.style.cssText = "background: var(--background-secondary); padding: 12px; border-radius: 6px; max-height: 60vh; overflow: auto; font-size: 0.85em; user-select: text; -webkit-user-select: text; cursor: text;";
         const code = pre.createEl("code");
+        code.style.cssText = "user-select: text; -webkit-user-select: text;";
         code.setText(this.source);
     }
     onClose() { this.contentEl.empty(); }
@@ -1883,7 +2109,7 @@ class MonthlyRitualPlugin extends Plugin {
             list.push(
                 { id: "lunar-cycle",  label: "Lunar Cycle (new moon → new moon)" },
                 { id: "lunar-phase",  label: "Lunar Phase (one quarter of a moon cycle)" },
-                { id: "sun-ingress",  label: "Sun Ingress (one zodiac sign)" },
+                { id: "sun-ingress",  label: "Solar Zodiac (one sign of the Sun)" },
             );
         }
         // Custom boundaries defined in the Boundaries tab
@@ -3762,6 +3988,11 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const builtInHeader = containerEl.createEl("h3", { text: "Built-in" });
         builtInHeader.style.cssText = "margin-top: 24px;";
 
+        // Calendar detectors fork to pure-math standalone modules; helios
+        // detectors fork to modules that talk to the Moon Phase plugin's
+        // Helios server via requestUrl. Both are runnable as custom JS.
+        const FORKABLE = new Set(["calendar-week", "calendar-month", "calendar-quarter", "calendar-year", "lunar-cycle", "lunar-phase", "sun-ingress"]);
+
         const builtInIds = [
             "calendar-week", "calendar-month", "calendar-quarter", "calendar-year",
             "lunar-cycle", "lunar-phase", "sun-ingress",
@@ -3769,8 +4000,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         for (const id of builtInIds) {
             const info = BUILT_IN_BOUNDARY_INFO[id];
             if (!info) continue;
-            const heliosOnly = !info.source;
-            this.renderPRBuiltInBoundaryCard(containerEl, id, info, heliosOnly);
+            this.renderPRBuiltInBoundaryCard(containerEl, id, info, FORKABLE.has(id));
         }
 
         // ── Custom section ──
@@ -3802,7 +4032,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 }));
     }
 
-    renderPRBuiltInBoundaryCard(parent, id, info, heliosOnly) {
+    renderPRBuiltInBoundaryCard(parent, id, info, forkable) {
         const card = parent.createDiv({ cls: "mr-pr-card" });
 
         const header = card.createDiv({ cls: "mr-pr-card-header" });
@@ -3834,7 +4064,9 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             viewBtn.addEventListener("click", () => {
                 new PRBoundarySourceModal(this.app, info.name, info.source).open();
             });
+        }
 
+        if (forkable && info.source) {
             const forkBtn = actions.createEl("button", { text: "Fork as custom" });
             forkBtn.addEventListener("click", async () => {
                 // Drop the source into a folder the user picks, then create
@@ -3871,9 +4103,6 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     }
                 }).open();
             });
-        } else {
-            const note = actions.createEl("span", { text: heliosOnly ? "Forking helios-backed detectors requires writing a custom helios client. Use a custom boundary with your own JS module." : "" });
-            note.style.cssText = "color: var(--text-faint); font-size: 0.85em; font-style: italic;";
         }
     }
 
