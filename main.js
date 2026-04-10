@@ -3088,12 +3088,11 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         }
 
         // ── LLM aggregation (Phase 2) ──
-        const llmHeader = card.createEl("h5", { text: "LLM aggregation (optional)" });
-        llmHeader.style.cssText = "margin-top: 16px; margin-bottom: 4px; color: var(--text-muted); font-weight: 500;";
-
-        const llmIntro = card.createEl("p");
-        llmIntro.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 0 0 8px 0;";
-        llmIntro.setText("When a service and a system prompt are both set, the plugin will collect daily notes in this container's range, send them to the LLM with the prompt, and merge the YAML response into this note's frontmatter.");
+        // No section heading on purpose — the System prompt and LLM service
+        // rows just continue the same Setting list as Template / Save dir /
+        // Naming so the visual rhythm stays uniform. When both are set the
+        // plugin collects daily notes in range, sends them to the LLM with
+        // the prompt, and merges the YAML response into the note's frontmatter.
 
         // System prompt MD picker (with starter-prompt creation)
         new Setting(card)
