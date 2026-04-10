@@ -3088,11 +3088,37 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         }
 
         // ── LLM aggregation (Phase 2) ──
-        // No section heading on purpose — the System prompt and LLM service
+        // No section heading on purpose — the LLM service and System prompt
         // rows just continue the same Setting list as Template / Save dir /
         // Naming so the visual rhythm stays uniform. When both are set the
         // plugin collects daily notes in range, sends them to the LLM with
         // the prompt, and merges the YAML response into the note's frontmatter.
+
+        // LLM service picker
+        const services = s.prLLMServices || [];
+        new Setting(card)
+            .setName("LLM service")
+            .setDesc(services.length === 0 ? "Define a service in the LLM tab first" : "Select which service handles this container's aggregation")
+            .addDropdown(dd => {
+                dd.addOption("", "— None —");
+                for (const svc of services) {
+                    // Strip parenthetical suffixes like "(local agent)" / "(local)"
+                    // from the provider's display name to keep the dropdown short.
+                    const rawName = PROVIDERS[svc.provider]?.name || svc.provider;
+                    const provName = rawName.replace(/\s*\([^)]*\)\s*$/, "");
+                    // Strip a leading "<provider>/" prefix from the model id so
+                    // OpenClaw shows "OpenClaw (mei)" instead of the redundant
+                    // "OpenClaw (local agent) (openclaw/mei)".
+                    const rawModel = svc.model || "no model selected";
+                    const modelLabel = rawModel.replace(new RegExp(`^${svc.provider}/`, "i"), "");
+                    dd.addOption(svc.id, `${provName} (${modelLabel})`);
+                }
+                dd.setValue(container.llmServiceId || "");
+                dd.onChange(async v => {
+                    container.llmServiceId = v;
+                    await this.plugin.saveSettings();
+                });
+            });
 
         // System prompt MD picker (with starter-prompt creation)
         new Setting(card)
@@ -3150,32 +3176,6 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     container.systemPromptFile = "";
                     await this.plugin.saveSettings();
                     this.display();
-                });
-            });
-
-        // LLM service picker
-        const services = s.prLLMServices || [];
-        new Setting(card)
-            .setName("LLM service")
-            .setDesc(services.length === 0 ? "Define a service in the LLM tab first" : "Select which service handles this container's aggregation")
-            .addDropdown(dd => {
-                dd.addOption("", "— None —");
-                for (const svc of services) {
-                    // Strip parenthetical suffixes like "(local agent)" / "(local)"
-                    // from the provider's display name to keep the dropdown short.
-                    const rawName = PROVIDERS[svc.provider]?.name || svc.provider;
-                    const provName = rawName.replace(/\s*\([^)]*\)\s*$/, "");
-                    // Strip a leading "<provider>/" prefix from the model id so
-                    // OpenClaw shows "OpenClaw (mei)" instead of the redundant
-                    // "OpenClaw (local agent) (openclaw/mei)".
-                    const rawModel = svc.model || "no model selected";
-                    const modelLabel = rawModel.replace(new RegExp(`^${svc.provider}/`, "i"), "");
-                    dd.addOption(svc.id, `${provName} (${modelLabel})`);
-                }
-                dd.setValue(container.llmServiceId || "");
-                dd.onChange(async v => {
-                    container.llmServiceId = v;
-                    await this.plugin.saveSettings();
                 });
             });
 
