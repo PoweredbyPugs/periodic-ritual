@@ -626,6 +626,42 @@
     color: white;
 }
 
+/* Filter popover (Phase 10c-3) */
+.pr-graph-filter-active {
+    background: var(--interactive-accent) !important;
+    color: var(--text-on-accent) !important;
+}
+
+.pr-graph-filter-popover {
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+.pr-graph-filter-section {
+    margin-bottom: 12px;
+}
+
+.pr-graph-filter-section-label {
+    color: var(--text-faint);
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+}
+
+.pr-graph-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    cursor: pointer;
+    color: var(--text-normal);
+    font-size: 0.88em;
+}
+
+.pr-graph-filter-row:hover {
+    color: var(--interactive-accent);
+}
+
 .pr-graph-node-title {
     font-weight: 600;
     font-size: 0.95em;

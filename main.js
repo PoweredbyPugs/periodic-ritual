@@ -4399,6 +4399,12 @@ class PRGraphView extends ItemView {
         this.panY = 0;
         this.nodes = [];      // built from settings on render
         this.wires = [];      // built from settings on render
+        // Phase 10c-3 view filters — in-memory only, reset on view close.
+        this.filters = {
+            hiddenKinds: new Set(),       // kinds to hide ("container", "reflection", ...)
+            focusContainerId: "",         // when set, show only this container's dependency graph
+            enabledOnly: false,           // when true, hide containers with enabled=false
+        };
     }
 
     getViewType() { return PR_GRAPH_VIEW_TYPE; }
@@ -4603,7 +4609,88 @@ class PRGraphView extends ItemView {
             });
         }
 
-        return { nodes, wires };
+        return this.applyFilters(nodes, wires);
+    }
+
+    // Apply view filters to a built graph. Removes nodes by kind, removes
+    // disabled containers when enabledOnly is on, and reduces to a single
+    // container's dependency graph (both upstream and downstream) when
+    // focusContainerId is set. Wires connecting to filtered-out nodes are
+    // also dropped.
+    applyFilters(nodes, wires) {
+        const f = this.filters;
+        let keptNodes = nodes;
+        let keptWires = wires;
+
+        // 1. Hidden kinds
+        if (f.hiddenKinds.size > 0) {
+            keptNodes = keptNodes.filter(n => !f.hiddenKinds.has(n.kind));
+        }
+
+        // 2. Enabled-only filter for containers
+        if (f.enabledOnly) {
+            keptNodes = keptNodes.filter(n => {
+                if (n.kind !== "container") return true;
+                return !!n.primitive?.enabled;
+            });
+        }
+
+        // 3. Container focus — keep only nodes connected to the focused
+        //    container (upstream sources + downstream consumers, recursively)
+        //    plus any reflections / alignments / llm services / boundaries
+        //    attached to any of those containers.
+        if (f.focusContainerId) {
+            const focusNodeId = `container-${f.focusContainerId}`;
+            const containerOnlyWires = wires.filter(w => w.kind === "data-source");
+
+            // Walk upstream
+            const upstream = new Set([focusNodeId]);
+            const stackUp = [focusNodeId];
+            while (stackUp.length) {
+                const cur = stackUp.pop();
+                for (const w of containerOnlyWires) {
+                    if (w.to === cur && !upstream.has(w.from)) {
+                        upstream.add(w.from);
+                        stackUp.push(w.from);
+                    }
+                }
+            }
+
+            // Walk downstream
+            const downstream = new Set([focusNodeId]);
+            const stackDown = [focusNodeId];
+            while (stackDown.length) {
+                const cur = stackDown.pop();
+                for (const w of containerOnlyWires) {
+                    if (w.from === cur && !downstream.has(w.to)) {
+                        downstream.add(w.to);
+                        stackDown.push(w.to);
+                    }
+                }
+            }
+
+            const visibleContainerIds = new Set([...upstream, ...downstream]);
+            // Always keep daily if any visible container reads from daily
+            for (const w of wires) {
+                if (w.kind === "data-source" && w.from === "daily" && visibleContainerIds.has(w.to)) {
+                    visibleContainerIds.add("daily");
+                }
+            }
+            // Keep attached reflections, alignments, llm services, and
+            // boundaries connected to any visible container
+            for (const w of wires) {
+                if (visibleContainerIds.has(w.to) && w.kind !== "data-source") {
+                    visibleContainerIds.add(w.from);
+                }
+            }
+            keptNodes = keptNodes.filter(n => visibleContainerIds.has(n.id));
+        }
+
+        // Drop wires whose endpoints aren't in the kept set
+        const keptIds = new Set(keptNodes.map(n => n.id));
+        keptWires = keptWires.filter(w => keptIds.has(w.from) && keptIds.has(w.to));
+
+        return { nodes: keptNodes, wires: keptWires };
     }
 
     // ─── Auto-layout ───
@@ -4670,8 +4757,19 @@ class PRGraphView extends ItemView {
             await this.plugin.saveSettings();
             this.render();
         });
+
+        // Filter button — count active filters in the label so the user
+        // sees at a glance whether anything is filtered
+        const filterCount = this.filters.hiddenKinds.size + (this.filters.focusContainerId ? 1 : 0) + (this.filters.enabledOnly ? 1 : 0);
+        const filterBtn = toolbar.createEl("button", { text: filterCount > 0 ? `🔍 Filter (${filterCount})` : "🔍 Filter" });
+        if (filterCount > 0) filterBtn.classList.add("pr-graph-filter-active");
+        filterBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.openFilterPopover(e.clientX, e.clientY);
+        });
+
         const help = toolbar.createEl("span", { cls: "pr-graph-help" });
-        help.setText("Drag empty space to pan • Scroll to zoom • Drag nodes to move • Click a node to edit");
+        help.setText("Drag to pan • Scroll to zoom • Click node to edit • Double-click empty for menu");
 
         // Canvas (the scrollable / zoomable area)
         const canvas = container.createEl("div", { cls: "pr-graph-canvas" });
@@ -5311,6 +5409,92 @@ class PRGraphView extends ItemView {
     applyTransform() {
         if (!this.viewportEl) return;
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+
+    // ─── Filter popover (Phase 10c-3) ───
+    openFilterPopover(clientX, clientY) {
+        // Close any existing menu
+        const existing = document.querySelector(".pr-graph-ctx-menu");
+        if (existing) existing.remove();
+
+        const menu = document.createElement("div");
+        menu.className = "pr-graph-ctx-menu pr-graph-filter-popover";
+        menu.style.cssText = `position: fixed; left: ${clientX}px; top: ${clientY + 10}px; z-index: 1000; min-width: 240px; padding: 12px;`;
+
+        // Title
+        const title = menu.createEl("div", { text: "Filters", cls: "pr-graph-filter-title" });
+        title.style.cssText = "color: var(--text-muted); font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;";
+
+        // Kind checkboxes
+        const KINDS = [
+            { id: "container",  label: "Containers" },
+            { id: "boundary",   label: "Boundaries" },
+            { id: "llm",        label: "LLM Services" },
+            { id: "reflection", label: "Reflections" },
+            { id: "alignment",  label: "Alignments" },
+            { id: "daily",      label: "Daily source" },
+        ];
+        const kindWrap = menu.createEl("div", { cls: "pr-graph-filter-section" });
+        kindWrap.createEl("div", { text: "Show kinds", cls: "pr-graph-filter-section-label" });
+        for (const k of KINDS) {
+            const row = kindWrap.createEl("label", { cls: "pr-graph-filter-row" });
+            const input = row.createEl("input", { type: "checkbox" });
+            input.checked = !this.filters.hiddenKinds.has(k.id);
+            row.createEl("span", { text: k.label });
+            input.addEventListener("change", () => {
+                if (input.checked) this.filters.hiddenKinds.delete(k.id);
+                else this.filters.hiddenKinds.add(k.id);
+                this.render();
+                // Close + reopen popover so the count badge refreshes
+                menu.remove();
+            });
+        }
+
+        // Container focus dropdown
+        const focusWrap = menu.createEl("div", { cls: "pr-graph-filter-section" });
+        focusWrap.createEl("div", { text: "Focus on container", cls: "pr-graph-filter-section-label" });
+        const focusSelect = focusWrap.createEl("select", { cls: "pr-graph-form-select" });
+        focusSelect.createEl("option", { value: "", text: "All containers" });
+        for (const c of (this.plugin.settings.prContainers || [])) {
+            const opt = focusSelect.createEl("option", { value: c.id, text: c.name || "(unnamed)" });
+            if (c.id === this.filters.focusContainerId) opt.selected = true;
+        }
+        focusSelect.addEventListener("change", () => {
+            this.filters.focusContainerId = focusSelect.value;
+            this.render();
+            menu.remove();
+        });
+
+        // Enabled only toggle
+        const enabledWrap = menu.createEl("div", { cls: "pr-graph-filter-section" });
+        const enabledRow = enabledWrap.createEl("label", { cls: "pr-graph-filter-row" });
+        const enabledInput = enabledRow.createEl("input", { type: "checkbox" });
+        enabledInput.checked = !!this.filters.enabledOnly;
+        enabledRow.createEl("span", { text: "Enabled containers only" });
+        enabledInput.addEventListener("change", () => {
+            this.filters.enabledOnly = enabledInput.checked;
+            this.render();
+            menu.remove();
+        });
+
+        // Reset button
+        const sep = menu.createEl("div", { cls: "pr-graph-ctx-sep" });
+        const resetBtn = menu.createEl("button", { text: "Reset all filters", cls: "pr-graph-ctx-item" });
+        resetBtn.addEventListener("click", () => {
+            this.filters = { hiddenKinds: new Set(), focusContainerId: "", enabledOnly: false };
+            this.render();
+            menu.remove();
+        });
+
+        document.body.appendChild(menu);
+
+        // Dismiss on outside click
+        const dismiss = (e) => {
+            if (menu.contains(e.target)) return;
+            menu.remove();
+            document.removeEventListener("mousedown", dismiss, true);
+        };
+        setTimeout(() => document.addEventListener("mousedown", dismiss, true), 0);
     }
 
     // ─── Double-click (Phase 10c-1) ───
