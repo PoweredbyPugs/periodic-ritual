@@ -4707,22 +4707,60 @@ class PRGraphView extends ItemView {
         this.setupWireClick();
         // Right-click context menus (Phase 10b-2)
         this.setupContextMenus();
+        // Double-click: empty canvas → add menu, node → toggle expand (Phase 10c-1)
+        this.setupDoubleClick();
+    }
+
+    // Per-node expanded state lives in prGraphLayout[id].expanded so it
+    // persists across reloads next to the node's saved position.
+    isNodeExpanded(node) {
+        const layout = this.plugin.settings.prGraphLayout || {};
+        return !!(layout[node.id] && layout[node.id].expanded);
+    }
+
+    async setNodeExpanded(node, expanded) {
+        if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
+        const cur = this.plugin.settings.prGraphLayout[node.id] || {};
+        cur.expanded = !!expanded;
+        if (typeof cur.x !== "number") cur.x = node.x;
+        if (typeof cur.y !== "number") cur.y = node.y;
+        this.plugin.settings.prGraphLayout[node.id] = cur;
+        await this.plugin.saveSettings();
+    }
+
+    nodeIsPrimitive(node) {
+        return node.primitive && (
+            node.kind === "container" || node.kind === "reflection" ||
+            node.kind === "alignment" || node.kind === "llm" ||
+            (node.kind === "boundary" && node.id.startsWith("boundary-custom-"))
+        );
     }
 
     renderNode(parent, node) {
-        const el = parent.createEl("div", { cls: `pr-graph-node pr-graph-node-${node.kind}` });
+        const expanded = this.isNodeExpanded(node);
+        const el = parent.createEl("div", { cls: `pr-graph-node pr-graph-node-${node.kind}${expanded ? " pr-graph-node-expanded" : ""}` });
         el.style.left = `${node.x}px`;
         el.style.top = `${node.y}px`;
         el.dataset.nodeId = node.id;
         node.el = el;
 
-        // Header — title is editable for primitive nodes (Phase 10b-3).
-        // Daily / built-in boundary nodes get a static span instead.
+        // Header — title is editable for primitive nodes; chevron toggles
+        // the expanded body. Daily / built-in boundary nodes get a static
+        // span and no chevron (no body to expand).
         const header = el.createEl("div", { cls: "pr-graph-node-header" });
-        if (node.primitive && (node.kind === "container" || node.kind === "reflection" || node.kind === "alignment" || node.kind === "llm" || (node.kind === "boundary" && node.id.startsWith("boundary-custom-")))) {
+        const isPrimitive = this.nodeIsPrimitive(node);
+
+        if (isPrimitive) {
+            const chev = header.createEl("span", { cls: "pr-graph-node-chev", text: expanded ? "▼" : "▶" });
+            chev.addEventListener("mousedown", (e) => { e.stopPropagation(); e.preventDefault(); });
+            chev.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                await this.setNodeExpanded(node, !expanded);
+                this.render();
+            });
+
             const titleInput = header.createEl("input", { type: "text", value: node.primitive.name || "" });
             titleInput.className = "pr-graph-node-title pr-graph-node-title-editable";
-            // Don't trigger node drag when interacting with the input
             titleInput.addEventListener("mousedown", (e) => e.stopPropagation());
             titleInput.addEventListener("change", async () => {
                 node.primitive.name = titleInput.value;
@@ -4733,10 +4771,16 @@ class PRGraphView extends ItemView {
             header.createEl("span", { cls: "pr-graph-node-title", text: node.title });
         }
 
-        // Body — subtitle + per-kind inline widgets (Phase 10b-3)
+        // Body — subtitle + widgets. Expanded nodes get the full editor
+        // (Phase 10c-2 fills in renderNodeExpandedBody).
         const body = el.createEl("div", { cls: "pr-graph-node-body" });
         body.createEl("div", { cls: "pr-graph-node-subtitle", text: node.subtitle });
-        this.renderNodeWidgets(body, node);
+        if (expanded) {
+            const expandedBody = body.createEl("div", { cls: "pr-graph-node-expanded-body" });
+            this.renderNodeExpandedBody(expandedBody, node);
+        } else {
+            this.renderNodeWidgets(body, node);
+        }
 
         // Sockets — input on left, output on right.
         // Containers have multiple inputs stacked vertically; everything else
@@ -4823,6 +4867,15 @@ class PRGraphView extends ItemView {
         // inline widgets and live in the settings tabs via click-to-edit.
     }
 
+    // Phase 10c-2 fills this in with the full edit form per node kind.
+    // Phase 10c-1 ships a placeholder so the expanded affordance is visible.
+    renderNodeExpandedBody(body, node) {
+        // Inline widgets first (the same ones the collapsed state shows)
+        this.renderNodeWidgets(body, node);
+        const placeholder = body.createEl("div", { cls: "pr-graph-expanded-placeholder" });
+        placeholder.setText("Full inline editor coming in Phase 10c-2. For now: right-click → Edit in settings.");
+    }
+
     // Compute the screen position of a socket within the viewport's
     // coordinate system (NOT the document — viewport coords).
     socketPos(nodeId, socketId) {
@@ -4869,6 +4922,32 @@ class PRGraphView extends ItemView {
     applyTransform() {
         if (!this.viewportEl) return;
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+
+    // ─── Double-click (Phase 10c-1) ───
+    //
+    // - On empty canvas: open the same Add menu as right-click, positioned
+    //   at the click point.
+    // - On a node: toggle the node's expanded state.
+    setupDoubleClick() {
+        if (!this.canvasEl) return;
+        const canvas = this.canvasEl;
+        const onDblClick = async (e) => {
+            // Sockets reserved for wire drag
+            if (e.target.closest(".pr-graph-socket")) return;
+            const nodeEl = e.target.closest(".pr-graph-node");
+            if (nodeEl) {
+                const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+                if (!node || !this.nodeIsPrimitive(node)) return;
+                await this.setNodeExpanded(node, !this.isNodeExpanded(node));
+                this.render();
+                return;
+            }
+            // Empty canvas → open the add menu at this position
+            this.openCanvasContextMenu(e);
+        };
+        canvas.addEventListener("dblclick", onDblClick);
+        this._dblClickCleanup = () => canvas.removeEventListener("dblclick", onDblClick);
     }
 
     // ─── Right-click context menus (Phase 10b-2) ───
@@ -5510,6 +5589,7 @@ class PRGraphView extends ItemView {
         if (this._wireDragCleanup) this._wireDragCleanup();
         if (this._wireClickCleanup) this._wireClickCleanup();
         if (this._ctxMenuCleanup) this._ctxMenuCleanup();
+        if (this._dblClickCleanup) this._dblClickCleanup();
         // Close any leftover floating menu
         const menu = document.querySelector(".pr-graph-ctx-menu");
         if (menu) menu.remove();

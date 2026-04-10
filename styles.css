@@ -433,8 +433,13 @@
     border-radius: 8px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
     cursor: pointer;
-    transition: box-shadow 0.15s, border-color 0.15s;
+    transition: box-shadow 0.15s, border-color 0.15s, width 0.15s;
     z-index: 1;
+}
+
+.pr-graph-node-expanded {
+    width: 320px;
+    z-index: 3;
 }
 
 .pr-graph-node:hover {
@@ -444,11 +449,44 @@
 }
 
 .pr-graph-node-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     padding: 8px 12px;
     border-bottom: 1px solid var(--background-modifier-border);
     border-top-left-radius: 7px;
     border-top-right-radius: 7px;
     background: var(--background-secondary-alt);
+}
+
+.pr-graph-node-chev {
+    color: var(--text-muted);
+    font-size: 0.7em;
+    cursor: pointer;
+    user-select: none;
+    padding: 2px 4px;
+    line-height: 1;
+}
+
+.pr-graph-node-chev:hover {
+    color: var(--text-normal);
+}
+
+.pr-graph-node-expanded-body {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--background-modifier-border);
+    max-height: 480px;
+    overflow-y: auto;
+}
+
+.pr-graph-expanded-placeholder {
+    color: var(--text-faint);
+    font-size: 0.78em;
+    font-style: italic;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--background-modifier-border);
 }
 
 .pr-graph-node-title {
