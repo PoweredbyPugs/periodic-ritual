@@ -4794,6 +4794,41 @@ class PRGraphView extends ItemView {
         this.viewportEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
     }
 
+    // ─── Click to edit (Phase 10a-3) ───
+    //
+    // Clicking a node opens Obsidian's settings modal scrolled to the
+    // Periodic Ritual plugin tab and switches the outer tab to the one
+    // that owns that primitive's edit card. The user is dropped exactly
+    // where they need to be to edit the thing they clicked.
+    onNodeClick(node) {
+        if (!node || !node.primitiveTab) {
+            // Daily / built-in boundary nodes have no primitive to edit
+            return;
+        }
+        const tab = node.primitiveTab;
+        const setting = this.app.setting;
+        if (!setting) {
+            new Notice("Could not open settings — Obsidian setting API missing");
+            return;
+        }
+        try {
+            setting.open();
+            setting.openTabById("monthly-ritual");
+        } catch (e) {
+            console.error("Periodic Ritual: failed to open settings", e);
+            return;
+        }
+        // Find the active settings tab instance and switch its outer tab.
+        // Obsidian doesn't expose this directly, but we can find our tab
+        // through the plugin's setting tab list.
+        const settingTabs = setting.settingTabs || [];
+        const ourTab = settingTabs.find(t => t.id === "monthly-ritual" || t.plugin === this.plugin);
+        if (ourTab && typeof ourTab.display === "function") {
+            ourTab.outerTab = tab;
+            ourTab.display();
+        }
+    }
+
     // ─── Pan, zoom, drag (Phase 10a-2) ───
 
     setupPanZoom() {
