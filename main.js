@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, parseYaml } = require("obsidian");
 
 // ═══════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -212,7 +212,20 @@ function makePRContainer(overrides = {}) {
         //                 from this container, but the user gets clean output.
         metadataPlacement: "frontmatter",
         metadataInlineKey: "periodic-ritual",
-        // Phase 2+ adds: systemPromptFile, llmService, reflectionMode, questions
+        // Phase 2+ LLM aggregation
+        systemPromptFile: "",   // path to a .md file in the vault
+        llmServiceId: "",       // references an entry in prLLMServices
+    }, overrides);
+}
+
+// ─── Periodic Ritual: LLM service factory (Phase 2+) ───
+function makePRLLMService(overrides = {}) {
+    return Object.assign({
+        id: "lsv-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New service",
+        provider: "gemini",  // gemini | openai | anthropic
+        apiKey: "",
+        model: "",
     }, overrides);
 }
 
@@ -339,6 +352,19 @@ class PRContainerPickerModal extends FuzzySuggestModal {
         return `${c.name || "(unnamed)"} — ${c.boundaryDetector}${status}`;
     }
     onChooseItem(c) { this.onChooseCallback(c); }
+}
+
+// Periodic Ritual: fuzzy picker for selecting an LLM model from a fetched list.
+class PRModelPickerModal extends FuzzySuggestModal {
+    constructor(app, models, onChoose) {
+        super(app);
+        this.models = models;
+        this.onChooseCallback = onChoose;
+        this.setPlaceholder("Pick a model…");
+    }
+    getItems() { return this.models; }
+    getItemText(m) { return m; }
+    onChooseItem(m) { this.onChooseCallback(m); }
 }
 
 class MarkdownFileSuggestModal extends FuzzySuggestModal {
@@ -1093,10 +1119,203 @@ class MonthlyRitualPlugin extends Plugin {
             }
 
             new Notice(`Created: ${fileName}`);
+
+            // Phase 2: LLM aggregation. If the container has both a service
+            // and a system prompt configured, run the aggregation pass and
+            // merge the parsed YAML response into the file's frontmatter.
+            // Skipped silently when not configured — Phase 1 behavior is
+            // preserved for containers without LLM setup.
+            if (container.llmServiceId && container.systemPromptFile) {
+                await this.runPRLLMAggregation(container, file, {
+                    start: data.start,
+                    end: data.end,
+                });
+            }
+
             return file;
         } catch (e) {
             new Notice(`Error generating ${container.name}: ${e.message}`);
             console.error("Periodic Ritual:", e);
+        }
+    }
+
+    // ─── Periodic Ritual LLM aggregation (Phase 2) ───
+
+    getPRLLMService(id) {
+        return (this.settings.prLLMServices || []).find(s => s.id === id);
+    }
+
+    // Build a single string payload from all daily notes in [start, end].
+    // Each daily becomes a section with its frontmatter and inline fields.
+    // Body content is intentionally excluded — the user's templates have
+    // huge dataview blocks that aren't useful to the LLM and would burn
+    // tokens. If the user wants the LLM to see body content, we add a
+    // setting later. Phase 2 ships with frontmatter + inline fields only.
+    async buildPRDailyPayload(start, end) {
+        // Inclusive end-of-day for the range
+        const endInclusive = new Date(end);
+        endInclusive.setHours(23, 59, 59, 999);
+
+        const dailies = this.findDailyNotesInRange(start, endInclusive);
+        if (dailies.length === 0) {
+            return { count: 0, text: "(no daily notes in range)" };
+        }
+
+        const sections = [];
+        for (const file of dailies) {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const fm = cache?.frontmatter || {};
+            const content = await this.app.vault.read(file);
+
+            // Strip the YAML block before scanning for inline fields
+            const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+
+            // Pull `key:: value` inline fields from the body
+            const inlineFields = {};
+            const inlineRegex = /^([a-zA-Z0-9_-]+)::\s*(.+)$/gm;
+            let m;
+            while ((m = inlineRegex.exec(body)) !== null) {
+                const k = m[1];
+                const v = m[2].trim();
+                if (!v) continue;
+                inlineFields[k] = inlineFields[k] ? `${inlineFields[k]} | ${v}` : v;
+            }
+
+            const lines = [`## ${file.basename}`];
+            for (const [k, v] of Object.entries(fm)) {
+                // Skip plugin-internal and Obsidian-internal frontmatter keys
+                if (k === "periodic-ritual" || k === "position") continue;
+                if (v === null || v === undefined) continue;
+                if (typeof v === "object") continue;
+                lines.push(`${k}: ${v}`);
+            }
+            for (const [k, v] of Object.entries(inlineFields)) {
+                lines.push(`${k}:: ${v}`);
+            }
+            sections.push(lines.join("\n"));
+        }
+
+        return { count: dailies.length, text: sections.join("\n\n---\n\n") };
+    }
+
+    // Try to extract a YAML object from an LLM response. Strips fenced code
+    // blocks if present. Falls back to writing the whole response into a
+    // single `pr-llm-raw` field so the user always sees what came back.
+    parsePRLLMResponse(response) {
+        if (!response) return { "pr-llm-raw": "(empty response)" };
+
+        // Strip a fenced ```yaml ... ``` block if present
+        const fenceMatch = response.match(/```(?:ya?ml)?\s*\n?([\s\S]*?)```/);
+        const yamlText = fenceMatch ? fenceMatch[1].trim() : response.trim();
+
+        // Strip leading `---` and trailing `---` if the model wrapped its
+        // output in YAML document markers
+        const stripped = yamlText
+            .replace(/^---\s*\n/, "")
+            .replace(/\n---\s*$/, "");
+
+        try {
+            const parsed = parseYaml(stripped);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                return parsed;
+            }
+            return { "pr-llm-raw": response };
+        } catch (e) {
+            console.warn("Periodic Ritual: YAML parse failed", e);
+            return { "pr-llm-raw": response };
+        }
+    }
+
+    async runPRLLMAggregation(container, file, range) {
+        const service = this.getPRLLMService(container.llmServiceId);
+        if (!service) {
+            new Notice(`${container.name}: LLM service not found`);
+            return;
+        }
+        if (!service.apiKey || !service.model) {
+            new Notice(`${container.name}: LLM service "${service.name}" is missing API key or model`);
+            return;
+        }
+
+        // Read the system prompt MD file
+        let systemPrompt = "";
+        try {
+            const promptFile = this.app.vault.getAbstractFileByPath(container.systemPromptFile);
+            if (!promptFile || !(promptFile instanceof TFile)) {
+                new Notice(`${container.name}: system prompt file not found: ${container.systemPromptFile}`);
+                return;
+            }
+            systemPrompt = await this.app.vault.read(promptFile);
+        } catch (e) {
+            new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
+            return;
+        }
+
+        // Build the daily payload
+        const payload = await this.buildPRDailyPayload(range.start, range.end);
+
+        // Compose the user message
+        const userMessage = [
+            `# Period`,
+            `start: ${formatDate(range.start)}`,
+            `end: ${formatDate(range.end)}`,
+            `daily_count: ${payload.count}`,
+            "",
+            `# Daily notes`,
+            "",
+            payload.text,
+        ].join("\n");
+
+        // Call the LLM
+        const provider = PROVIDERS[service.provider];
+        if (!provider) {
+            new Notice(`${container.name}: unknown provider "${service.provider}"`);
+            return;
+        }
+
+        let responseText;
+        try {
+            new Notice(`${container.name}: aggregating ${payload.count} daily note(s) via ${service.name}…`);
+            const url = provider.buildUrl(service);
+            const body = provider.buildBody(userMessage, service, systemPrompt);
+            const headers = {
+                "Content-Type": "application/json",
+                ...(provider.headers ? provider.headers(service) : {}),
+            };
+            const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+            if (!r.ok) {
+                const errText = await r.text();
+                throw new Error(`${r.status}: ${errText.slice(0, 300)}`);
+            }
+            const data = await r.json();
+            responseText = provider.extractText(data);
+        } catch (e) {
+            new Notice(`${container.name}: LLM call failed — ${e.message}`);
+            console.error("Periodic Ritual LLM error:", e);
+            return;
+        }
+
+        if (!responseText) {
+            new Notice(`${container.name}: LLM returned an empty response`);
+            return;
+        }
+
+        // Parse YAML and merge into frontmatter
+        const parsed = this.parsePRLLMResponse(responseText);
+        const keys = Object.keys(parsed);
+        if (keys.length === 0) {
+            new Notice(`${container.name}: LLM response had no fields to write`);
+            return;
+        }
+
+        try {
+            await this.app.fileManager.processFrontMatter(file, fm => {
+                for (const k of keys) fm[k] = parsed[k];
+            });
+            new Notice(`${container.name}: wrote ${keys.length} field(s) from LLM`);
+        } catch (e) {
+            new Notice(`${container.name}: failed to write frontmatter — ${e.message}`);
+            console.error("Periodic Ritual processFrontMatter error:", e);
         }
     }
 
@@ -2176,6 +2395,50 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     }));
         }
 
+        // ── LLM aggregation (Phase 2) ──
+        const llmHeader = card.createEl("h5", { text: "LLM aggregation (optional)" });
+        llmHeader.style.cssText = "margin-top: 16px; margin-bottom: 4px; color: var(--text-muted); font-weight: 500;";
+
+        const llmIntro = card.createEl("p");
+        llmIntro.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 0 0 8px 0;";
+        llmIntro.setText("When a service and a system prompt are both set, the plugin will collect daily notes in this container's range, send them to the LLM with the prompt, and merge the YAML response into this note's frontmatter.");
+
+        // System prompt MD picker
+        new Setting(card)
+            .setName("System prompt")
+            .setDesc(container.systemPromptFile || "None selected")
+            .addButton(btn => {
+                btn.setButtonText(container.systemPromptFile ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        container.systemPromptFile = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    container.systemPromptFile = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // LLM service picker
+        const services = s.prLLMServices || [];
+        new Setting(card)
+            .setName("LLM service")
+            .setDesc(services.length === 0 ? "Define a service in the LLM tab first" : "Select which service handles this container's aggregation")
+            .addDropdown(dd => {
+                dd.addOption("", "— None —");
+                for (const svc of services) dd.addOption(svc.id, `${svc.name} (${svc.provider})`);
+                dd.setValue(container.llmServiceId || "");
+                dd.onChange(async v => {
+                    container.llmServiceId = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
         // ── Generate button ──
         new Setting(card)
             .addButton(btn => btn
@@ -2193,14 +2456,142 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         p.setText("Measurable anchors attached to a container. Each alignment names a daily field, a description of what is being measured, and the container level it lives in. Wired up in Phase 7.");
     }
 
+    // Phase 2: real LLM tab. List of services with add/edit/remove and a
+    // model fetch button per service.
     displayLLMStub(containerEl) {
+        const s = this.plugin.settings;
+        if (!Array.isArray(s.prLLMServices)) s.prLLMServices = [];
+
         containerEl.createEl("h2", { text: "LLM Services" });
-        const p = containerEl.createEl("p");
-        p.style.cssText = "color: var(--text-muted); max-width: 60ch;";
-        p.setText("Define one or more LLM services (provider + API key + model). Containers reference services by name and can use different services from each other. Wired up in Phase 2.");
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        intro.setText("Define one or more LLM services. Containers reference services by name and can use different services from each other.");
+
+        if (s.prLLMServices.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); margin: 24px 0;";
+            empty.setText("No services yet. Click below to add one.");
+        } else {
+            for (let i = 0; i < s.prLLMServices.length; i++) {
+                this.renderPRLLMServiceCard(containerEl, s.prLLMServices[i], i);
+            }
+        }
+
+        new Setting(containerEl)
+            .addButton(btn => btn
+                .setButtonText("+ Add LLM service")
+                .setCta()
+                .onClick(async () => {
+                    s.prLLMServices.push(makePRLLMService());
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+
         const note = containerEl.createEl("p");
-        note.style.cssText = "color: var(--text-faint); max-width: 60ch; font-size: 0.9em;";
-        note.setText("The legacy single-LLM config (provider, API key, model) still lives under Legacy Settings and continues to work for the existing reflection flows.");
+        note.style.cssText = "color: var(--text-faint); max-width: 60ch; font-size: 0.85em; margin-top: 24px;";
+        note.setText("The legacy single-LLM config under Existing settings continues to work for the existing reflection flows. PR services are independent.");
+    }
+
+    renderPRLLMServiceCard(parent, service, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv();
+        card.style.cssText = "border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;";
+
+        // Header: name + delete
+        const header = card.createDiv();
+        header.style.cssText = "display: flex; align-items: center; gap: 12px; margin-bottom: 12px;";
+
+        const nameInput = header.createEl("input", { type: "text", value: service.name || "" });
+        nameInput.placeholder = "Service name";
+        nameInput.style.cssText = "flex: 1; font-size: 1.05em; font-weight: 600; background: transparent; border: none; color: var(--text-normal); outline: none; border-bottom: 1px solid transparent; padding: 2px 0;";
+        nameInput.addEventListener("focus", () => { nameInput.style.borderBottom = "1px solid var(--background-modifier-border)"; });
+        nameInput.addEventListener("blur", () => { nameInput.style.borderBottom = "1px solid transparent"; });
+        nameInput.addEventListener("change", async () => {
+            service.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×" });
+        deleteBtn.title = "Delete service";
+        deleteBtn.style.cssText = "background: none; border: none; color: var(--text-muted); font-size: 1.4em; cursor: pointer; padding: 0 6px; line-height: 1;";
+        deleteBtn.addEventListener("click", async () => {
+            s.prLLMServices.splice(idx, 1);
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        // Provider
+        new Setting(card)
+            .setName("Provider")
+            .addDropdown(dd => {
+                for (const [key, p] of Object.entries(PROVIDERS)) dd.addOption(key, p.name);
+                dd.setValue(service.provider || "gemini");
+                dd.onChange(async v => {
+                    service.provider = v;
+                    service.model = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // API key (password)
+        new Setting(card)
+            .setName("API key")
+            .addText(t => {
+                t.setPlaceholder("sk-... / AIza... / sk-ant-...")
+                    .setValue(service.apiKey || "")
+                    .onChange(async v => {
+                        service.apiKey = v;
+                        await this.plugin.saveSettings();
+                    });
+                t.inputEl.type = "password";
+                t.inputEl.style.width = "320px";
+            });
+
+        // Model + fetch button
+        new Setting(card)
+            .setName("Model")
+            .setDesc(service.model || "Not selected")
+            .addText(t => t
+                .setPlaceholder("gpt-4o / gemini-2.0-flash / claude-3-5-sonnet-...")
+                .setValue(service.model || "")
+                .onChange(async v => {
+                    service.model = v;
+                    await this.plugin.saveSettings();
+                }))
+            .addExtraButton(btn => {
+                btn.setIcon("refresh-cw").setTooltip("Fetch available models from provider").onClick(async () => {
+                    if (!service.apiKey) {
+                        new Notice("Set the API key first");
+                        return;
+                    }
+                    const provider = PROVIDERS[service.provider];
+                    if (!provider) {
+                        new Notice(`Unknown provider: ${service.provider}`);
+                        return;
+                    }
+                    try {
+                        new Notice(`Fetching models from ${provider.name}…`);
+                        const models = await provider.listModels(service.apiKey);
+                        if (!models || models.length === 0) {
+                            new Notice("No models returned");
+                            return;
+                        }
+                        // Open a fuzzy picker over the fetched models
+                        const picker = new PRModelPickerModal(this.app, models, async (chosen) => {
+                            service.model = chosen;
+                            await this.plugin.saveSettings();
+                            this.display();
+                            new Notice(`Selected ${chosen}`);
+                        });
+                        picker.open();
+                    } catch (e) {
+                        new Notice(`Model fetch failed: ${e.message}`);
+                        console.error(e);
+                    }
+                });
+            });
     }
 
     displayGeneral(containerEl) {
