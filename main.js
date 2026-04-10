@@ -3178,20 +3178,50 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
+    // Find today's daily note based on the configured Daily notes folder
+    // and the standard Daily Ritual filename format. Used for cross-plugin
+    // output targets ("today's daily note") so PR reflection answers can
+    // land on the user's daily note instead of (or in addition to) PR
+    // container notes.
+    findTodaysDailyNote() {
+        const folder = this.settings.dailyNotesFolder || "";
+        const today = new Date();
+        // Daily Ritual / Templater convention: "Friday, April 10th 2026"
+        const files = this.app.vault.getMarkdownFiles().filter(f => {
+            if (folder && !f.path.startsWith(folder + "/") && f.parent?.path !== folder) return false;
+            const d = parseDateFromFilename(f.name);
+            if (!d) return false;
+            return d.getFullYear() === today.getFullYear()
+                && d.getMonth() === today.getMonth()
+                && d.getDate() === today.getDate();
+        });
+        return files[0] || null;
+    }
+
     // Write a single answer to its configured output field. Default target
     // is the active container's file. When question.outputTargetContainer
     // is set, the answer goes to the corresponding current note of that
-    // other PR container instead. Inline fields go in the body; frontmatter
-    // fields go via processFrontMatter so we don't hand-edit YAML.
+    // other PR container, OR to today's daily note when the special value
+    // "daily-today" is used (cross-plugin Daily Ritual integration).
+    // Inline fields go in the body; frontmatter fields go via
+    // processFrontMatter so we don't hand-edit YAML.
     async writePRAnswerToField(activeFile, question, answer) {
         if (!question || !question.outputToField || !question.outputFieldName) return;
         const ans = (answer || "").trim();
         if (!ans) return;
 
         // Resolve target file: active container by default, or another
-        // container's current note when outputTargetContainer is set.
+        // container's current note, or today's daily note.
         let file = activeFile;
-        if (question.outputTargetContainer) {
+        if (question.outputTargetContainer === "daily-today") {
+            const dailyFile = this.findTodaysDailyNote();
+            if (dailyFile) {
+                file = dailyFile;
+            } else {
+                new Notice(`Question "${question.text}": no daily note for today found in ${this.settings.dailyNotesFolder || "vault root"}. Skipping output.`);
+                return;
+            }
+        } else if (question.outputTargetContainer) {
             const targetContainer = (this.settings.prContainers || []).find(c => c.id === question.outputTargetContainer);
             if (targetContainer) {
                 const targetFile = await this.findMostRecentPRContainerNote(targetContainer);
@@ -5269,9 +5299,10 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 if (q.outputToField) {
                     new Setting(panel)
                         .setName("Target")
-                        .setDesc("Where to write the answer. Default is the active container's note. Picking another container pushes the answer to that container's current corresponding note instead.")
+                        .setDesc("Where to write the answer. Default is the active container's note. Picking another container pushes the answer to that container's current corresponding note. Picking 'Today's daily note' pushes to today's daily note (uses the Daily notes folder from General settings).")
                         .addDropdown(dd => {
                             dd.addOption("", "Active container (default)");
+                            dd.addOption("daily-today", "Today's daily note");
                             for (const c of (s.prContainers || [])) dd.addOption(c.id, c.name || "(unnamed)");
                             dd.setValue(q.outputTargetContainer || "");
                             dd.onChange(async v => {
