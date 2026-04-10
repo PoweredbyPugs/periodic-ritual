@@ -218,6 +218,29 @@
     text-align: center;
 }
 
+.pr-graph-empty-overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    text-align: center;
+    color: var(--text-faint);
+    max-width: 360px;
+    user-select: none;
+}
+
+.pr-graph-empty-title {
+    font-size: 1.1em;
+    font-weight: 500;
+    margin-bottom: 8px;
+}
+
+.pr-graph-empty-hint {
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+
 .pr-graph-canvas {
     flex: 1;
     position: relative;

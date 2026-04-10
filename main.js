@@ -492,8 +492,12 @@ Now produce the YAML.
 
 // Normalize a container's dataSource into the array form, regardless of
 // whether it was saved in the legacy single-source shape or the multi-
-// source shape. Always returns at least one source. Helper used by every
-// place that reads dataSource so the rest of the code can assume an array.
+// source shape. Helper used by every place that reads dataSource so the
+// rest of the code can assume an array.
+//
+// Legacy shapes auto-default to daily; an explicitly-set empty array
+// stays empty (the user can have a container with no sources, in which
+// case auto-LLM aggregation runs against an empty payload).
 //
 // Legacy shapes:
 //   { type: "daily" }
@@ -502,10 +506,8 @@ Now produce the YAML.
 //   { sources: [{ type: "daily" }, { type: "container", containerId }, ...] }
 function getContainerDataSources(container) {
     const ds = container?.dataSource;
-    if (!ds) return [{ type: "daily" }];
-    if (Array.isArray(ds.sources)) {
-        return ds.sources.length > 0 ? ds.sources : [{ type: "daily" }];
-    }
+    if (!ds) return [{ type: "daily" }];        // legacy default for unconfigured
+    if (Array.isArray(ds.sources)) return ds.sources;  // honor empty arrays
     if (ds.type === "daily") return [{ type: "daily" }];
     if (ds.type === "container" && ds.containerId) {
         return [{ type: "container", containerId: ds.containerId }];
@@ -3059,6 +3061,12 @@ class MonthlyRitualPlugin extends Plugin {
     async buildPRSourcePayload(container, start, end) {
         const sources = getContainerDataSources(container);
 
+        // Empty data sources is a valid state — the container has no
+        // configured sources. Aggregation runs against an empty payload.
+        if (sources.length === 0) {
+            return { count: 0, text: "(no data sources configured)", label: "no sources" };
+        }
+
         // Walk every configured source. Files are deduped by path so two
         // sources that happen to overlap don't duplicate sections.
         const sourceFiles = [];
@@ -5106,13 +5114,6 @@ class PRGraphView extends ItemView {
         this.nodes = nodes;
         this.wires = wires;
 
-        if (nodes.length === 0) {
-            const empty = container.createEl("div", { cls: "pr-graph-empty" });
-            empty.createEl("h3", { text: "No Periodic Ritual graph yet" });
-            empty.createEl("p", { text: "Add a container in Settings → Periodic Ritual → Containers, then come back here to see it." });
-            return;
-        }
-
         // Toolbar
         const toolbar = container.createEl("div", { cls: "pr-graph-toolbar" });
         const refreshBtn = toolbar.createEl("button", { text: "↻ Refresh" });
@@ -5161,6 +5162,15 @@ class PRGraphView extends ItemView {
 
         // Render wires (after nodes so socket positions are known)
         this.renderWires();
+
+        // Empty-state hint overlay — sits over the canvas when there are
+        // no nodes yet so the user knows the canvas is interactive.
+        if (nodes.length === 0) {
+            const overlay = canvas.createEl("div", { cls: "pr-graph-empty-overlay" });
+            overlay.createEl("div", { cls: "pr-graph-empty-title", text: "Blank graph" });
+            const hint = overlay.createEl("div", { cls: "pr-graph-empty-hint" });
+            hint.setText("Right-click or double-click anywhere to add a container, reflection, alignment, LLM service, or custom boundary.");
+        }
 
         // Apply current pan/zoom
         this.applyTransform();
@@ -5568,7 +5578,7 @@ class PRGraphView extends ItemView {
                 e.stopPropagation();
                 const sources = getContainerDataSources(c);
                 sources.splice(i, 1);
-                c.dataSource = { sources: sources.length > 0 ? sources : [{ type: "daily" }] };
+                c.dataSource = { sources };
                 await this.plugin.saveSettings();
                 this.render();
             });
@@ -7100,7 +7110,7 @@ class PRGraphView extends ItemView {
                         removeKey = `container:${wire.from.replace(/^container-/, "")}`;
                     }
                     const filtered = sources.filter(s => dataSourceKey(s) !== removeKey);
-                    target.dataSource = { sources: filtered.length > 0 ? filtered : [{ type: "daily" }] };
+                    target.dataSource = { sources: filtered };
                 }
                 break;
             case "boundary":
@@ -7143,7 +7153,7 @@ class PRGraphView extends ItemView {
                         removeKey = `container:${wire.from.replace(/^container-/, "")}`;
                     }
                     const filtered = sources.filter(s => dataSourceKey(s) !== removeKey);
-                    target.dataSource = { sources: filtered.length > 0 ? filtered : [{ type: "daily" }] };
+                    target.dataSource = { sources: filtered };
                 }
                 break;
             case "boundary":
@@ -7966,7 +7976,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             removeBtn.addEventListener("click", async () => {
                 const sources = getContainerDataSources(container);
                 sources.splice(i, 1);
-                container.dataSource = { sources: sources.length > 0 ? sources : [{ type: "daily" }] };
+                container.dataSource = { sources };
                 await this.plugin.saveSettings();
                 this.display();
             });
