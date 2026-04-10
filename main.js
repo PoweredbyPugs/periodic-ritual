@@ -872,6 +872,86 @@ module.exports = async function(date, app, plugin) {
 };
 `,
     },
+    "solar-cycle": {
+        name: "Solar Cycle",
+        description: "One full tropical year — from the Spring Equinox (Sun's ingress into Aries) through all twelve zodiac signs and back to the next Aries ingress. ~365 days, but anchored on the Aries ingress rather than January 1. The astrological alternative to a calendar year. Requires the Moon Phase plugin.",
+        tokens: ["year", "month", "month-name", "day", "date", "cycle", "cycle-start", "cycle-end"],
+        source:
+`// Solar Cycle boundary detector — fork of the built-in.
+//
+// Returns the tropical year containing the given date, anchored on the
+// Sun's ingress into Aries. Start = most recent Aries ingress on or
+// before the given date. End = day before the next Aries ingress.
+//
+// Requires the Moon Phase plugin and its Helios server.
+
+async function fetchSunIngresses(app, start, end) {
+    const moon = app.plugins.plugins["obsidian-moon"];
+    if (!moon) throw new Error("Moon Phase plugin required");
+    const base = (moon.settings.serverUrl || "http://baratie:3000").replace(/\\/+$/, "");
+    const obsidian = require("obsidian");
+    const url = base + "/planetary-ingresses?planet=Sun&start=" + fmt(start) + "&end=" + fmt(end);
+    const r = await obsidian.requestUrl({ url, method: "GET", throw: false });
+    if (r.status < 200 || r.status >= 300) throw new Error("helios " + r.status);
+    return r.json;
+}
+
+function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+function addDays(d, n) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+}
+function fmt(d) { return d.toISOString().slice(0, 10); }
+function monthName(d) { return d.toLocaleString("default", { month: "long" }); }
+
+module.exports = async function(date, app, plugin) {
+    const d = date || new Date();
+    // Search a wide window — Aries ingresses are once a year, so we need
+    // ~400 days back and forward to be safe.
+    const searchStart = addDays(d, -400);
+    const searchEnd = addDays(d, 400);
+    const raw = await fetchSunIngresses(app, searchStart, searchEnd);
+
+    const ariesIngresses = (Array.isArray(raw) ? raw : raw.ingresses || [])
+        .map(ing => Object.assign({}, ing, {
+            dateObj: new Date(ing.date || ing.exactDate || ing.timestamp),
+            sign: ing.sign || ing.toSign || "",
+        }))
+        .filter(ing => ing.sign === "Aries")
+        .sort((a, b) => a.dateObj - b.dateObj);
+
+    let prev = null, next = null;
+    for (const ing of ariesIngresses) {
+        if (ing.dateObj <= d) prev = ing;
+        else if (!next) next = ing;
+    }
+    if (!prev) throw new Error("No prior Aries ingress found in 400-day window");
+
+    const start = startOfDay(prev.dateObj);
+    const end = next ? startOfDay(addDays(next.dateObj, -1)) : addDays(start, 364);
+    const year = start.getFullYear();
+
+    return {
+        start, end,
+        tokens: {
+            year: String(year),
+            month: String(start.getMonth() + 1).padStart(2, "0"),
+            "month-name": monthName(start),
+            day: String(start.getDate()).padStart(2, "0"),
+            date: fmt(start),
+            cycle: String(year),
+            "cycle-start": fmt(start),
+            "cycle-end": fmt(end),
+        },
+    };
+};
+`,
+    },
     "sun-ingress": {
         name: "Solar Zodiac",
         description: "The period the Sun spends in one zodiac sign (~30 days). Begins at the exact moment of ingress and ends when the Sun moves into the next sign. The astrological alternative to a calendar month — themed by sign archetype rather than calendar bookkeeping. Requires the Moon Phase plugin.",
@@ -1210,6 +1290,11 @@ class PRTokenReferenceModal extends Modal {
                 { token: "{{phase-short}}", desc: "new / q1 / full / q3" },
                 { token: "{{sign}}", desc: "Moon's zodiac sign at phase start (if astrology toggle on)" },
                 { token: "{{sign-glyph}}", desc: "Sign glyph" },
+            ],
+            "solar-cycle": [
+                { token: "{{cycle}}", desc: "Year of the Aries ingress, e.g. 2026" },
+                { token: "{{cycle-start}}", desc: "ISO date of the Aries ingress (cycle start)" },
+                { token: "{{cycle-end}}", desc: "ISO date of the day before next year's Aries ingress" },
             ],
             "sun-ingress": [
                 { token: "{{sign}}", desc: "Zodiac sign of the Sun, e.g. Aries (if astrology toggle on)" },
@@ -1749,6 +1834,50 @@ class MonthlyRitualPlugin extends Plugin {
 
     // ─── Solar boundaries ───
 
+    // Solar Cycle: one tropical year, anchored on the Aries ingress.
+    // Different from Calendar Year (Jan 1 → Dec 31) — Solar Cycle starts
+    // when the Sun enters Aries (Spring Equinox) and ends the day before
+    // the next Aries ingress.
+    async getCurrentSolarCycleData(date) {
+        const d = date || new Date();
+        const searchStart = addDays(d, -400);
+        const searchEnd = addDays(d, 400);
+        const raw = await this.fetchSunIngresses(searchStart, searchEnd);
+
+        const ariesIngresses = (Array.isArray(raw) ? raw : raw.ingresses || [])
+            .map(ing => Object.assign({}, ing, {
+                dateObj: new Date(ing.date || ing.exactDate || ing.timestamp),
+                sign: ing.sign || ing.toSign || "",
+            }))
+            .filter(ing => ing.sign === "Aries")
+            .sort((a, b) => a.dateObj - b.dateObj);
+
+        let prev = null, next = null;
+        for (const ing of ariesIngresses) {
+            if (ing.dateObj <= d) prev = ing;
+            else if (!next) next = ing;
+        }
+        if (!prev) throw new Error("No prior Aries ingress found in 400-day window");
+
+        const start = startOfDay(prev.dateObj);
+        const end = next ? startOfDay(addDays(next.dateObj, -1)) : addDays(start, 364);
+        const year = start.getFullYear();
+
+        return {
+            start, end,
+            tokens: {
+                year: String(year),
+                month: String(start.getMonth() + 1).padStart(2, "0"),
+                "month-name": monthName(start),
+                day: String(start.getDate()).padStart(2, "0"),
+                date: formatDate(start),
+                cycle: String(year),
+                "cycle-start": formatDate(start),
+                "cycle-end": formatDate(end),
+            },
+        };
+    }
+
     async getSolarContainerData(date) {
         const d = date || new Date();
         // Fetch Sun ingresses for a wide window around today
@@ -2016,6 +2145,7 @@ class MonthlyRitualPlugin extends Plugin {
             // pick these without the dependency installed.
             case "lunar-cycle":      return await this.getLunarContainerData(d);
             case "lunar-phase":      return await this.getCurrentPhaseData(d);
+            case "solar-cycle":      return await this.getCurrentSolarCycleData(d);
             case "sun-ingress":      return await this.getSolarContainerData(d);
             default:
                 throw new Error(`Boundary detector "${detector}" is not implemented yet`);
@@ -2109,6 +2239,7 @@ class MonthlyRitualPlugin extends Plugin {
             list.push(
                 { id: "lunar-cycle",  label: "Lunar Cycle (new moon → new moon)" },
                 { id: "lunar-phase",  label: "Lunar Phase (one quarter of a moon cycle)" },
+                { id: "solar-cycle",  label: "Solar Cycle (Aries ingress → next Aries ingress)" },
                 { id: "sun-ingress",  label: "Solar Zodiac (one sign of the Sun)" },
             );
         }
@@ -3991,11 +4122,11 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // Calendar detectors fork to pure-math standalone modules; helios
         // detectors fork to modules that talk to the Moon Phase plugin's
         // Helios server via requestUrl. Both are runnable as custom JS.
-        const FORKABLE = new Set(["calendar-week", "calendar-month", "calendar-quarter", "calendar-year", "lunar-cycle", "lunar-phase", "sun-ingress"]);
+        const FORKABLE = new Set(["calendar-week", "calendar-month", "calendar-quarter", "calendar-year", "lunar-cycle", "lunar-phase", "solar-cycle", "sun-ingress"]);
 
         const builtInIds = [
             "calendar-week", "calendar-month", "calendar-quarter", "calendar-year",
-            "lunar-cycle", "lunar-phase", "sun-ingress",
+            "lunar-cycle", "lunar-phase", "solar-cycle", "sun-ingress",
         ];
         for (const id of builtInIds) {
             const info = BUILT_IN_BOUNDARY_INFO[id];
