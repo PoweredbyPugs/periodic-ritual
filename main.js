@@ -202,8 +202,57 @@ function makePRContainer(overrides = {}) {
         template: "",
         saveDir: "",
         naming: "",
+        // Where to write the plugin's per-note metadata (id / boundary / range).
+        // "frontmatter" — single nested key under the YAML block.
+        // "inline"      — find an inline-field marker in the body and replace
+        //                 its line; if not found, append a hidden %% block
+        //                 at the end of the file.
+        // "none"        — don't write metadata at all. Phase 3 auto-generation
+        //                 won't be able to identify previously-generated notes
+        //                 from this container, but the user gets clean output.
+        metadataPlacement: "frontmatter",
+        metadataInlineKey: "periodic-ritual",
         // Phase 2+ adds: systemPromptFile, llmService, reflectionMode, questions
     }, overrides);
+}
+
+// Format the metadata fields as a single inline blob: "k1=v1 k2=v2 ...".
+// Used for both inline placement and as the value of the frontmatter key,
+// so the format is identical regardless of where it lands.
+function formatPRMetadataBlob(fields) {
+    return Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(" ");
+}
+
+// Apply Periodic Ritual metadata to note content according to the container's
+// configured placement. Returns the (possibly modified) content string.
+function applyPRMetadata(content, placement, inlineKey, fields) {
+    if (placement === "none") return content;
+
+    const blob = formatPRMetadataBlob(fields);
+
+    if (placement === "frontmatter") {
+        // One nested key under the YAML block. Quoted to keep YAML valid
+        // even when the blob contains characters YAML would otherwise parse.
+        return mergeFrontmatter(content, { "periodic-ritual": `"${blob}"` });
+    }
+
+    if (placement === "inline") {
+        const key = inlineKey || "periodic-ritual";
+        const rendered = `${key}:: ${blob}`;
+        const escaped = escapeRegex(key);
+        // Match the marker line whether it's bare or wrapped in %% comments.
+        const markerRegex = new RegExp(`^.*${escaped}::.*$`, "m");
+        if (markerRegex.test(content)) {
+            // Preserve any %% wrapping or surrounding text on the line by
+            // replacing only the field portion via a tighter regex.
+            const fieldRegex = new RegExp(`${escaped}::[^\\n]*`, "m");
+            return content.replace(fieldRegex, rendered);
+        }
+        // Marker not present in template — append a hidden block at end of file.
+        return content.trimEnd() + `\n\n%%\n${rendered}\n%%\n`;
+    }
+
+    return content;
 }
 
 const DEFAULT_SETTINGS = {
@@ -990,15 +1039,21 @@ class MonthlyRitualPlugin extends Plugin {
             let content = await this.loadTemplate(container.template);
             content = this.resolveTokens(content, data.tokens);
 
-            // Stamp Periodic Ritual metadata so we can find these notes later
-            // (Phase 3 uses pr-container-id to track last-generated, etc.)
-            const fmFields = {
-                "pr-container-id": container.id,
-                "pr-boundary": container.boundaryDetector,
-                "pr-start": formatDate(data.start),
-                "pr-end": formatDate(data.end),
+            // Stamp Periodic Ritual metadata so future phases can find these
+            // notes again. Placement is per-container — frontmatter, inline,
+            // or none. See applyPRMetadata for details.
+            const fields = {
+                id: container.id,
+                boundary: container.boundaryDetector,
+                start: formatDate(data.start),
+                end: formatDate(data.end),
             };
-            content = mergeFrontmatter(content, fmFields);
+            content = applyPRMetadata(
+                content,
+                container.metadataPlacement || "frontmatter",
+                container.metadataInlineKey || "periodic-ritual",
+                fields
+            );
 
             const file = await this.app.vault.create(filePath, content);
             new Notice(`Created: ${fileName}`);
@@ -2054,6 +2109,36 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     container.naming = v;
                     await this.plugin.saveSettings();
                 }));
+
+        // ── Metadata placement ──
+        new Setting(card)
+            .setName("Plugin metadata location")
+            .setDesc("Where the plugin writes its per-note bookkeeping (id / boundary / range). Future phases use this to find previously-generated notes.")
+            .addDropdown(dd => {
+                dd.addOption("frontmatter", "Frontmatter (single nested key)");
+                dd.addOption("inline", "Inline marker (find or append)");
+                dd.addOption("none", "Don't write — clean output, breaks Phase 3+");
+                dd.setValue(container.metadataPlacement || "frontmatter");
+                dd.onChange(async v => {
+                    container.metadataPlacement = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // Show inline-key field only when inline placement is selected
+        if ((container.metadataPlacement || "frontmatter") === "inline") {
+            new Setting(card)
+                .setName("Inline marker key")
+                .setDesc("Inline-field key the plugin looks for in the template body (no ::). If found, its line is replaced with the rendered metadata. If not found, a hidden %% periodic-ritual:: ... %% block is appended at the end of the file.")
+                .addText(t => t
+                    .setPlaceholder("periodic-ritual")
+                    .setValue(container.metadataInlineKey || "periodic-ritual")
+                    .onChange(async v => {
+                        container.metadataInlineKey = v;
+                        await this.plugin.saveSettings();
+                    }));
+        }
 
         // ── Generate button ──
         new Setting(card)
