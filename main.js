@@ -530,6 +530,16 @@ function makePRContainer(overrides = {}) {
         // prReflections by id. Empty string = no reflection (only auto-LLM
         // runs at boundary, no Q&A modal).
         reflectionId: "",
+        // Phase 8a+ data source. Controls what the auto-LLM aggregation
+        // pass reads from. Default is daily notes in the container's range
+        // (current behavior). Alternative: another PR container, in which
+        // case the LLM reads that container's generated notes that fall
+        // inside this container's range. Enables hierarchical roll-ups
+        // like Lunar Phase → Lunar Cycle → Solar Year without each level
+        // re-reading the raw dailies.
+        //
+        // Shape: { type: "daily" } or { type: "container", containerId: "..." }
+        dataSource: { type: "daily" },
     }, overrides);
 }
 
@@ -2484,24 +2494,41 @@ class MonthlyRitualPlugin extends Plugin {
         return (this.settings.prLLMServices || []).find(s => s.id === id);
     }
 
-    // Build a single string payload from all daily notes in [start, end].
-    // Each daily becomes a section with its frontmatter and inline fields.
-    // Body content is intentionally excluded — the user's templates have
-    // huge dataview blocks that aren't useful to the LLM and would burn
-    // tokens. If the user wants the LLM to see body content, we add a
-    // setting later. Phase 2 ships with frontmatter + inline fields only.
-    async buildPRDailyPayload(start, end) {
-        // Inclusive end-of-day for the range
-        const endInclusive = new Date(end);
-        endInclusive.setHours(23, 59, 59, 999);
+    // ─── Source payload (Phase 8a) ───
+    //
+    // Build a single string payload from a container's source notes in
+    // [start, end]. Each source becomes a section with its frontmatter
+    // and inline fields. Body content is intentionally excluded — the
+    // user's templates have huge dataview blocks that aren't useful to
+    // the LLM and would burn tokens.
+    //
+    // Source is determined by container.dataSource:
+    //   { type: "daily" } (default) — daily notes folder
+    //   { type: "container", containerId: "..." } — another PR container's
+    //     notes whose pr-start falls in [start, end]
+    async buildPRSourcePayload(container, start, end) {
+        const ds = container?.dataSource || { type: "daily" };
 
-        const dailies = this.findDailyNotesInRange(start, endInclusive);
-        if (dailies.length === 0) {
-            return { count: 0, text: "(no daily notes in range)" };
+        let sourceFiles = [];
+        let sourceLabel = "daily notes";
+        if (ds.type === "container" && ds.containerId) {
+            const sourceContainer = (this.settings.prContainers || []).find(c => c.id === ds.containerId);
+            if (sourceContainer) {
+                sourceFiles = await this.findPRContainerNotesInRange(sourceContainer, start, end);
+                sourceLabel = `${sourceContainer.name || "container"} notes`;
+            }
+        } else {
+            const endInclusive = new Date(end);
+            endInclusive.setHours(23, 59, 59, 999);
+            sourceFiles = this.findDailyNotesInRange(start, endInclusive);
+        }
+
+        if (sourceFiles.length === 0) {
+            return { count: 0, text: `(no ${sourceLabel} in range)`, label: sourceLabel };
         }
 
         const sections = [];
-        for (const file of dailies) {
+        for (const file of sourceFiles) {
             const cache = this.app.metadataCache.getFileCache(file);
             const fm = cache?.frontmatter || {};
             const content = await this.app.vault.read(file);
@@ -2534,7 +2561,72 @@ class MonthlyRitualPlugin extends Plugin {
             sections.push(lines.join("\n"));
         }
 
-        return { count: dailies.length, text: sections.join("\n\n---\n\n") };
+        return { count: sourceFiles.length, text: sections.join("\n\n---\n\n"), label: sourceLabel };
+    }
+
+    // Parse a Periodic Ritual metadata blob like
+    //   "id=pr-xxx boundary=calendar-week start=2026-04-06 end=2026-04-12"
+    // into { id, boundary, start, end }. Returns null if the input doesn't
+    // look like a PR blob.
+    parsePRMetadataBlob(blob) {
+        if (!blob || typeof blob !== "string") return null;
+        const stripped = blob.replace(/^["']|["']$/g, "").trim();
+        const result = {};
+        for (const part of stripped.split(/\s+/)) {
+            const idx = part.indexOf("=");
+            if (idx > 0) result[part.slice(0, idx)] = part.slice(idx + 1);
+        }
+        return result.id || result.start ? result : null;
+    }
+
+    // Read PR metadata from a file regardless of placement (frontmatter or
+    // inline marker). Returns { id, boundary, start, end } or null.
+    async readPRMetadataFromFile(file, sourceContainer) {
+        const placement = sourceContainer?.metadataPlacement || "frontmatter";
+        if (placement === "frontmatter") {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const blob = cache?.frontmatter?.["periodic-ritual"];
+            return this.parsePRMetadataBlob(blob);
+        }
+        if (placement === "inline") {
+            const key = sourceContainer?.metadataInlineKey || "periodic-ritual";
+            try {
+                const content = await this.app.vault.read(file);
+                const re = new RegExp(`(?:^|\\s)${escapeRegex(key)}::\\s*([^\\n]+)`, "m");
+                const m = content.match(re);
+                return m ? this.parsePRMetadataBlob(m[1]) : null;
+            } catch (e) {
+                return null;
+            }
+        }
+        // placement === "none" — no metadata to read
+        return null;
+    }
+
+    // Find all notes from a given source container whose pr-start falls
+    // inside [start, end]. Returns sorted by pr-start ascending.
+    async findPRContainerNotesInRange(sourceContainer, start, end) {
+        if (!sourceContainer || !sourceContainer.saveDir) return [];
+        const dirPath = sourceContainer.saveDir;
+        const files = this.app.vault.getMarkdownFiles().filter(f =>
+            f.path === dirPath || f.path.startsWith(dirPath + "/") || f.parent?.path === dirPath
+        );
+
+        const matches = [];
+        for (const file of files) {
+            const meta = await this.readPRMetadataFromFile(file, sourceContainer);
+            if (!meta || !meta.start || !meta.id) continue;
+            // Filter by container id so we don't grab notes from other
+            // containers that happen to live in the same folder.
+            if (meta.id !== sourceContainer.id) continue;
+            const noteStart = new Date(meta.start);
+            if (isNaN(noteStart.getTime())) continue;
+            if (noteStart >= start && noteStart <= end) {
+                matches.push({ file, sortKey: noteStart });
+            }
+        }
+        matches.sort((a, b) => a.sortKey - b.sortKey);
+        return matches.map(m => m.file);
     }
 
     // Try to extract a YAML object from an LLM response. Strips fenced code
@@ -2607,8 +2699,9 @@ class MonthlyRitualPlugin extends Plugin {
             systemPrompt = `# Reflection guidance\n${opts.reflection.promptPrepend.trim()}\n\n---\n\n${systemPrompt}`;
         }
 
-        // Build the daily payload
-        const payload = await this.buildPRDailyPayload(range.start, range.end);
+        // Build the source payload (daily notes by default, or another
+        // PR container's notes when dataSource is set to container).
+        const payload = await this.buildPRSourcePayload(container, range.start, range.end);
 
         // Compose the user message. Three optional sections beyond the
         // standard period header + daily notes:
@@ -2623,7 +2716,8 @@ class MonthlyRitualPlugin extends Plugin {
             `# Period`,
             `start: ${formatDate(range.start)}`,
             `end: ${formatDate(range.end)}`,
-            `daily_count: ${payload.count}`,
+            `source: ${payload.label || "daily notes"}`,
+            `count: ${payload.count}`,
             "",
         ];
 
@@ -2671,7 +2765,7 @@ class MonthlyRitualPlugin extends Plugin {
             }
         }
 
-        parts.push("# Daily notes", "", payload.text);
+        parts.push(`# Source notes (${payload.label || "daily notes"})`, "", payload.text);
 
         const userMessage = parts.join("\n");
 
@@ -4252,6 +4346,35 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 dd.setValue(container.generateAt || "start");
                 dd.onChange(async v => {
                     container.generateAt = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // ── Data source (Phase 8a) ──
+        // What the auto-LLM aggregation reads from. Default: daily notes
+        // in the container's range. Alternative: another PR container's
+        // notes whose pr-start falls in this container's range. Enables
+        // hierarchical roll-ups (Lunar Phase → Lunar Cycle → Solar Year).
+        const ds = container.dataSource || { type: "daily" };
+        const currentDsValue = ds.type === "container" && ds.containerId
+            ? `container:${ds.containerId}`
+            : "daily";
+        new Setting(card)
+            .setName("Data source")
+            .setDesc("What this container's auto-LLM reads from. Default is daily notes. Picking another container makes this one read its notes instead — used for roll-up chains like Lunar Phase → Lunar Cycle → Solar Year.")
+            .addDropdown(dd => {
+                dd.addOption("daily", "Daily notes (default)");
+                for (const c of (s.prContainers || [])) {
+                    if (c.id === container.id) continue; // can't reference self
+                    dd.addOption(`container:${c.id}`, `${c.name || "(unnamed)"} (container)`);
+                }
+                dd.setValue(currentDsValue);
+                dd.onChange(async v => {
+                    if (v === "daily") {
+                        container.dataSource = { type: "daily" };
+                    } else if (v.startsWith("container:")) {
+                        container.dataSource = { type: "container", containerId: v.slice("container:".length) };
+                    }
                     await this.plugin.saveSettings();
                 });
             });
