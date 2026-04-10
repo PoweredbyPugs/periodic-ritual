@@ -496,6 +496,15 @@ function makePRContainer(overrides = {}) {
         name: "New container",
         enabled: false,
         boundaryDetector: "calendar-week",
+        // "start" — create the note as soon as a new period begins.
+        //           Used for arc / planning / dataview containers that need
+        //           to exist throughout the cycle so the user can fill them
+        //           in or so dataview tables can render.
+        // "end"   — wait until the period has fully ended, then create the
+        //           note. Used for aggregation containers that summarize
+        //           what happened during the period — generating mid-period
+        //           would be premature.
+        generateAt: "start",
         template: "",
         saveDir: "",
         naming: "",
@@ -1702,8 +1711,7 @@ class MonthlyRitualPlugin extends Plugin {
     // explicit operation, not catch-up.
     async catchUpPRContainer(container) {
         if (!container.template || !container.naming) {
-            // Not yet configured — skip silently. The settings UI shows
-            // the missing fields; no need to nag from auto-generate.
+            // Not yet configured — skip silently.
             return;
         }
 
@@ -1711,27 +1719,48 @@ class MonthlyRitualPlugin extends Plugin {
         const currentRange = this.getPRBoundaryData(container.boundaryDetector, now);
         if (!currentRange) return;
 
-        // First-run case: no history, no backfill, just the current period.
+        const generateAt = container.generateAt || "start";
+        // In end mode, the current period only counts as "missed" once it's
+        // ended. The walker uses this as the upper bound when collecting
+        // periods to generate.
+        const includeCurrent = generateAt === "start" || currentRange.end < now;
+
+        // First-run case: no history.
         if (!container.lastGeneratedEnd) {
+            if (generateAt === "end") {
+                // First run end mode: generate the most recently ENDED period
+                // (the one before today's period). Gives the user immediate
+                // feedback instead of waiting an entire cycle.
+                const previousPeriodDate = addDays(currentRange.start, -1);
+                const previousRange = this.getPRBoundaryData(container.boundaryDetector, previousPeriodDate);
+                if (previousRange) {
+                    await this.generatePRContainerNote(container, previousPeriodDate);
+                }
+                // If the current period has also ended (rare — only true if
+                // the user installed mid-boundary), pick it up too.
+                if (currentRange.end < now) {
+                    await this.generatePRContainerNote(container, now);
+                }
+                return;
+            }
+            // Start mode first run: generate the current period.
             await this.generatePRContainerNote(container, now);
             return;
         }
 
         const lastEnd = new Date(container.lastGeneratedEnd);
         if (isNaN(lastEnd.getTime())) {
-            // Corrupt timestamp — fall back to generating the current period.
             console.warn(`Periodic Ritual: ${container.name} has invalid lastGeneratedEnd "${container.lastGeneratedEnd}", falling back to current period`);
             await this.generatePRContainerNote(container, now);
             return;
         }
 
-        // If lastGeneratedEnd is already at or past the end of the current
-        // period, we're up to date. Nothing to do.
+        // If lastGeneratedEnd is at or past the current period's end, we're
+        // up to date. Nothing to do.
         if (lastEnd >= currentRange.end) return;
 
-        // Walk forward one period at a time. Collect period start dates first,
-        // then iterate so we know how many notices to suppress and what to
-        // report at the end.
+        // Walk forward one period at a time, collecting period start dates.
+        // In end mode, skip any period whose end is in the future.
         const periodDates = [];
         let cursor = addDays(lastEnd, 1);
         let safety = 0;
@@ -1739,10 +1768,12 @@ class MonthlyRitualPlugin extends Plugin {
             safety++;
             const range = this.getPRBoundaryData(container.boundaryDetector, cursor);
             if (!range) break;
+            // End mode: skip periods that haven't fully ended yet.
+            if (generateAt === "end" && range.end > now) {
+                break;
+            }
             periodDates.push(new Date(cursor));
             const nextCursor = addDays(range.end, 1);
-            // Defensive: if the detector returned a period that doesn't
-            // advance the cursor, bail rather than infinite-loop.
             if (nextCursor <= cursor) {
                 console.warn(`Periodic Ritual: ${container.name} boundary detector returned non-advancing range`, range);
                 break;
@@ -2697,15 +2728,17 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             }
         }
 
-        // Add button — restricted to Calendar Week in Phase 1
-        const detectors = this.plugin.getPRAvailableBoundaryDetectors();
+        // Add a generic container. The user picks the boundary detector and
+        // edits the rest. Phase 1 only ships calendar-week as a detector;
+        // Phases 4–5 will add more, and they'll automatically appear in the
+        // dropdown without changes here.
         new Setting(containerEl)
             .addButton(btn => btn
-                .setButtonText("+ Add Calendar Week")
+                .setButtonText("+ Add container")
                 .setCta()
                 .onClick(async () => {
                     s.prContainers.push(makePRContainer({
-                        name: "Calendar Week",
+                        name: "New container",
                         boundaryDetector: "calendar-week",
                         naming: "W{{week}}-{{year}}",
                     }));
@@ -2764,6 +2797,20 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 dd.setValue(container.boundaryDetector || "calendar-week");
                 dd.onChange(async v => {
                     container.boundaryDetector = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // ── Generate at (start vs end of period) ──
+        new Setting(card)
+            .setName("Generate at")
+            .setDesc("Start: create the note as soon as a new period begins (good for arc / planning / dataview containers that need to exist throughout the cycle). End: wait until the period has fully ended (good for aggregation containers that summarize what happened).")
+            .addDropdown(dd => {
+                dd.addOption("start", "Start of period");
+                dd.addOption("end", "End of period");
+                dd.setValue(container.generateAt || "start");
+                dd.onChange(async v => {
+                    container.generateAt = v;
                     await this.plugin.saveSettings();
                 });
             });
