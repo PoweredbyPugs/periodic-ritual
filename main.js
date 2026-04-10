@@ -617,6 +617,13 @@ function makePRReflection(overrides = {}) {
         //   T/T: No auto. Reflection-driven LLM call when the user runs it.
         useLLM: false,
         replaceAutoLLM: false,
+        // When true, alignments attached to the container fire BEFORE the
+        // reflection LLM call (not after, the default), AND a dedicated
+        // "# Alignment outputs" section is appended to the user message
+        // listing every alignment_* frontmatter key on the container note.
+        // Lets the reflection LLM see measurement context from alignments
+        // alongside the daily payload and reflection answers.
+        includeAlignmentContext: false,
         // Optional markdown text prepended to the container's system prompt
         // during reflection LLM runs only. Only relevant when useLLM is true.
         promptPrepend: "",
@@ -3021,6 +3028,24 @@ class MonthlyRitualPlugin extends Plugin {
             }
         }
 
+        // Dedicated alignment-outputs section. When opts.includeAlignmentContext
+        // is on, we explicitly call out the alignment_* frontmatter keys so
+        // the LLM treats them as measurements rather than generic context.
+        if (opts.includeAlignmentContext && file) {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const fm = cache?.frontmatter || {};
+            const alignmentLines = [];
+            for (const [k, v] of Object.entries(fm)) {
+                if (!k.startsWith("alignment_")) continue;
+                if (v === null || v === undefined) continue;
+                const display = typeof v === "object" ? JSON.stringify(v) : String(v);
+                alignmentLines.push(`**${k.replace(/^alignment_/, "")}**: ${display}`);
+            }
+            if (alignmentLines.length > 0) {
+                parts.push("# Alignment outputs (measurements from this period)", "", ...alignmentLines, "");
+            }
+        }
+
         parts.push(`# Source notes (${payload.label || "daily notes"})`, "", payload.text);
 
         const userMessage = parts.join("\n");
@@ -3349,21 +3374,34 @@ class MonthlyRitualPlugin extends Plugin {
                 await this.writePRAnswerToField(file, reflection.questions[i], answers[i]);
             }
 
-            // Step 2 — optional LLM call. The reflection's useLLM toggle
+            // Step 2 — alignments fire EARLY when includeAlignmentContext
+            // is on. Otherwise they fire after the LLM call (or already ran
+            // at boundary in non-replace mode). The early-fire path lets
+            // the reflection LLM see alignment outputs in the same call.
+            const earlyAlignments = reflection.includeAlignmentContext && reflection.replaceAutoLLM && range;
+            if (earlyAlignments) {
+                await this.runPRAlignmentsForContainer(container, file, range, {});
+            }
+
+            // Step 3 — optional LLM call. The reflection's useLLM toggle
             // controls whether this fires.
             if (reflection.useLLM) {
                 await this.runPRLLMAggregation(container, file, range, {
                     answers,
                     injectedVars,
-                    includePreviousFrontmatter: !reflection.replaceAutoLLM,
+                    // Force previous-frontmatter inclusion when alignment
+                    // context is requested so the LLM sees the alignment
+                    // keys we just wrote.
+                    includePreviousFrontmatter: !reflection.replaceAutoLLM || reflection.includeAlignmentContext,
+                    includeAlignmentContext: reflection.includeAlignmentContext,
                     reflection,
                 });
             }
 
-            // Step 3 — alignments. Only fire here when the reflection
-            // suppressed the boundary auto-aggregation; otherwise they
-            // already ran in generatePRContainerNote and we'd duplicate.
-            if (reflection.replaceAutoLLM && range) {
+            // Step 4 — alignments fire late when they didn't fire early.
+            // Skip when they already ran (either at boundary or earlier in
+            // this same reflection call).
+            if (reflection.replaceAutoLLM && range && !earlyAlignments) {
                 await this.runPRAlignmentsForContainer(container, file, range, {});
             }
 
@@ -4919,24 +4957,32 @@ class PRGraphView extends ItemView {
         if (node.kind === "container") {
             const inputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-in" });
             const inDefs = [
-                { id: "in-data",       cls: "data-source", label: "data" },
+                { id: "in-data",       cls: "data-source", label: "data source" },
                 { id: "in-boundary",   cls: "boundary",    label: "boundary" },
-                { id: "in-llm",        cls: "llm",         label: "llm" },
+                { id: "in-llm",        cls: "llm",         label: "llm service" },
                 { id: "in-reflection", cls: "reflection",  label: "reflection" },
                 { id: "in-alignment",  cls: "alignment",   label: "alignment" },
             ];
             for (const def of inDefs) {
                 const socket = inputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-in pr-graph-socket-${def.cls}` });
                 socket.dataset.socketId = def.id;
-                socket.title = def.label;
+                socket.dataset.label = def.label;
             }
             const outputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-out" });
             const outSocket = outputs.createEl("div", { cls: "pr-graph-socket pr-graph-socket-out pr-graph-socket-data-source" });
             outSocket.dataset.socketId = "out";
+            outSocket.dataset.label = "feeds another container";
         } else {
             const outputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-out" });
             const outSocket = outputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-out pr-graph-socket-${node.kind}` });
             outSocket.dataset.socketId = "out";
+            outSocket.dataset.label = {
+                daily:      "feeds containers",
+                boundary:   "boundary out",
+                llm:        "llm service out",
+                reflection: "reflection out",
+                alignment:  "alignment out",
+            }[node.kind] || node.kind;
         }
     }
 
@@ -4989,6 +5035,7 @@ class PRGraphView extends ItemView {
             const r = node.primitive;
             addToggle("Send to LLM", () => r.useLLM, (v) => { r.useLLM = v; });
             addToggle("Replace auto", () => r.replaceAutoLLM, (v) => { r.replaceAutoLLM = v; });
+            addToggle("Inc. alignments", () => r.includeAlignmentContext, (v) => { r.includeAlignmentContext = v; });
         } else if (node.kind === "alignment") {
             const a = node.primitive;
             addText("Field", "health", () => a.dataField, (v) => { a.dataField = v; });
@@ -6050,69 +6097,124 @@ class PRGraphView extends ItemView {
         if (!this.viewportEl || !this.wireSvg) return;
         const SVG_NS = "http://www.w3.org/2000/svg";
 
-        let active = null;       // { fromNode, fromSocketId, ghost: SVGPathElement }
+        // Drag direction: "out" = output socket → input socket (forward)
+        //                 "in"  = empty input socket → menu (reverse)
+        let active = null;
 
         const onMouseDown = (e) => {
             if (e.button !== 0) return;
-            const socket = e.target.closest(".pr-graph-socket-out");
-            if (!socket) return;
-            const nodeEl = socket.closest(".pr-graph-node");
-            if (!nodeEl) return;
-            const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
-            if (!node) return;
 
-            const ghost = document.createElementNS(SVG_NS, "path");
-            ghost.setAttribute("class", `pr-graph-wire pr-graph-wire-${this.nodeOutputType(node.kind)} pr-graph-wire-ghost`);
-            ghost.setAttribute("fill", "none");
-            this.wireSvg.appendChild(ghost);
+            // Output socket — forward drag
+            const outSocket = e.target.closest(".pr-graph-socket-out");
+            if (outSocket) {
+                const nodeEl = outSocket.closest(".pr-graph-node");
+                if (!nodeEl) return;
+                const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+                if (!node) return;
+                const ghost = document.createElementNS(SVG_NS, "path");
+                ghost.setAttribute("class", `pr-graph-wire pr-graph-wire-${this.nodeOutputType(node.kind)} pr-graph-wire-ghost`);
+                ghost.setAttribute("fill", "none");
+                this.wireSvg.appendChild(ghost);
+                active = {
+                    direction: "out",
+                    fromNode: node,
+                    fromSocketId: outSocket.dataset.socketId || "out",
+                    ghost,
+                };
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
 
-            active = {
-                fromNode: node,
-                fromSocketId: socket.dataset.socketId || "out",
-                ghost,
-            };
-            e.preventDefault();
-            e.stopPropagation();
+            // Input socket — reverse drag (only if empty)
+            const inSocket = e.target.closest(".pr-graph-socket-in");
+            if (inSocket) {
+                const nodeEl = inSocket.closest(".pr-graph-node");
+                if (!nodeEl) return;
+                const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+                if (!node) return;
+                const socketId = inSocket.dataset.socketId;
+                // Check if this input already has a wire — if so, don't start
+                // a reverse drag (use right-click delete on the wire instead).
+                const hasWire = this.wires.some(w => w.to === node.id && w.toSocket === socketId);
+                if (hasWire) return;
+                // Determine the wire color from the input socket type
+                const wireKind = (socketId || "").replace(/^in-/, "") || "data-source";
+                const ghost = document.createElementNS(SVG_NS, "path");
+                ghost.setAttribute("class", `pr-graph-wire pr-graph-wire-${wireKind} pr-graph-wire-ghost`);
+                ghost.setAttribute("fill", "none");
+                this.wireSvg.appendChild(ghost);
+                active = {
+                    direction: "in",
+                    toNode: node,
+                    toSocketId: socketId,
+                    ghost,
+                };
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
         };
 
         const onMouseMove = (e) => {
             if (!active) return;
-            // Convert mouse position from screen to viewport coordinates
             const rect = this.canvasEl.getBoundingClientRect();
             const mx = (e.clientX - rect.left - this.panX) / this.zoom;
             const my = (e.clientY - rect.top - this.panY) / this.zoom;
 
-            const a = this.socketPos(active.fromNode.id, active.fromSocketId);
-            const dx = Math.max(60, Math.abs(mx - a.x) * 0.4);
-            const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${mx - dx} ${my}, ${mx} ${my}`;
-            active.ghost.setAttribute("d", d);
+            if (active.direction === "out") {
+                const a = this.socketPos(active.fromNode.id, active.fromSocketId);
+                const dx = Math.max(60, Math.abs(mx - a.x) * 0.4);
+                const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${mx - dx} ${my}, ${mx} ${my}`;
+                active.ghost.setAttribute("d", d);
+            } else {
+                const b = this.socketPos(active.toNode.id, active.toSocketId);
+                const dx = Math.max(60, Math.abs(b.x - mx) * 0.4);
+                const d = `M ${mx} ${my} C ${mx + dx} ${my}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
+                active.ghost.setAttribute("d", d);
+            }
         };
 
         const onMouseUp = async (e) => {
             if (!active) return;
             const ghost = active.ghost;
-            const fromNode = active.fromNode;
-            const fromSocketId = active.fromSocketId;
+            const drag = active;
             active = null;
-            // Always remove the ghost
             if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
 
-            // Did we drop on an input socket?
             const target = document.elementFromPoint(e.clientX, e.clientY);
-            if (!target) return;
-            const socket = target.closest(".pr-graph-socket-in");
-            if (!socket) return;
-            const nodeEl = socket.closest(".pr-graph-node");
-            if (!nodeEl) return;
-            const toNode = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
-            if (!toNode) return;
-            const toSocketId = socket.dataset.socketId;
 
-            if (!this.canConnect(fromNode, toNode, toSocketId)) {
-                new Notice(`Can't connect ${fromNode.kind} → ${toSocketId}`);
+            if (drag.direction === "out") {
+                // Forward drag: must drop on a compatible input socket
+                if (!target) return;
+                const socket = target.closest(".pr-graph-socket-in");
+                if (!socket) return;
+                const nodeEl = socket.closest(".pr-graph-node");
+                if (!nodeEl) return;
+                const toNode = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+                if (!toNode) return;
+                const toSocketId = socket.dataset.socketId;
+                if (!this.canConnect(drag.fromNode, toNode, toSocketId)) {
+                    new Notice(`Can't connect ${drag.fromNode.kind} → ${toSocketId}`);
+                    return;
+                }
+                await this.applyConnection(drag.fromNode, toNode, drag.fromSocketId, toSocketId);
                 return;
             }
-            await this.applyConnection(fromNode, toNode, fromSocketId, toSocketId);
+
+            // Reverse drag from an empty input socket. If we dropped on an
+            // existing compatible source node, wire it up. Otherwise, open
+            // a "create source" menu so the user can spawn a new node here.
+            const dropOnNodeEl = target?.closest(".pr-graph-node");
+            if (dropOnNodeEl) {
+                const fromNode = this.nodes.find(n => n.id === dropOnNodeEl.dataset.nodeId);
+                if (fromNode && this.canConnect(fromNode, drag.toNode, drag.toSocketId)) {
+                    await this.applyConnection(fromNode, drag.toNode, "out", drag.toSocketId);
+                    return;
+                }
+            }
+            // Empty / incompatible drop → open the source-create menu
+            this.openInputDragMenu(e, drag.toNode, drag.toSocketId);
         };
 
         this.viewportEl.addEventListener("mousedown", onMouseDown);
@@ -6124,6 +6226,163 @@ class PRGraphView extends ItemView {
             window.removeEventListener("mousemove", onMouseMove);
             window.removeEventListener("mouseup", onMouseUp);
         };
+    }
+
+    // Menu opened when the user drags FROM an empty container input socket
+    // and releases on empty canvas. Lists compatible source options for the
+    // socket type — picking one creates the source node + wires it to the
+    // input. The new source node is positioned at the drop point.
+    openInputDragMenu(e, toNode, toSocketId) {
+        const rect = this.canvasEl.getBoundingClientRect();
+        const vx = (e.clientX - rect.left - this.panX) / this.zoom;
+        const vy = (e.clientY - rect.top - this.panY) / this.zoom;
+        const seedPosition = (id) => {
+            if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
+            const cur = this.plugin.settings.prGraphLayout[id] || {};
+            cur.x = vx; cur.y = vy;
+            this.plugin.settings.prGraphLayout[id] = cur;
+        };
+
+        const items = [];
+        const headerLabel = ({
+            "in-data":       "Add data source",
+            "in-boundary":   "Add boundary",
+            "in-llm":        "Add LLM service",
+            "in-reflection": "Add reflection",
+            "in-alignment":  "Add alignment",
+        })[toSocketId] || "Add source";
+        items.push({ label: headerLabel, onClick: null });
+        items.push("separator");
+
+        const wireUp = async () => {
+            await this.plugin.saveSettings();
+            this.render();
+        };
+
+        if (toSocketId === "in-data") {
+            items.push({
+                label: "Daily notes",
+                onClick: async () => {
+                    toNode.primitive.dataSource = { type: "daily" };
+                    await wireUp();
+                },
+            });
+            items.push({
+                label: "+ New container",
+                onClick: async () => {
+                    const c = makePRContainer({ name: "New container" });
+                    this.plugin.settings.prContainers.push(c);
+                    seedPosition(`container-${c.id}`);
+                    toNode.primitive.dataSource = { type: "container", containerId: c.id };
+                    await wireUp();
+                },
+            });
+            // Existing containers we could pull from
+            const others = (this.plugin.settings.prContainers || []).filter(c => c.id !== toNode.primitive.id);
+            if (others.length > 0) {
+                items.push("separator");
+                items.push({ label: "Existing containers", onClick: null });
+                for (const c of others) {
+                    items.push({
+                        label: c.name || "(unnamed)",
+                        onClick: async () => {
+                            toNode.primitive.dataSource = { type: "container", containerId: c.id };
+                            await wireUp();
+                        },
+                    });
+                }
+            }
+        } else if (toSocketId === "in-boundary") {
+            for (const det of this.plugin.getPRAvailableBoundaryDetectors()) {
+                items.push({
+                    label: det.label,
+                    onClick: async () => {
+                        toNode.primitive.boundaryDetector = det.id;
+                        await wireUp();
+                    },
+                });
+            }
+            items.push("separator");
+            items.push({
+                label: "+ New custom boundary",
+                onClick: async () => {
+                    const cb = makePRCustomBoundary();
+                    this.plugin.settings.prCustomBoundaries.push(cb);
+                    seedPosition(`boundary-custom-${cb.id}`);
+                    toNode.primitive.boundaryDetector = `custom:${cb.id}`;
+                    await wireUp();
+                },
+            });
+        } else if (toSocketId === "in-llm") {
+            const services = this.plugin.settings.prLLMServices || [];
+            for (const svc of services) {
+                items.push({
+                    label: svc.name || "(unnamed)",
+                    onClick: async () => {
+                        toNode.primitive.llmServiceId = svc.id;
+                        await wireUp();
+                    },
+                });
+            }
+            if (services.length > 0) items.push("separator");
+            items.push({
+                label: "+ New LLM service",
+                onClick: async () => {
+                    const svc = makePRLLMService();
+                    this.plugin.settings.prLLMServices.push(svc);
+                    seedPosition(`llm-${svc.id}`);
+                    toNode.primitive.llmServiceId = svc.id;
+                    await wireUp();
+                },
+            });
+        } else if (toSocketId === "in-reflection") {
+            const reflections = this.plugin.settings.prReflections || [];
+            for (const r of reflections) {
+                items.push({
+                    label: r.name || "(unnamed)",
+                    onClick: async () => {
+                        toNode.primitive.reflectionId = r.id;
+                        await wireUp();
+                    },
+                });
+            }
+            if (reflections.length > 0) items.push("separator");
+            items.push({
+                label: "+ New reflection",
+                onClick: async () => {
+                    const r = makePRReflection();
+                    this.plugin.settings.prReflections.push(r);
+                    seedPosition(`reflection-${r.id}`);
+                    toNode.primitive.reflectionId = r.id;
+                    await wireUp();
+                },
+            });
+        } else if (toSocketId === "in-alignment") {
+            const alignments = this.plugin.settings.prAlignments || [];
+            const unattached = alignments.filter(a => !a.containerId);
+            for (const a of unattached) {
+                items.push({
+                    label: a.name || "(unnamed)",
+                    onClick: async () => {
+                        a.containerId = toNode.primitive.id;
+                        await wireUp();
+                    },
+                });
+            }
+            if (unattached.length > 0) items.push("separator");
+            items.push({
+                label: "+ New alignment",
+                onClick: async () => {
+                    const a = makePRAlignment();
+                    a.containerId = toNode.primitive.id;
+                    this.plugin.settings.prAlignments.push(a);
+                    seedPosition(`alignment-${a.id}`);
+                    await wireUp();
+                },
+            });
+        }
+
+        this.showFloatingMenu(e.clientX, e.clientY, items);
     }
 
     // ─── Wire click to delete (Phase 10b-1) ───
@@ -7164,6 +7423,17 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .setValue(!!reflection.replaceAutoLLM)
                 .onChange(async v => {
                     reflection.replaceAutoLLM = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Include alignment context
+        new Setting(body)
+            .setName("Include alignment outputs in LLM context")
+            .setDesc("When on, alignments attached to the container fire BEFORE the reflection LLM call (instead of after) and a dedicated \"# Alignment outputs\" section is added to the LLM user message. Lets the reflection synthesize alignment measurements alongside the daily payload and your answers.")
+            .addToggle(t => t
+                .setValue(!!reflection.includeAlignmentContext)
+                .onChange(async v => {
+                    reflection.includeAlignmentContext = v;
                     await this.plugin.saveSettings();
                 }));
 
