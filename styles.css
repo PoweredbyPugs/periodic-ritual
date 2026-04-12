@@ -297,6 +297,15 @@
     stroke: #f0a04b;
     stroke-dasharray: 2 4;
 }
+.pr-graph-wire-show {
+    stroke: var(--text-muted);
+    stroke-dasharray: 3 3;
+    stroke-width: 1.8px;
+}
+.pr-graph-wire-any {
+    stroke: var(--text-muted);
+    stroke-dasharray: 3 3;
+}
 
 /* Wire being dragged from an output socket toward the cursor */
 .pr-graph-wire-ghost {
@@ -407,6 +416,30 @@
     border-color: var(--interactive-accent);
 }
 
+.pr-graph-widget-picker-value {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-size: 0.8em;
+    font-family: var(--font-monospace);
+}
+.pr-graph-widget-picker-btn {
+    flex-shrink: 0;
+    padding: 2px 6px;
+    font-size: 0.75em;
+    background: var(--interactive-normal);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 3px;
+    color: var(--text-normal);
+    cursor: pointer;
+}
+.pr-graph-widget-picker-btn:hover {
+    background: var(--interactive-hover);
+}
+
 .pr-graph-widget-toggle {
     position: relative;
     display: inline-block;
@@ -462,18 +495,61 @@
 .pr-graph-node {
     position: absolute;
     width: 220px;
+    min-height: 110px; /* normalized collapsed size — wide enough for all five container inputs to spread out without crowding */
     background: var(--background-secondary);
     border: 1px solid var(--background-modifier-border);
     border-radius: 8px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
     cursor: pointer;
-    transition: box-shadow 0.15s, border-color 0.15s, width 0.15s;
+    transition: box-shadow 0.15s, border-color 0.15s;
     z-index: 1;
+    display: flex;
+    flex-direction: column;
 }
 
 .pr-graph-node-expanded {
     width: 320px;
+    min-height: 0; /* expanded grows to fit its body, no minimum */
     z-index: 3;
+}
+
+/* When the user has manually sized a node, fix its dimensions and let the
+   body scroll internally. Without this the body grows past the node box. */
+.pr-graph-node-sized {
+    overflow: hidden;
+}
+.pr-graph-node-sized .pr-graph-node-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+.pr-graph-node-resizing {
+    /* Kill the transition during drag so the box follows the cursor 1:1. */
+    transition: none !important;
+    user-select: none;
+}
+
+/* Bottom-right resize grip — visible on hover, always drag-targetable. */
+.pr-graph-node-resize {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 14px;
+    height: 14px;
+    cursor: nwse-resize;
+    z-index: 5;
+    background:
+        linear-gradient(135deg, transparent 50%, var(--text-muted) 50%, var(--text-muted) 60%, transparent 60%, transparent 70%, var(--text-muted) 70%, var(--text-muted) 80%, transparent 80%);
+    opacity: 0.35;
+    border-bottom-right-radius: 8px;
+    transition: opacity 0.15s;
+}
+.pr-graph-node:hover .pr-graph-node-resize {
+    opacity: 0.75;
+}
+.pr-graph-node-resize:hover {
+    opacity: 1;
 }
 
 /* Multi-select highlight: nodes in the selection set get a tinted ring */
@@ -497,26 +573,48 @@
     outline: none;
 }
 
-/* Type badge above each node card */
-.pr-graph-node-kind {
-    position: absolute;
-    top: -16px;
-    left: 4px;
+/* Kind pill — sits inside the header next to the title so the user
+   always knows which kind of node they're looking at. */
+.pr-graph-node-kind-pill {
+    display: inline-block;
     font-size: 0.65em;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: var(--text-faint);
-    user-select: none;
-    pointer-events: none;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-right: 6px;
     font-family: var(--font-monospace);
+    color: var(--background-primary);
+    background: var(--text-muted);
+    flex-shrink: 0;
+    user-select: none;
 }
 
-.pr-graph-node-kind-container  { color: var(--interactive-accent); opacity: 0.7; }
-.pr-graph-node-kind-boundary   { color: #4a90e2; opacity: 0.7; }
-.pr-graph-node-kind-llm        { color: #5cb85c; opacity: 0.7; }
-.pr-graph-node-kind-reflection { color: #a06cd5; opacity: 0.7; }
-.pr-graph-node-kind-alignment  { color: #f0a04b; opacity: 0.7; }
-.pr-graph-node-kind-daily      { color: var(--text-faint); }
+.pr-graph-node-kind-container     { background: var(--interactive-accent); color: var(--text-on-accent, #fff); }
+.pr-graph-node-kind-boundary      { background: #4a90e2; color: #fff; }
+.pr-graph-node-kind-llm           { background: #5cb85c; color: #fff; }
+.pr-graph-node-kind-reflection    { background: #a06cd5; color: #fff; }
+.pr-graph-node-kind-alignment     { background: #f0a04b; color: #fff; }
+.pr-graph-node-kind-daily         { background: var(--text-faint); color: var(--background-primary); }
+.pr-graph-node-kind-show          { background: var(--text-muted); color: var(--background-primary); }
+.pr-graph-node-kind-data-source      { background: #3db8a6; color: #fff; }
+.pr-graph-node-kind-alignment-group  { background: #e08a3c; color: #fff; }
+
+/* Minimal color pipe — small vertical bar used as a visual identifier
+   for node kinds in context menus, filter popovers, settings rows, etc.
+   Same color palette as node header stripes and kind pills. */
+.pr-color-pipe {
+    display: inline-block;
+    width: 3px;
+    height: 12px;
+    vertical-align: middle;
+    margin-right: 8px;
+    border-radius: 1px;
+    flex-shrink: 0;
+}
+.pr-color-pipe-tall {
+    height: 1em;
+}
 
 .pr-graph-node:hover {
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
@@ -552,8 +650,6 @@
     margin-top: 8px;
     padding-top: 8px;
     border-top: 1px dashed var(--background-modifier-border);
-    max-height: 480px;
-    overflow-y: auto;
 }
 
 .pr-graph-expanded-placeholder {
@@ -848,7 +944,10 @@
 .pr-graph-node-boundary   .pr-graph-node-header { border-top: 3px solid #4a90e2; }
 .pr-graph-node-llm        .pr-graph-node-header { border-top: 3px solid #5cb85c; }
 .pr-graph-node-reflection .pr-graph-node-header { border-top: 3px solid #a06cd5; }
-.pr-graph-node-alignment  .pr-graph-node-header { border-top: 3px solid #f0a04b; }
+.pr-graph-node-alignment    .pr-graph-node-header { border-top: 3px solid #f0a04b; }
+.pr-graph-node-show         .pr-graph-node-header { border-top: 3px solid var(--text-muted); border-top-style: dashed; }
+.pr-graph-node-data-source     .pr-graph-node-header { border-top: 3px solid #3db8a6; }
+.pr-graph-node-alignment-group .pr-graph-node-header { border-top: 3px solid #e08a3c; }
 
 /* Sockets */
 .pr-graph-sockets {
@@ -878,6 +977,37 @@
 .pr-graph-socket-alignment   { background: #f0a04b; }
 .pr-graph-socket-daily       { background: var(--text-faint); }
 .pr-graph-socket-container   { background: var(--interactive-accent); }
+.pr-graph-socket-any         { background: var(--text-muted); border-style: dashed; }
+.pr-graph-socket-show        { background: var(--text-muted); }
+
+/* Indeterminate progress bar shown inside a show-output node's result
+   panel while a dry run is in flight. */
+.pr-graph-show-loading {
+    padding: 8px 0;
+}
+.pr-graph-progress-bar {
+    position: relative;
+    height: 4px;
+    width: 100%;
+    background: var(--background-modifier-border);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.pr-graph-progress-bar::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 35%;
+    height: 100%;
+    background: var(--interactive-accent);
+    border-radius: 2px;
+    animation: pr-progress-slide 1.2s ease-in-out infinite;
+}
+@keyframes pr-progress-slide {
+    0%   { left: -35%; }
+    100% { left: 100%; }
+}
 
 /* Hover label — sits next to the socket on hover so you can read what
    it represents without guessing from the color. */

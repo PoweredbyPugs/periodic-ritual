@@ -520,6 +520,7 @@ function getContainerDataSources(container) {
 function dataSourceKey(source) {
     if (!source || source.type === "daily") return "daily";
     if (source.type === "container") return `container:${source.containerId || ""}`;
+    if (source.type === "dataSource") return `dataSource:${source.dataSourceId || ""}`;
     return `unknown`;
 }
 
@@ -529,6 +530,16 @@ function makePRContainer(overrides = {}) {
         id: "pr-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
         name: "New container",
         enabled: false,
+        // Local feature toggles — respect the global master in General.
+        // When off, the corresponding piece is skipped even if the global
+        // master is on. When global is off, these are forced off regardless.
+        useSystemPrompt: true,
+        useFramework: true,
+        // Framework reinforcement — short markdown snippet injected into
+        // the user message right before the YAML output instructions.
+        // Much higher attention slot than the system prompt, so frameworks
+        // and procedural thinking guidance survive long source payloads.
+        framework: "",
         boundaryDetector: "calendar-week",
         // "start" — create the note as soon as a new period begins.
         //           Used for arc / planning / dataview containers that need
@@ -714,6 +725,99 @@ function makePRCustomBoundary(overrides = {}) {
         // what kind of period it's looking at, even when the calculation
         // happens in the user's own JS module.
         description: "",
+    }, overrides);
+}
+
+// Periodic Ritual: Alignment Group primitive.
+//
+// An alignment group is a graph-wired gap-analysis pass that runs after a
+// container's main LLM aggregation. It reads guidelines from a source note
+// (via a DataSource or a container wire), compares them against the
+// container's actuals (the subdivision payload + optionally the freshly-
+// aggregated summary frontmatter), and writes gap analysis back to the
+// container's note as `{prefix}_{name}` frontmatter keys.
+//
+// Individual alignments inside the group are auto-discovered from the
+// source note's frontmatter/inline fields by prefix — if the group's
+// prefix is "alignment", every source-note field starting with
+// "alignment_" becomes an input guideline, and the LLM is asked to return
+// the same key names with the gap analysis as values. No per-alignment
+// configuration needed — the source note IS the config.
+//
+// Wiring:
+//   - in-source   (from a data-source node OR a container node)
+//   - in-llm      (from an llm-service node)
+//   - out         (wires into a container's in-alignment socket; that
+//                  container becomes the write target)
+function makePRAlignmentGroup(overrides = {}) {
+    return Object.assign({
+        id: "ag-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New alignment group",
+        prefix: "alignment",
+        // Wire-driven relationships
+        containerId: "",              // target container — set by wire to in-alignment
+        sourceKind: "",               // "data-source" | "container"
+        sourceId: "",                 // id of the source primitive
+        llmServiceId: "",             // LLM service used for the gap-analysis call
+        // Config
+        systemPromptFile: "",
+        // Local feature toggles (respect General master)
+        useSystemPrompt: true,
+        useFramework: true,
+        framework: "",
+        includeAggregatedSummary: true,  // feed the container's fresh frontmatter as extra context
+        // Per-alignment output shape.
+        //   defaultMode:
+        //     - "separate" → LLM writes narrative to {prefix}_{name} key
+        //     - "rewrite"  → LLM writes concise string to target key (replaces it)
+        //     - "prepend"  → pure string splice: target = template(guideline,existing)
+        //     - "append"   → pure string splice, reverse order
+        //   defaultTarget is a template string with {prefix} and {name} tokens.
+        //   overrides is a map keyed by the full alignment key (e.g.
+        //   "alignment_health") → { mode, target, template }.
+        //
+        // Source-note meta keys take highest priority (alignment_health_mode,
+        // alignment_health_target, alignment_health_template); group overrides
+        // come next; group defaults are the fallback.
+        defaultMode: "separate",
+        defaultTarget: "{prefix}_{name}",
+        defaultTemplate: "",
+        overrides: {},
+    }, overrides);
+}
+
+// Periodic Ritual: Data source primitive.
+//
+// A named, reusable reference to a note or folder of notes that can be wired
+// into containers (as a source payload section) and alignment groups (as a
+// guidelines source). Two modes:
+//   - static:  references one specific note — read that file's frontmatter
+//              and inline fields every generation, regardless of period
+//   - dynamic: references a folder of notes — the consumer determines what
+//              "the right notes" means. Containers filter by their own period
+//              window (using pr-start/pr-end frontmatter if present, falling
+//              back to file mtime). Alignment groups ignore period and take
+//              the single latest note in the folder.
+function makePRDataSource(overrides = {}) {
+    return Object.assign({
+        id: "ds-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "New data source",
+        mode: "static",        // "static" | "dynamic"
+        notePath: "",          // used when mode === "static"
+        folderPath: "",        // used when mode === "dynamic"
+    }, overrides);
+}
+
+// Periodic Ritual: Show-output node.
+// A terminal graph-only primitive. Has one "any" input that accepts a wire
+// from any other node's output. The Dry Run button probes the upstream node
+// and renders a snapshot of what would flow through that wire at runtime.
+// Purely a debugging/inspection tool — doesn't affect generation.
+function makePRShowNode(overrides = {}) {
+    return Object.assign({
+        id: "sh-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: "Show output",
+        sourceNodeId: "",  // graph node id of the upstream node being probed
     }, overrides);
 }
 
@@ -1297,6 +1401,13 @@ const DEFAULT_SETTINGS = {
     prReflections: [],         // Reflection[] — Q&A profiles per container
     prLLMServices: [],         // LLMService[] — { name, provider, apiKey, model }
     prCustomBoundaries: [],    // CustomBoundary[] — { id, name, scriptPath, description }
+    prDataSources: [],         // DataSource[] — named static/dynamic note/folder references
+    prAlignmentGroups: [],     // AlignmentGroup[] — graph-wired gap-analysis groups
+    prShowNodes: [],           // ShowNode[] — graph-only dry-run probes
+    // Global master switches — when off, no container/group sends the
+    // corresponding piece even if its local toggle is on.
+    prSystemPromptsGlobalEnabled: true,
+    prFrameworksGlobalEnabled: true,
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
     prGraphLayout: {},         // { [nodeId]: { x, y } } — node positions in the graph view
 };
@@ -3024,14 +3135,25 @@ class MonthlyRitualPlugin extends Plugin {
             const reflection = this.getPRReflectionForContainer(container);
             const skipAutoLLM = !!(reflection && reflection.replaceAutoLLM);
             const range = { start: data.start, end: data.end };
-            if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM) {
-                await this.runPRLLMAggregation(container, file, range, opts);
+
+            // Phase 11: alignment-group passes run BEFORE the main LLM call
+            // so the main summary can reference alignment outputs. The main
+            // call is then given includePreviousFrontmatter so it sees the
+            // group results the groups just wrote.
+            if (!skipAutoLLM) {
+                await this.runPRAlignmentGroupsForContainer(container, file, range, opts);
             }
 
-            // Phase 7: alignment passes. Run after main aggregation so the
-            // alignment writes don't get clobbered. Skipped when the attached
-            // reflection replaces auto-LLM — runPRContainerReflection runs
-            // them then so the user still gets alignment output.
+            if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM) {
+                await this.runPRLLMAggregation(container, file, range, {
+                    ...opts,
+                    includePreviousFrontmatter: true,
+                });
+            }
+
+            // Legacy single alignments still run AFTER main aggregation so
+            // existing flows are unaffected. New alignment groups are the
+            // supported path; legacy only exists for backwards compat.
             if (!skipAutoLLM) {
                 await this.runPRAlignmentsForContainer(container, file, range, opts);
             }
@@ -3083,6 +3205,15 @@ class MonthlyRitualPlugin extends Plugin {
                     theseFiles = await this.findPRContainerNotesInRange(sourceContainer, start, end);
                     labelParts.push(`${sourceContainer.name || "container"} notes`);
                 }
+            } else if (source.type === "dataSource" && source.dataSourceId) {
+                // DataSource primitive — resolve by id, then delegate to the
+                // shared resolver which applies period filtering for dynamic
+                // folder sources and reads the single file for static ones.
+                const ds = (this.settings.prDataSources || []).find(x => x.id === source.dataSourceId);
+                if (ds) {
+                    theseFiles = await this.resolveDataSourceForContainer(ds, start, end);
+                    labelParts.push(ds.name || "data source");
+                }
             } else {
                 const endInclusive = new Date(end);
                 endInclusive.setHours(23, 59, 59, 999);
@@ -3112,7 +3243,9 @@ class MonthlyRitualPlugin extends Plugin {
 
             // Pull `key:: value` inline fields from the body
             const inlineFields = {};
-            const inlineRegex = /^([a-zA-Z0-9_-]+)::\s*(.+)$/gm;
+            // `[ \t]*` (not `\s*`) so empty inline fields don't consume the
+// newline and pick up the next line's value.
+const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             let m;
             while ((m = inlineRegex.exec(body)) !== null) {
                 const k = m[1];
@@ -3166,7 +3299,7 @@ class MonthlyRitualPlugin extends Plugin {
             const key = sourceContainer?.metadataInlineKey || "periodic-ritual";
             try {
                 const content = await this.app.vault.read(file);
-                const re = new RegExp(`(?:^|\\s)${escapeRegex(key)}::\\s*([^\\n]+)`, "m");
+                const re = new RegExp(`^${escapeRegex(key)}::[ \\t]*([^\\n]+)`, "m");
                 const m = content.match(re);
                 return m ? this.parsePRMetadataBlob(m[1]) : null;
             } catch (e) {
@@ -3179,6 +3312,85 @@ class MonthlyRitualPlugin extends Plugin {
 
     // Find all notes from a given source container whose pr-start falls
     // inside [start, end]. Returns sorted by pr-start ascending.
+    // ─── Periodic Ritual: DataSource resolvers ───
+    //
+    // DataSources are dumb — they just point at a note or a folder. The
+    // resolvers below turn them into the right set of TFiles for whichever
+    // consumer is asking.
+
+    // Container consumer: static → [that one file]; dynamic → folder scan
+    // filtered by the container's period window. Matching logic:
+    //   1. If the note has pr-start / pr-end frontmatter (PR-generated),
+    //      use that to decide overlap with [start, end].
+    //   2. Otherwise fall back to file.stat.mtime in the same window.
+    async resolveDataSourceForContainer(dataSource, start, end) {
+        if (!dataSource) return [];
+
+        if (dataSource.mode === "static") {
+            const file = this.app.vault.getAbstractFileByPath(dataSource.notePath);
+            if (file && file instanceof TFile) return [file];
+            return [];
+        }
+
+        if (dataSource.mode === "dynamic") {
+            const folder = dataSource.folderPath || "";
+            if (!folder) return [];
+            const files = this.app.vault.getMarkdownFiles().filter(f =>
+                f.path === folder || f.path.startsWith(folder + "/") || f.parent?.path === folder
+            );
+            const startMs = start.getTime();
+            const endMs = end.getTime();
+            const matches = [];
+            for (const file of files) {
+                // Prefer PR metadata when present — more precise than mtime
+                // and what the user expects for the PR container chain.
+                const fmCache = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
+                const prBlock = fmCache["periodic-ritual"];
+                let noteStart = null;
+                if (prBlock && typeof prBlock === "object" && prBlock.start) {
+                    const d = new Date(prBlock.start);
+                    if (!isNaN(d.getTime())) noteStart = d;
+                } else if (fmCache["pr-start"]) {
+                    const d = new Date(fmCache["pr-start"]);
+                    if (!isNaN(d.getTime())) noteStart = d;
+                }
+                const effectiveMs = noteStart ? noteStart.getTime() : (file.stat?.mtime || 0);
+                if (effectiveMs >= startMs && effectiveMs <= endMs) {
+                    matches.push({ file, sortKey: effectiveMs });
+                }
+            }
+            matches.sort((a, b) => a.sortKey - b.sortKey);
+            return matches.map(m => m.file);
+        }
+
+        return [];
+    }
+
+    // Alignment-group consumer: static → that one file; dynamic → single
+    // latest note in the folder (by mtime). Period is irrelevant here —
+    // alignments read the current milestone, whatever that is.
+    resolveDataSourceLatest(dataSource) {
+        if (!dataSource) return null;
+
+        if (dataSource.mode === "static") {
+            const file = this.app.vault.getAbstractFileByPath(dataSource.notePath);
+            return (file && file instanceof TFile) ? file : null;
+        }
+
+        if (dataSource.mode === "dynamic") {
+            const folder = dataSource.folderPath || "";
+            if (!folder) return null;
+            const files = this.app.vault.getMarkdownFiles().filter(f =>
+                f.path === folder || f.path.startsWith(folder + "/") || f.parent?.path === folder
+            );
+            if (files.length === 0) return null;
+            files.sort((a, b) => (b.stat?.mtime || 0) - (a.stat?.mtime || 0));
+            return files[0];
+        }
+
+        return null;
+    }
+
     async findPRContainerNotesInRange(sourceContainer, start, end) {
         if (!sourceContainer || !sourceContainer.saveDir) return [];
         const dirPath = sourceContainer.saveDir;
@@ -3219,8 +3431,16 @@ class MonthlyRitualPlugin extends Plugin {
             .replace(/^---\s*\n/, "")
             .replace(/\n---\s*$/, "");
 
+        // Sanitize top-level `key: value` lines that contain ambiguous
+        // characters (colons inside values, leading #, etc.) before parsing.
+        // LLMs sometimes return `health: 3 of 5: missed Friday` which most
+        // YAML parsers misread. We wrap the value in single quotes at parse
+        // time; those quotes are stripped when the parser produces the final
+        // object, so the user sees a clean string in their frontmatter.
+        const sanitized = this.sanitizePRYamlForParse(stripped);
+
         try {
-            const parsed = parseYaml(stripped);
+            const parsed = parseYaml(sanitized);
             if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
                 return parsed;
             }
@@ -3229,6 +3449,49 @@ class MonthlyRitualPlugin extends Plugin {
             console.warn("Periodic Ritual: YAML parse failed", e);
             return { "pr-llm-raw": response };
         }
+    }
+
+    // Best-effort YAML rescue. Looks for top-level `key: value` lines whose
+    // value would break the parser (unquoted colon inside, leading # or |>)
+    // and wraps those values in single quotes so parseYaml sees them as a
+    // single scalar string. Already-quoted, list, or map values pass through
+    // untouched. Non-top-level indented lines are left alone.
+    sanitizePRYamlForParse(text) {
+        const lines = text.split("\n");
+        const out = [];
+        for (const line of lines) {
+            // Only touch top-level scalar assignments. Indented lines are
+            // part of a structure the user might actually want, so skip.
+            const m = line.match(/^([A-Za-z_][A-Za-z0-9_\-]*)\s*:\s+(.+?)\s*$/);
+            if (!m) { out.push(line); continue; }
+            const key = m[1];
+            const value = m[2];
+
+            // Already wrapped? Leave alone.
+            if ((value.startsWith('"') && value.endsWith('"')) ||
+                (value.startsWith("'") && value.endsWith("'"))) {
+                out.push(line);
+                continue;
+            }
+            // Value starts with a YAML-significant char — list, map, folded,
+            // anchor, merge, tag. User presumably meant structure; leave it.
+            if (/^[-?\[{>|!*&]/.test(value)) {
+                out.push(line);
+                continue;
+            }
+            // Ambiguous payload: contains a "colon + space" sequence (looks
+            // like a nested key), a leading #, or embedded newlines.
+            const ambiguous = /:\s/.test(value) || value.startsWith("#") || value.includes("\t");
+            if (!ambiguous) {
+                out.push(line);
+                continue;
+            }
+            // Wrap in single quotes, doubling any existing single quotes
+            // to preserve them per YAML rules.
+            const escaped = value.replace(/'/g, "''");
+            out.push(`${key}: '${escaped}'`);
+        }
+        return out.join("\n");
     }
 
     // Capture the last LLM call (system prompt + user message + raw response)
@@ -3248,18 +3511,26 @@ class MonthlyRitualPlugin extends Plugin {
             return;
         }
 
-        // Read the system prompt MD file
+        // Read the system prompt MD file — unless system prompts are
+        // disabled globally or locally on this container. Disabling
+        // system prompts is a valid config: the container still runs,
+        // but the model sees an empty system role and relies entirely
+        // on the user message structure.
+        const globalSP = this.settings.prSystemPromptsGlobalEnabled !== false;
+        const useSP = globalSP && container.useSystemPrompt !== false;
         let systemPrompt = "";
-        try {
-            const promptFile = this.app.vault.getAbstractFileByPath(container.systemPromptFile);
-            if (!promptFile || !(promptFile instanceof TFile)) {
-                if (!opts.silent) new Notice(`${container.name}: system prompt file not found: ${container.systemPromptFile}`);
+        if (useSP) {
+            try {
+                const promptFile = this.app.vault.getAbstractFileByPath(container.systemPromptFile);
+                if (!promptFile || !(promptFile instanceof TFile)) {
+                    if (!opts.silent) new Notice(`${container.name}: system prompt file not found: ${container.systemPromptFile}`);
+                    return;
+                }
+                systemPrompt = await this.app.vault.read(promptFile);
+            } catch (e) {
+                if (!opts.silent) new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
                 return;
             }
-            systemPrompt = await this.app.vault.read(promptFile);
-        } catch (e) {
-            if (!opts.silent) new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
-            return;
         }
 
         // Phase 4c: prepend the boundary description to the system prompt.
@@ -3365,6 +3636,38 @@ class MonthlyRitualPlugin extends Plugin {
 
         parts.push(`# Source notes (${payload.label || "daily notes"})`, "", payload.text);
 
+        // Framework reinforcement — reads the markdown file at
+        // container.framework and injects its contents at the highest-
+        // attention slot (right before the output instructions). Much
+        // more reliable for procedural thinking guidance than the system
+        // prompt. Respects the global Frameworks master in General and
+        // the container's local useFramework toggle.
+        const globalFW = this.settings.prFrameworksGlobalEnabled !== false;
+        const useFW = globalFW && container.useFramework !== false && container.framework;
+        if (useFW) {
+            try {
+                const frameworkText = await this.loadTemplate(container.framework);
+                if (frameworkText && frameworkText.trim()) {
+                    parts.push("");
+                    parts.push("# Framework reinforcement");
+                    parts.push("");
+                    parts.push(frameworkText.trim());
+                }
+            } catch (_) { /* skip silently on read failure */ }
+        }
+
+        // Universal YAML hygiene tail — applies to EVERY LLM call the plugin
+        // makes, so a sloppy system prompt can't produce unparseable YAML.
+        // Non-prescriptive: only tells the model what would break the parser,
+        // not how to style the content.
+        parts.push("");
+        parts.push("# YAML formatting requirements");
+        parts.push("- Use plain, unquoted string values. Commas, semicolons, periods, and internal punctuation are fine as plain text.");
+        parts.push("- Do NOT place a colon followed by a space (`: `) inside an unquoted value — the parser will misread it as a new key. Rephrase instead.");
+        parts.push("- Do NOT start a value with `-`, `#`, `[`, or `{` unless you genuinely intend to produce a YAML list or map.");
+        parts.push("- Do NOT wrap values in quotes. Plain strings only.");
+        parts.push("- Do NOT return YAML document markers (`---`) around the block.");
+
         const userMessage = parts.join("\n");
 
         // Call the LLM
@@ -3425,7 +3728,7 @@ class MonthlyRitualPlugin extends Plugin {
 
         if (!responseText) {
             if (!opts.silent) new Notice(`${container.name}: LLM returned an empty response`);
-            return;
+            return opts.dryRun ? { parsed: {}, responseText: "", empty: true } : undefined;
         }
 
         // Parse YAML and merge into frontmatter
@@ -3433,7 +3736,14 @@ class MonthlyRitualPlugin extends Plugin {
         const keys = Object.keys(parsed);
         if (keys.length === 0) {
             if (!opts.silent) new Notice(`${container.name}: LLM response had no fields to write`);
-            return;
+            return opts.dryRun ? { parsed: {}, responseText, empty: true } : undefined;
+        }
+
+        // Dry-run: do not mutate the file. Return the parsed keys so the
+        // caller (the show-output node) can display what WOULD be written
+        // and how it would interact with the note's current frontmatter.
+        if (opts.dryRun) {
+            return { parsed, responseText, systemPrompt, userMessage };
         }
 
         try {
@@ -3530,7 +3840,9 @@ class MonthlyRitualPlugin extends Plugin {
             // Inline field — read body and regex match
             const content = await this.app.vault.read(sourceFile);
             const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
-            const re = new RegExp(`^${escapeRegex(question.varField)}::\\s*(.+)$`, "m");
+            // `[ \t]*` keeps the match on one line; otherwise empty inline
+// fields absorb the newline and pick up the next line's content.
+const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
             const m = body.match(re);
             return m ? m[1].trim() : "";
         } catch (e) {
@@ -3698,6 +4010,7 @@ class MonthlyRitualPlugin extends Plugin {
             const earlyAlignments = reflection.includeAlignmentContext && reflection.replaceAutoLLM && range;
             if (earlyAlignments) {
                 await this.runPRAlignmentsForContainer(container, file, range, {});
+                await this.runPRAlignmentGroupsForContainer(container, file, range, {});
             }
 
             // Step 3 — optional LLM call. The reflection's useLLM toggle
@@ -3720,6 +4033,7 @@ class MonthlyRitualPlugin extends Plugin {
             // this same reflection call).
             if (reflection.replaceAutoLLM && range && !earlyAlignments) {
                 await this.runPRAlignmentsForContainer(container, file, range, {});
+                await this.runPRAlignmentGroupsForContainer(container, file, range, {});
             }
 
             new Notice(`${container.name}: reflection complete`);
@@ -3774,7 +4088,7 @@ class MonthlyRitualPlugin extends Plugin {
             } else {
                 const content = await this.app.vault.read(dn);
                 const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
-                const re = new RegExp(`^${escapeRegex(alignment.dataField)}::\\s*(.+)$`, "m");
+                const re = new RegExp(`^${escapeRegex(alignment.dataField)}::[ \\t]*(.+)$`, "m");
                 const m = body.match(re);
                 val = m ? m[1].trim() : "";
             }
@@ -3859,6 +4173,446 @@ class MonthlyRitualPlugin extends Plugin {
         if (alignments.length === 0) return;
         for (const a of alignments) {
             await this.runPRAlignmentPass(a, container, file, range, opts);
+        }
+    }
+
+    // ─── Periodic Ritual: Alignment Group pass ───
+    //
+    // Runs after the main container aggregation, before on-demand reflection.
+    // For each group attached to this container, resolves the guidelines
+    // source, extracts {prefix}_* fields, and sends one LLM call with:
+    //   - the group's system prompt
+    //   - the container's period + subdivision payload (actuals)
+    //   - optionally the freshly-aggregated frontmatter (compressed actuals)
+    //   - the extracted guidelines
+    // Then parses the YAML response and merges keys into the container note.
+    async runPRAlignmentGroupsForContainer(container, file, range, opts = {}) {
+        const groups = (this.settings.prAlignmentGroups || []).filter(g => g.containerId === container.id);
+        if (groups.length === 0) return;
+        for (const g of groups) {
+            await this.runPRAlignmentGroupPass(g, container, file, range, opts);
+        }
+    }
+
+    // ─── Alignment group helpers ───
+
+    // Load the guidelines source for a group into a structured object:
+    //   {
+    //     sourceFile,
+    //     sourceLabel,
+    //     sourceFm,           // { key: value } frontmatter from source
+    //     sourceInline,       // { key: value } inline `key:: value` fields from source body
+    //     guidelines,         // { alignmentKey: value } — filtered to prefix, meta keys excluded
+    //   }
+    // Returns null if the source can't be resolved.
+    async resolvePRAlignmentGroupSource(group) {
+        let sourceFile = null;
+        let sourceLabel = "(no source)";
+        if (group.sourceKind === "data-source" && group.sourceId) {
+            const ds = (this.settings.prDataSources || []).find(x => x.id === group.sourceId);
+            if (ds) {
+                sourceFile = this.resolveDataSourceLatest(ds);
+                sourceLabel = ds.name || "data source";
+            }
+        } else if (group.sourceKind === "container" && group.sourceId) {
+            const srcContainer = (this.settings.prContainers || []).find(x => x.id === group.sourceId);
+            if (srcContainer) {
+                sourceFile = await this.findMostRecentPRContainerNote(srcContainer);
+                sourceLabel = srcContainer.name || "container";
+            }
+        }
+        if (!sourceFile) return null;
+
+        const prefix = (group.prefix || "alignment").trim();
+        if (!prefix) return null;
+
+        const sourceFm = this.app.metadataCache.getFileCache(sourceFile)?.frontmatter || {};
+        const sourceInline = {};
+        try {
+            const raw = await this.app.vault.read(sourceFile);
+            const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
+            // `[ \t]*` (not `\s*`) so empty inline fields don't consume the
+// newline and pick up the next line's value.
+const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
+            let m;
+            while ((m = inlineRegex.exec(body)) !== null) {
+                sourceInline[m[1]] = m[2].trim();
+            }
+        } catch (_) { /* ignore */ }
+
+        // A base alignment key: starts with `{prefix}_`, doesn't end with
+        // one of the meta suffixes. `alignment_health` is a guideline,
+        // `alignment_health_target` is a meta override.
+        const META_SUFFIXES = ["_target", "_mode", "_template"];
+        const isBase = (k) => {
+            if (!k.startsWith(prefix + "_")) return false;
+            for (const suffix of META_SUFFIXES) {
+                if (k.endsWith(suffix)) return false;
+            }
+            return true;
+        };
+
+        const guidelines = {};
+        // Frontmatter first
+        for (const [k, v] of Object.entries(sourceFm)) {
+            if (!isBase(k)) continue;
+            if (v === null || v === undefined) continue;
+            guidelines[k] = typeof v === "object" ? JSON.stringify(v) : String(v);
+        }
+        // Inline second — doesn't overwrite frontmatter
+        for (const [k, v] of Object.entries(sourceInline)) {
+            if (!isBase(k)) continue;
+            if (guidelines[k]) continue;
+            guidelines[k] = v;
+        }
+
+        return { sourceFile, sourceLabel, sourceFm, sourceInline, guidelines };
+    }
+
+    // Resolve the full config (mode, target, template) for a single
+    // discovered alignment. Precedence: source meta keys > group overrides
+    // > group defaults.
+    resolvePRAlignmentConfig(group, alignmentKey, sourceFm, sourceInline) {
+        const getMeta = (suffix) => {
+            const k = `${alignmentKey}${suffix}`;
+            if (sourceFm && sourceFm[k] !== undefined && sourceFm[k] !== null) {
+                return typeof sourceFm[k] === "object" ? JSON.stringify(sourceFm[k]) : String(sourceFm[k]);
+            }
+            if (sourceInline && sourceInline[k] !== undefined) return sourceInline[k];
+            return null;
+        };
+
+        const prefix = (group.prefix || "alignment").trim();
+        const name = alignmentKey.startsWith(prefix + "_")
+            ? alignmentKey.slice(prefix.length + 1)
+            : alignmentKey;
+
+        const groupOverride = (group.overrides || {})[alignmentKey] || {};
+
+        let mode = getMeta("_mode") || groupOverride.mode || group.defaultMode || "separate";
+        // `append` was an earlier mode; it's now collapsed into `prepend`
+        // since the same result is achievable with a custom template. Any
+        // lingering append config silently coerces to prepend.
+        if (mode === "append") mode = "prepend";
+
+        // Target pattern: can have {prefix} and {name} tokens
+        const targetPattern = getMeta("_target") || groupOverride.target || group.defaultTarget || "{prefix}_{name}";
+        const target = targetPattern
+            .replace(/\{prefix\}/g, prefix)
+            .replace(/\{name\}/g, name);
+
+        const defaultTemplates = {
+            prepend: "**{guideline}** — {entries}",
+        };
+        const template = getMeta("_template") || groupOverride.template || group.defaultTemplate || defaultTemplates[mode] || "";
+
+        return { mode, target, template, name, alignmentKey };
+    }
+
+    // Apply a template string to produce a splice result for prepend/append
+    // modes. No LLM involvement. Available tokens:
+    //   {guideline} — the source-note guideline value
+    //   {existing}  — current value of the target key on the container note
+    //   {entries}   — collected subdivision field values for the alignment's
+    //                 short name, joined with ", "
+    //   {name}      — the alignment's short name (e.g., "health")
+    applyPRAlignmentTemplate(template, tokens) {
+        return template
+            .replace(/\{guideline\}/g, tokens.guideline || "")
+            .replace(/\{existing\}/g, tokens.existing || "")
+            .replace(/\{entries\}/g,  tokens.entries  || "")
+            .replace(/\{name\}/g,     tokens.name     || "");
+    }
+
+    // Collect the value of a single field name across every subdivision
+    // note in a container's current period. Reads the same sources that
+    // buildPRSourcePayload would walk (daily / container / dataSource) but
+    // extracts only the one field. Returns a joined ", "-separated string
+    // of non-empty values. Empty string if nothing matches.
+    async collectPRFieldFromSubdivisions(container, start, end, fieldName) {
+        if (!container || !fieldName) return "";
+        const sources = getContainerDataSources(container);
+        if (sources.length === 0) return "";
+
+        const results = [];
+        const seen = new Set();
+
+        for (const source of sources) {
+            let files = [];
+            if (source.type === "container" && source.containerId) {
+                const sc = (this.settings.prContainers || []).find(c => c.id === source.containerId);
+                if (sc) files = await this.findPRContainerNotesInRange(sc, start, end);
+            } else if (source.type === "dataSource" && source.dataSourceId) {
+                const ds = (this.settings.prDataSources || []).find(x => x.id === source.dataSourceId);
+                if (ds) files = await this.resolveDataSourceForContainer(ds, start, end);
+            } else {
+                const endInclusive = new Date(end);
+                endInclusive.setHours(23, 59, 59, 999);
+                files = this.findDailyNotesInRange(start, endInclusive);
+            }
+            for (const f of files) {
+                if (seen.has(f.path)) continue;
+                seen.add(f.path);
+                const val = await this.readPRFieldValue(f, fieldName);
+                if (val !== null && val !== undefined && String(val).trim() !== "") {
+                    results.push(String(val).trim());
+                }
+            }
+        }
+
+        return results.join(", ");
+    }
+
+    // Read a single field value from a file, checking frontmatter first,
+    // then inline `key:: value` markers in the body. Returns null if absent.
+    async readPRFieldValue(file, fieldName) {
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
+        if (fm[fieldName] !== undefined && fm[fieldName] !== null) {
+            if (typeof fm[fieldName] === "object") return JSON.stringify(fm[fieldName]);
+            return String(fm[fieldName]);
+        }
+        try {
+            const raw = await this.app.vault.read(file);
+            const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
+            const re = new RegExp(`^${escapeRegex(fieldName)}::[ \\t]*(.+)$`, "m");
+            const m = body.match(re);
+            if (m) return m[1].trim();
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
+    async runPRAlignmentGroupPass(group, container, file, range, opts = {}) {
+        // 1. Resolve source → guidelines + raw source frontmatter / inline
+        const src = await this.resolvePRAlignmentGroupSource(group);
+        if (!src) {
+            if (!opts.silent) new Notice(`${group.name}: guidelines source has no note to read`);
+            return;
+        }
+        const { sourceFile, sourceLabel, sourceFm, sourceInline, guidelines } = src;
+        if (Object.keys(guidelines).length === 0) {
+            if (!opts.silent) new Notice(`${group.name}: no ${group.prefix}_* fields found in ${sourceFile.path}`);
+            return;
+        }
+
+        // 2. Resolve per-alignment config — split into splice-only vs LLM-required
+        const resolved = [];
+        for (const alignmentKey of Object.keys(guidelines)) {
+            const config = this.resolvePRAlignmentConfig(group, alignmentKey, sourceFm, sourceInline);
+            resolved.push({ ...config, guideline: guidelines[alignmentKey] });
+        }
+        const spliceAlignments = resolved.filter(r => r.mode === "prepend");
+        const llmAlignments    = resolved.filter(r => r.mode === "separate" || r.mode === "rewrite");
+
+        // 3. Splice writes run immediately — no LLM, no network. For each
+        //    splice alignment: collect subdivision entries for the alignment's
+        //    short name, read the current target value from the note, apply
+        //    the template, stage for a single processFrontMatter write at
+        //    the end.
+        const writes = {};   // { key: value } to write in order
+        const writeOrder = []; // track sequential prepends for same key
+        const currentFm = file ? (this.app.metadataCache.getFileCache(file)?.frontmatter || {}) : {};
+        for (const r of spliceAlignments) {
+            // Pull subdivision entries for this alignment's short name
+            // (e.g. `health`). Empty string if nothing matches the field
+            // across the period's source notes.
+            const entries = await this.collectPRFieldFromSubdivisions(container, range.start, range.end, r.name);
+
+            // Existing = whatever we've already staged, OR the current note
+            // value. Sequential prepends against the same target key chain
+            // through this.
+            const staged = writes[r.target];
+            const existing = staged !== undefined ? staged : (currentFm[r.target] ?? "");
+            const existingStr = existing === null || existing === undefined ? "" :
+                (typeof existing === "object" ? JSON.stringify(existing) : String(existing));
+
+            const spliced = this.applyPRAlignmentTemplate(r.template, {
+                guideline: r.guideline,
+                existing:  existingStr,
+                entries,
+                name:      r.name,
+            });
+            writes[r.target] = spliced;
+            writeOrder.push(r.target);
+        }
+
+        // 4. If any alignments need the LLM, bundle them into ONE call
+        let llmResult = null;
+        let systemPrompt = "";
+        let userMessage = "";
+        if (llmAlignments.length > 0) {
+            const service = this.getPRLLMService(group.llmServiceId);
+            if (!service || !service.model) {
+                if (!opts.silent) new Notice(`${group.name}: LLM service missing or has no model (needed for ${llmAlignments.length} alignment(s))`);
+                // Splice writes still land — the LLM ones are skipped.
+            } else {
+                // Load the group's own system prompt — unless system prompts
+                // are disabled globally or locally on this group. When off,
+                // the call runs with an empty system role.
+                const globalSPG = this.settings.prSystemPromptsGlobalEnabled !== false;
+                const useSPG = globalSPG && group.useSystemPrompt !== false;
+                if (useSPG && group.systemPromptFile) {
+                    try { systemPrompt = await this.loadTemplate(group.systemPromptFile); } catch (_) {}
+                }
+
+                // Build the source payload
+                const payload = await this.buildPRSourcePayload(container, range.start, range.end);
+
+                const parts = [
+                    "# Period",
+                    `start: ${formatDate(range.start)}`,
+                    `end: ${formatDate(range.end)}`,
+                    `source: ${payload.label || "daily notes"}`,
+                    `count: ${payload.count}`,
+                    "",
+                ];
+
+                if (group.includeAggregatedSummary !== false && file) {
+                    const cache = this.app.metadataCache.getFileCache(file);
+                    const aggregated = cache?.frontmatter || {};
+                    const lines = [];
+                    const prefix = (group.prefix || "alignment").trim();
+                    for (const [k, v] of Object.entries(aggregated)) {
+                        if (k === "periodic-ritual" || k === "position") continue;
+                        if (k.startsWith("pr-")) continue;
+                        if (k.startsWith(prefix + "_")) continue;  // skip previous gap results
+                        if (v === null || v === undefined) continue;
+                        if (typeof v === "object") lines.push(`${k}: ${JSON.stringify(v)}`);
+                        else lines.push(`${k}: ${v}`);
+                    }
+                    if (lines.length > 0) {
+                        parts.push("# Aggregated container summary", "", ...lines, "");
+                    }
+                }
+
+                parts.push(`# Guidelines (from ${sourceLabel} — ${sourceFile.path})`, "");
+                for (const r of llmAlignments) {
+                    parts.push(`- **${r.alignmentKey}** → return under key \`${r.target}\`: ${r.guideline}`);
+                }
+                parts.push("");
+
+                // Framework reinforcement — reads the markdown file at
+                // group.framework and injects its contents at the highest-
+                // attention slot right before the output instructions.
+                // Respects both the global Frameworks master and the local
+                // useFramework toggle.
+                const globalFWG = this.settings.prFrameworksGlobalEnabled !== false;
+                const useFWG = globalFWG && group.useFramework !== false && group.framework;
+                if (useFWG) {
+                    try {
+                        const fwText = await this.loadTemplate(group.framework);
+                        if (fwText && fwText.trim()) {
+                            parts.push("# Framework reinforcement", "");
+                            parts.push(fwText.trim());
+                            parts.push("");
+                        }
+                    } catch (_) { /* skip silently on read failure */ }
+                }
+
+                parts.push("# Instructions", "");
+                parts.push("Return a YAML block with exactly the keys listed below. Use the exact key names as given.");
+                parts.push("");
+                parts.push("**Isolation requirement — read carefully.** Treat each alignment as an INDEPENDENT analysis. Do not correlate, cross-reference, or merge concepts across alignments. Each alignment's value must reason ONLY about its own guideline and NO other. The reasoning, evidence, and framing for one alignment must not contaminate another. If a guideline asks about something that isn't present in the source activity below, say so explicitly rather than borrowing evidence from a neighboring dimension.");
+                parts.push("");
+                parts.push("**YAML formatting requirements:**");
+                parts.push("- Use plain, unquoted string values. Commas, semicolons, periods, and internal punctuation are fine as plain text.");
+                parts.push("- Do NOT place a colon followed by a space (`: `) inside an unquoted value — the parser will misread it as a new key. Rephrase instead.");
+                parts.push("- Do NOT start a value with `-`, `#`, `[`, or `{` unless you genuinely intend to produce a YAML list or map.");
+                parts.push("- Do NOT wrap values in quotes. Plain strings only.");
+                parts.push("- Do NOT return YAML document markers (`---`) around the block.");
+                parts.push("");
+                parts.push("Produce the value type indicated by each alignment's mode:");
+                parts.push("");
+                for (const r of llmAlignments) {
+                    if (r.mode === "separate") {
+                        parts.push(`- \`${r.target}\`: long-form narrative gap analysis comparing the actuals below against this guideline, and only this guideline — ${r.guideline}`);
+                    } else if (r.mode === "rewrite") {
+                        parts.push(`- \`${r.target}\`: a concise string (5-20 words) that captures how close the actuals below were to this guideline, and only this guideline — ${r.guideline}`);
+                    }
+                }
+                parts.push("");
+                parts.push(`# Source activity (${payload.label || "daily notes"})`, "", payload.text);
+
+                userMessage = parts.join("\n");
+
+                const provider = PROVIDERS[service.provider];
+                if (!provider) {
+                    if (!opts.silent) new Notice(`${group.name}: unknown provider "${service.provider}"`);
+                } else {
+                    try {
+                        if (!opts.silent) new Notice(`${group.name}: gap analysis via ${service.name}…`);
+                        const url = provider.buildUrl(service);
+                        const bodyJson = provider.buildBody(userMessage, service, systemPrompt);
+                        const headers = {
+                            "Content-Type": "application/json",
+                            ...(provider.headers ? provider.headers(service) : {}),
+                        };
+                        const r = await requestUrl({ url, method: "POST", headers, body: JSON.stringify(bodyJson), throw: false });
+                        const responseStatus = r.status;
+                        const responseRaw = r.text || "";
+                        this.recordPRLastLLMCall({
+                            timestamp: new Date().toISOString(),
+                            container: `${container.name} → ${group.name}`,
+                            service: service.name,
+                            provider: service.provider,
+                            model: service.model,
+                            url,
+                            requestHeaders: headers,
+                            requestBody: bodyJson,
+                            responseStatus,
+                            responseRaw,
+                            systemPrompt,
+                            userMessage,
+                        });
+                        if (r.status < 200 || r.status >= 300) {
+                            throw new Error(`${r.status}: ${(r.text || "").slice(0, 300)}`);
+                        }
+                        const responseText = provider.extractText(r.json);
+                        if (responseText) {
+                            const parsed = this.parsePRLLMResponse(responseText);
+                            llmResult = { parsed, responseText };
+                            // Stage the LLM-returned values into our writes map
+                            for (const r of llmAlignments) {
+                                if (parsed[r.target] !== undefined) {
+                                    writes[r.target] = parsed[r.target];
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        if (!opts.silent) new Notice(`${group.name}: LLM call failed — ${e.message}`);
+                        console.error("Periodic Ritual alignment-group error:", e);
+                    }
+                }
+            }
+        }
+
+        const writeKeys = Object.keys(writes);
+
+        // 5. Dry-run: return everything for preview, don't touch the file.
+        if (opts.dryRun) {
+            return {
+                parsed: writes,
+                writes,
+                resolved,
+                spliceAlignments,
+                llmAlignments,
+                guidelines,
+                systemPrompt,
+                userMessage,
+                sourceFile,
+                sourceLabel,
+                empty: writeKeys.length === 0,
+            };
+        }
+
+        // 6. Write all staged keys in one processFrontMatter call
+        if (!file || writeKeys.length === 0) return;
+        try {
+            await this.app.fileManager.processFrontMatter(file, fm => {
+                for (const k of writeKeys) fm[k] = writes[k];
+            });
+            if (!opts.silent) new Notice(`${group.name}: wrote ${writeKeys.length} alignment(s)`);
+        } catch (e) {
+            if (!opts.silent) new Notice(`${group.name}: failed to write frontmatter — ${e.message}`);
         }
     }
 
@@ -4492,7 +5246,7 @@ class MonthlyRitualPlugin extends Plugin {
             try {
                 const content = await this.app.vault.read(file);
                 for (const key of seenKeys) {
-                    const re = new RegExp(`(?:^|\\s)${escapeRegex(key)}::\\s*([^\\n]+)`, "m");
+                    const re = new RegExp(`^${escapeRegex(key)}::[ \\t]*([^\\n]+)`, "m");
                     const m = content.match(re);
                     if (m) {
                         const meta = this.parsePRMetadataBlob(m[1]);
@@ -4771,6 +5525,24 @@ class PRGraphView extends ItemView {
     getDisplayText() { return "Periodic Ritual Graph"; }
     getIcon() { return "git-fork"; }
 
+    // Shared color identity per node kind. Used everywhere the UI needs a
+    // minimal visual marker (pipes, dots, highlights) without showing the
+    // full node. Kept in sync with the CSS kind pill + header stripe colors.
+    colorForKind(kind) {
+        switch (kind) {
+            case "container":       return "var(--interactive-accent)";
+            case "boundary":        return "#4a90e2";
+            case "llm":             return "#5cb85c";
+            case "reflection":      return "#a06cd5";
+            case "alignment":       return "#f0a04b";
+            case "alignment-group": return "#e08a3c";
+            case "data-source":     return "#3db8a6";
+            case "show":            return "var(--text-muted)";
+            case "daily":           return "var(--text-faint)";
+            default:                return "var(--text-muted)";
+        }
+    }
+
     async onOpen() {
         this.render();
     }
@@ -4784,6 +5556,9 @@ class PRGraphView extends ItemView {
         const alignments = s.prAlignments || [];
         const services = s.prLLMServices || [];
         const customBoundaries = s.prCustomBoundaries || [];
+        const dataSources = s.prDataSources || [];
+        const alignmentGroups = s.prAlignmentGroups || [];
+        const showNodes = s.prShowNodes || [];
 
         const nodes = [];
         const wires = [];
@@ -4910,6 +5685,66 @@ class PRGraphView extends ItemView {
             });
         }
 
+        // ── Data source nodes (always shown — reusable note/folder refs) ──
+        for (const ds of dataSources) {
+            let subtitle;
+            if (ds.mode === "static") {
+                subtitle = ds.notePath ? ds.notePath.split("/").pop() : "(no note selected)";
+            } else {
+                subtitle = ds.folderPath ? `${ds.folderPath}/ (dynamic)` : "(no folder selected)";
+            }
+            nodes.push({
+                id: `datasource-${ds.id}`,
+                kind: "data-source",
+                title: ds.name || "(unnamed)",
+                subtitle,
+                primitive: ds,
+                primitiveTab: "data-sources",
+            });
+        }
+
+        // ── Alignment group nodes (always shown) ──
+        for (const g of alignmentGroups) {
+            const targetLabel = g.containerId
+                ? ((containers.find(c => c.id === g.containerId)?.name) || "(missing)")
+                : "(unattached)";
+            nodes.push({
+                id: `alignmentgroup-${g.id}`,
+                kind: "alignment-group",
+                title: g.name || "(unnamed)",
+                subtitle: `prefix: ${g.prefix || "?"} → ${targetLabel}`,
+                primitive: g,
+                primitiveTab: "alignments",
+            });
+        }
+
+        // ── Show-output probe nodes (graph-only, no settings tab) ──
+        for (const sh of showNodes) {
+            let subtitle = "(drag any output here)";
+            if (sh.sourceNodeId) {
+                // Resolve the source node's title for a clearer subtitle —
+                // "← Daily notes", "← Weekly", etc. Falls back to the raw
+                // id when the source no longer exists.
+                const src =
+                    containers.find(x => `container-${x.id}` === sh.sourceNodeId) ||
+                    reflections.find(x => `reflection-${x.id}` === sh.sourceNodeId) ||
+                    alignments.find(x => `alignment-${x.id}` === sh.sourceNodeId) ||
+                    services.find(x => `llm-${x.id}` === sh.sourceNodeId);
+                if (src) subtitle = `← ${src.name || "(unnamed)"}`;
+                else if (sh.sourceNodeId === "daily") subtitle = "← Daily notes";
+                else if (sh.sourceNodeId.startsWith("boundary-")) subtitle = `← ${sh.sourceNodeId.replace(/^boundary-(custom-)?/, "")}`;
+                else subtitle = "← (source missing)";
+            }
+            nodes.push({
+                id: `show-${sh.id}`,
+                kind: "show",
+                title: sh.name || "Show output",
+                subtitle,
+                primitive: sh,
+                primitiveTab: null,  // graph-only, no settings tab
+            });
+        }
+
         // ── Wires ──
 
         // dataSource wires — one per configured source so multi-source
@@ -4920,6 +5755,14 @@ class PRGraphView extends ItemView {
                 if (src.type === "container" && src.containerId) {
                     wires.push({
                         from: `container-${src.containerId}`,
+                        to: `container-${c.id}`,
+                        fromSocket: "out",
+                        toSocket: "in-data",
+                        kind: "data-source",
+                    });
+                } else if (src.type === "dataSource" && src.dataSourceId) {
+                    wires.push({
+                        from: `datasource-${src.dataSourceId}`,
                         to: `container-${c.id}`,
                         fromSocket: "out",
                         toSocket: "in-data",
@@ -4985,6 +5828,58 @@ class PRGraphView extends ItemView {
                 fromSocket: "out",
                 toSocket: "in-alignment",
                 kind: "alignment",
+            });
+        }
+
+        // alignment-group wires — three per group (source, llm, target)
+        for (const g of alignmentGroups) {
+            if (g.containerId) {
+                wires.push({
+                    from: `alignmentgroup-${g.id}`,
+                    to: `container-${g.containerId}`,
+                    fromSocket: "out",
+                    toSocket: "in-alignment",
+                    kind: "alignment",
+                });
+            }
+            if (g.sourceKind === "data-source" && g.sourceId) {
+                wires.push({
+                    from: `datasource-${g.sourceId}`,
+                    to: `alignmentgroup-${g.id}`,
+                    fromSocket: "out",
+                    toSocket: "in-source",
+                    kind: "data-source",
+                });
+            } else if (g.sourceKind === "container" && g.sourceId) {
+                wires.push({
+                    from: `container-${g.sourceId}`,
+                    to: `alignmentgroup-${g.id}`,
+                    fromSocket: "out",
+                    toSocket: "in-source",
+                    kind: "data-source",
+                });
+            }
+            if (g.llmServiceId) {
+                wires.push({
+                    from: `llm-${g.llmServiceId}`,
+                    to: `alignmentgroup-${g.id}`,
+                    fromSocket: "out",
+                    toSocket: "in-llm",
+                    kind: "llm",
+                });
+            }
+        }
+
+        // show-node probe wires — one per show node that has a live source
+        const nodeIds = new Set(nodes.map(n => n.id));
+        for (const sh of showNodes) {
+            if (!sh.sourceNodeId || !nodeIds.has(sh.sourceNodeId)) continue;
+            wires.push({
+                from: sh.sourceNodeId,
+                to: `show-${sh.id}`,
+                fromSocket: "out",
+                toSocket: "in-any",
+                kind: "show",
             });
         }
 
@@ -5077,18 +5972,21 @@ class PRGraphView extends ItemView {
     layoutNodes(nodes) {
         const COLS = {
             daily: 0,
+            "data-source": 0,
             boundary: 1,
             llm: 2,
             container: 3,
             reflection: 4,
             alignment: 5,
+            "alignment-group": 5,
+            show: 6,
         };
         const COL_X = 280;
         const ROW_Y = 140;
         const PAD_X = 60;
         const PAD_Y = 60;
 
-        const counters = { daily: 0, boundary: 0, llm: 0, container: 0, reflection: 0, alignment: 0 };
+        const counters = { daily: 0, "data-source": 0, boundary: 0, llm: 0, container: 0, reflection: 0, alignment: 0, "alignment-group": 0, show: 0 };
         const saved = this.plugin.settings.prGraphLayout || {};
 
         for (const node of nodes) {
@@ -5180,6 +6078,7 @@ class PRGraphView extends ItemView {
 
         // Pan/zoom + drag handlers (Phase 10a-2)
         this.setupPanZoom();
+        this.setupNodeResize();
         this.setupNodeDrag();
         // Wire drag + wire delete (Phase 10b-1)
         this.setupWireDrag();
@@ -5212,7 +6111,9 @@ class PRGraphView extends ItemView {
     nodeIsPrimitive(node) {
         return node.primitive && (
             node.kind === "container" || node.kind === "reflection" ||
-            node.kind === "alignment" || node.kind === "llm" ||
+            node.kind === "alignment" || node.kind === "alignment-group" ||
+            node.kind === "llm" ||
+            node.kind === "show" || node.kind === "data-source" ||
             (node.kind === "boundary" && node.id.startsWith("boundary-custom-"))
         );
     }
@@ -5224,11 +6125,14 @@ class PRGraphView extends ItemView {
             return "boundary";
         }
         return {
-            container:  "container",
-            reflection: "reflection",
-            alignment:  "alignment",
-            llm:        "llm service",
-            daily:      "source",
+            container:         "container",
+            reflection:        "reflection",
+            alignment:         "alignment",
+            "alignment-group": "alignment group",
+            llm:               "llm service",
+            daily:             "source",
+            show:              "show output",
+            "data-source":     "data source",
         }[node.kind] || node.kind;
     }
 
@@ -5242,15 +6146,35 @@ class PRGraphView extends ItemView {
         el.dataset.nodeId = node.id;
         node.el = el;
 
-        // Type badge — small label sitting just above the card so the user
-        // can read at a glance what kind of node this is.
-        const kindLabel = el.createEl("div", { cls: `pr-graph-node-kind pr-graph-node-kind-${node.kind}`, text: this.nodeKindLabel(node) });
+        // Apply saved manual size for the CURRENT state (collapsed or
+        // expanded). Each state has its own saved w/h, so chevron toggle
+        // swaps between two distinct sizes — a normalized collapsed size
+        // and a full expanded size that shows all options. When no size
+        // is saved for the current state, CSS defaults drive the layout
+        // (220×110 collapsed, 320×auto expanded).
+        const savedLayout = this.plugin.settings.prGraphLayout?.[node.id];
+        const stateKey = expanded ? "expanded" : "collapsed";
+        const stateSize = savedLayout?.[stateKey];
+        if (stateSize && typeof stateSize.w === "number") {
+            el.style.width = `${stateSize.w}px`;
+        }
+        if (stateSize && typeof stateSize.h === "number") {
+            el.style.height = `${stateSize.h}px`;
+            el.classList.add("pr-graph-node-sized");
+        }
 
-        // Header — title is editable for primitive nodes; chevron toggles
-        // the expanded body. Daily / built-in boundary nodes get a static
-        // span and no chevron (no body to expand).
+        // Header — chevron (if primitive), kind pill, title (editable for
+        // primitives). Daily / built-in boundary nodes get a static span and
+        // no chevron (no body to expand).
         const header = el.createEl("div", { cls: "pr-graph-node-header" });
         const isPrimitive = this.nodeIsPrimitive(node);
+
+        // Kind pill — visible inside the header so the user always knows at
+        // a glance what kind of node they're looking at.
+        header.createEl("span", {
+            cls: `pr-graph-node-kind-pill pr-graph-node-kind-${node.kind}`,
+            text: this.nodeKindLabel(node),
+        });
 
         if (isPrimitive) {
             const chev = header.createEl("span", { cls: "pr-graph-node-chev", text: expanded ? "▼" : "▶" });
@@ -5273,15 +6197,12 @@ class PRGraphView extends ItemView {
             header.createEl("span", { cls: "pr-graph-node-title", text: node.title });
         }
 
-        // Body — subtitle + widgets. Expanded nodes get the full editor
-        // (Phase 10c-2 fills in renderNodeExpandedBody).
+        // Body. Collapsed = just the title shown in the header above, nothing
+        // else. Expanded = full per-kind editor form.
         const body = el.createEl("div", { cls: "pr-graph-node-body" });
-        body.createEl("div", { cls: "pr-graph-node-subtitle", text: node.subtitle });
         if (expanded) {
             const expandedBody = body.createEl("div", { cls: "pr-graph-node-expanded-body" });
             this.renderNodeExpandedBody(expandedBody, node);
-        } else {
-            this.renderNodeWidgets(body, node);
         }
 
         // Sockets — input on left, output on right.
@@ -5305,18 +6226,47 @@ class PRGraphView extends ItemView {
             const outSocket = outputs.createEl("div", { cls: "pr-graph-socket pr-graph-socket-out pr-graph-socket-data-source" });
             outSocket.dataset.socketId = "out";
             outSocket.dataset.label = "feeds another container";
+        } else if (node.kind === "show") {
+            // Show-output probe: one universal input, no output (terminal).
+            const inputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-in" });
+            const socket = inputs.createEl("div", { cls: "pr-graph-socket pr-graph-socket-in pr-graph-socket-any" });
+            socket.dataset.socketId = "in-any";
+            socket.dataset.label = "any output";
+        } else if (node.kind === "alignment-group") {
+            const inputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-in" });
+            const inDefs = [
+                { id: "in-source", cls: "data-source", label: "guidelines source" },
+                { id: "in-llm",    cls: "llm",         label: "llm service" },
+            ];
+            for (const def of inDefs) {
+                const socket = inputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-in pr-graph-socket-${def.cls}` });
+                socket.dataset.socketId = def.id;
+                socket.dataset.label = def.label;
+            }
+            const outputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-out" });
+            const outSocket = outputs.createEl("div", { cls: "pr-graph-socket pr-graph-socket-out pr-graph-socket-alignment" });
+            outSocket.dataset.socketId = "out";
+            outSocket.dataset.label = "→ container in-alignment";
         } else {
             const outputs = el.createEl("div", { cls: "pr-graph-sockets pr-graph-sockets-out" });
-            const outSocket = outputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-out pr-graph-socket-${node.kind}` });
+            const socketClass = node.kind === "data-source" ? "data-source" : node.kind;
+            const outSocket = outputs.createEl("div", { cls: `pr-graph-socket pr-graph-socket-out pr-graph-socket-${socketClass}` });
             outSocket.dataset.socketId = "out";
             outSocket.dataset.label = {
-                daily:      "feeds containers",
-                boundary:   "boundary out",
-                llm:        "llm service out",
-                reflection: "reflection out",
-                alignment:  "alignment out",
+                daily:          "feeds containers",
+                "data-source":  "feeds containers",
+                boundary:       "boundary out",
+                llm:            "llm service out",
+                reflection:     "reflection out",
+                alignment:      "alignment out",
             }[node.kind] || node.kind;
         }
+
+        // Bottom-right resize grip — drag to set manual width/height, which
+        // persists in prGraphLayout. Double-click clears the override.
+        const grip = el.createEl("div", { cls: "pr-graph-node-resize" });
+        grip.dataset.resizeHandle = "1";
+        grip.title = "Drag to resize • double-click to reset";
     }
 
     // ─── Inline parameter widgets (Phase 10b-3) ───
@@ -5364,6 +6314,40 @@ class PRGraphView extends ItemView {
         if (node.kind === "container") {
             const c = node.primitive;
             addToggle("Enabled", () => c.enabled, (v) => { c.enabled = v; });
+
+            // Compact file picker for the core pipeline fields — template
+            // and system prompt. These are critical enough that the user
+            // should see and change them without expanding the node.
+            const addFilePickerRow = (label, getPath, setPath) => {
+                const row = body.createEl("div", { cls: "pr-graph-widget-row" });
+                row.createEl("span", { text: label, cls: "pr-graph-widget-label" });
+                const valueEl = row.createEl("span", { cls: "pr-graph-widget-picker-value" });
+                const cur = getPath();
+                valueEl.setText(cur ? cur.split("/").pop() : "(none)");
+                valueEl.title = cur || "";
+                const btn = row.createEl("button", { text: cur ? "Change" : "Choose", cls: "pr-graph-widget-picker-btn" });
+                stop(btn);
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        setPath(file.path);
+                        await this.plugin.saveSettings();
+                        this.render();
+                    }).open();
+                });
+                if (cur) {
+                    const clearBtn = row.createEl("button", { text: "×", cls: "pr-graph-widget-picker-btn" });
+                    stop(clearBtn);
+                    clearBtn.addEventListener("click", async (e) => {
+                        e.stopPropagation();
+                        setPath("");
+                        await this.plugin.saveSettings();
+                        this.render();
+                    });
+                }
+            };
+            addFilePickerRow("Template", () => c.template, (v) => { c.template = v; });
+            addFilePickerRow("System prompt", () => c.systemPromptFile, (v) => { c.systemPromptFile = v; });
         } else if (node.kind === "reflection") {
             const r = node.primitive;
             addToggle("Send to LLM", () => r.useLLM, (v) => { r.useLLM = v; });
@@ -5372,6 +6356,23 @@ class PRGraphView extends ItemView {
         } else if (node.kind === "alignment") {
             const a = node.primitive;
             addText("Field", "health", () => a.dataField, (v) => { a.dataField = v; });
+        } else if (node.kind === "show") {
+            const sh = node.primitive;
+            const row = body.createEl("div", { cls: "pr-graph-widget-row" });
+            const btn = row.createEl("button", { text: "Dry run", cls: "pr-graph-form-button mod-cta" });
+            stop(btn);
+            btn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                if (!sh.sourceNodeId) {
+                    new Notice("Connect a node's output to this show node first.");
+                    return;
+                }
+                await this.setNodeExpanded(node, true);
+                this.render();
+            });
+            const srcNode = sh.sourceNodeId ? this.nodes.find(n => n.id === sh.sourceNodeId) : null;
+            const sub = body.createEl("div", { cls: "pr-graph-widget-row" });
+            sub.createEl("span", { text: srcNode ? `← ${srcNode.title}` : "(no source)", cls: "pr-graph-widget-label" });
         }
         // LLM service and custom boundary nodes only get the editable name in
         // the header — model selection and script paths are too complex for
@@ -5459,13 +6460,20 @@ class PRGraphView extends ItemView {
         if (node.kind === "container") this.renderContainerExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
         else if (node.kind === "reflection") this.renderReflectionExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
         else if (node.kind === "alignment") this.renderAlignmentExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "alignment-group") this.renderAlignmentGroupExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
         else if (node.kind === "llm") this.renderLLMExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "show") this.renderShowExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
+        else if (node.kind === "data-source") this.renderDataSourceExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
         else if (node.kind === "boundary" && node.id.startsWith("boundary-custom-")) this.renderCustomBoundaryExpanded(body, node, { addRow, addLabeledText, addLabeledTextArea, addLabeledDropdown, addLabeledToggle, addPicker, addButton, stop, save, reRender });
     }
 
     renderContainerExpanded(body, node, h) {
         const c = node.primitive;
         const s = this.plugin.settings;
+
+        // Enabled toggle — at the top so it's the first thing the user
+        // sees. Also re-renders on change so the node subtitle updates.
+        h.addLabeledToggle("Enabled", () => c.enabled, (v) => { c.enabled = v; });
 
         // Boundary detector
         const detectors = this.plugin.getPRAvailableBoundaryDetectors();
@@ -5608,13 +6616,24 @@ class PRGraphView extends ItemView {
         );
 
         // System prompt picker
-        h.addPicker("Sys prompt", c.systemPromptFile, "(none)",
+        h.addPicker("System prompt", c.systemPromptFile, "(none)",
             () => new MarkdownFileSuggestModal(this.app, async (file) => {
                 c.systemPromptFile = file.path;
                 await this.plugin.saveSettings();
                 this.render();
             }).open(),
             async () => { c.systemPromptFile = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        // Framework picker — same pattern as system prompt: markdown file
+        // selected from the vault. Its contents get injected at runtime.
+        h.addPicker("Framework", c.framework, "(none)",
+            () => new MarkdownFileSuggestModal(this.app, async (file) => {
+                c.framework = file.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { c.framework = ""; await this.plugin.saveSettings(); this.render(); }
         );
 
         // Reflection
@@ -5972,6 +6991,832 @@ class PRGraphView extends ItemView {
         });
     }
 
+    // Alignment Group — prefix, system prompt, include-aggregated toggle,
+    // plus interactive pickers for target container / guidelines source /
+    // LLM service. All three can also be set by wiring in the graph; the
+    // pickers and the wires write to the same fields, so either path works.
+    renderAlignmentGroupExpanded(body, node, h) {
+        const g = node.primitive;
+        const s = this.plugin.settings;
+
+        h.addLabeledText("Name", "Life alignments",
+            () => g.name, (v) => { g.name = v; }
+        );
+        h.addLabeledText("Prefix", "alignment",
+            () => g.prefix, (v) => { g.prefix = v; }
+        );
+
+        // Target container picker — same field a wire to in-alignment sets.
+        const targetOpts = [{ value: "", label: "— None —" }];
+        for (const c of (s.prContainers || [])) {
+            targetOpts.push({ value: c.id, label: c.name || "(unnamed)" });
+        }
+        h.addLabeledDropdown("Target container", targetOpts,
+            () => g.containerId || "",
+            (v) => { g.containerId = v; }
+        );
+
+        // Guidelines source picker — lists both data sources and containers
+        // with a type prefix in the value so we can round-trip through the
+        // same dropdown. Same fields a wire into in-source sets.
+        const sourceOpts = [{ value: "", label: "— None —" }];
+        for (const ds of (s.prDataSources || [])) {
+            sourceOpts.push({
+                value: `data-source:${ds.id}`,
+                label: `${ds.name || "(unnamed)"} · data source (${ds.mode || "static"})`,
+            });
+        }
+        for (const c of (s.prContainers || [])) {
+            sourceOpts.push({
+                value: `container:${c.id}`,
+                label: `${c.name || "(unnamed)"} · container`,
+            });
+        }
+        const currentSourceKey = g.sourceKind && g.sourceId ? `${g.sourceKind}:${g.sourceId}` : "";
+        h.addLabeledDropdown("Guidelines source", sourceOpts,
+            () => currentSourceKey,
+            (v) => {
+                if (!v) { g.sourceKind = ""; g.sourceId = ""; }
+                else {
+                    const idx = v.indexOf(":");
+                    g.sourceKind = v.slice(0, idx);
+                    g.sourceId = v.slice(idx + 1);
+                }
+            }
+        );
+
+        // LLM service picker — same field a wire into in-llm sets.
+        const llmOpts = [{ value: "", label: "— None —" }];
+        for (const svc of (s.prLLMServices || [])) {
+            llmOpts.push({ value: svc.id, label: svc.name || "(unnamed)" });
+        }
+        h.addLabeledDropdown("LLM service", llmOpts,
+            () => g.llmServiceId || "",
+            (v) => { g.llmServiceId = v; }
+        );
+
+        // System prompt picker
+        h.addPicker("System prompt", g.systemPromptFile, "(none)",
+            () => new MarkdownFileSuggestModal(this.app, async (file) => {
+                g.systemPromptFile = file.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { g.systemPromptFile = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        // Framework picker (markdown file)
+        h.addPicker("Framework", g.framework, "(none)",
+            () => new MarkdownFileSuggestModal(this.app, async (file) => {
+                g.framework = file.path;
+                await this.plugin.saveSettings();
+                this.render();
+            }).open(),
+            async () => { g.framework = ""; await this.plugin.saveSettings(); this.render(); }
+        );
+
+        h.addLabeledToggle("Include aggregated summary",
+            () => g.includeAggregatedSummary !== false,
+            (v) => { g.includeAggregatedSummary = v; }
+        );
+
+        // Output shape defaults
+        h.addLabeledDropdown("Default mode",
+            [
+                { value: "separate", label: "separate (LLM narrative)" },
+                { value: "rewrite",  label: "rewrite (LLM concise)" },
+                { value: "prepend",  label: "prepend (splice, no LLM)" },
+            ],
+            () => g.defaultMode || "separate",
+            (v) => { g.defaultMode = v; }
+        );
+        h.addLabeledText("Default target", "{prefix}_{name}",
+            () => g.defaultTarget || "{prefix}_{name}",
+            (v) => { g.defaultTarget = v; }
+        );
+        const dm = g.defaultMode || "separate";
+        if (dm === "prepend") {
+            h.addLabeledText("Default template", "**{guideline}** — {entries}",
+                () => g.defaultTemplate || "",
+                (v) => { g.defaultTemplate = v; }
+            );
+        }
+
+        const hint = body.createEl("div", { cls: "pr-graph-form-preview" });
+        hint.setText(`Per-alignment overrides live in Settings → Alignment → this group's card. Source-note meta keys (alignment_health_mode / _target / _template) take highest priority.`);
+    }
+
+    // Data source primitive — mode (static/dynamic) + note or folder picker.
+    renderDataSourceExpanded(body, node, h) {
+        const ds = node.primitive;
+
+        h.addLabeledText("Name", "Life charter",
+            () => ds.name,
+            (v) => { ds.name = v; }
+        );
+
+        h.addLabeledDropdown(
+            "Mode",
+            [
+                { value: "static",  label: "Static (single note)" },
+                { value: "dynamic", label: "Dynamic (folder of notes)" },
+            ],
+            () => ds.mode || "static",
+            (v) => { ds.mode = v; }
+        );
+
+        if ((ds.mode || "static") === "static") {
+            h.addPicker("Note", ds.notePath, "(none)",
+                () => new MarkdownFileSuggestModal(this.app, async (file) => {
+                    ds.notePath = file.path;
+                    if (!ds.name || ds.name === "New data source") ds.name = file.basename;
+                    await this.plugin.saveSettings();
+                    this.render();
+                }).open(),
+                async () => { ds.notePath = ""; await this.plugin.saveSettings(); this.render(); }
+            );
+        } else {
+            h.addPicker("Folder", ds.folderPath, "(none)",
+                () => new FolderSuggestModal(this.app, async (folder) => {
+                    ds.folderPath = folder.path;
+                    if (!ds.name || ds.name === "New data source") ds.name = folder.name || folder.path;
+                    await this.plugin.saveSettings();
+                    this.render();
+                }).open(),
+                async () => { ds.folderPath = ""; await this.plugin.saveSettings(); this.render(); }
+            );
+            const hint = body.createEl("div", { cls: "pr-graph-form-preview" });
+            hint.setText("Container consumers filter this folder by their period (pr-start/end or mtime). Alignment groups read the single latest note.");
+        }
+    }
+
+    // Show-output probe node — dry run panel.
+    //
+    // The dry run walks the upstream node in `sh.sourceNodeId` and renders a
+    // compact snapshot of what would flow through the wire at runtime. This
+    // is inspection-only — no files are written, no LLM calls are made.
+    renderShowExpanded(body, node, h) {
+        const sh = node.primitive;
+
+        // Rename
+        h.addLabeledText("Name", "Show output",
+            () => sh.name,
+            (v) => { sh.name = v; }
+        );
+
+        // Current source
+        const srcNode = sh.sourceNodeId ? this.nodes.find(n => n.id === sh.sourceNodeId) : null;
+        const srcRow = h.addRow("Source");
+        const srcLabel = srcRow.createEl("div", { cls: "pr-graph-form-picker-value" });
+        srcLabel.setText(srcNode ? `${srcNode.title} (${srcNode.kind})` : "(drag any output here)");
+
+        // Result panel — grows with content so the show node expands to fit
+        // whatever the dry run produces. No max-height so the node itself
+        // resizes rather than scrolling inside a fixed window.
+        const resultWrap = body.createEl("div", { cls: "pr-graph-form-row" });
+        resultWrap.createEl("div", { cls: "pr-graph-form-label", text: "Dry run result" });
+        const resultEl = resultWrap.createEl("div", { cls: "pr-graph-show-result" });
+        resultEl.style.cssText = "background: var(--background-secondary); border-radius: 6px; padding: 8px 12px; font-family: var(--font-monospace); font-size: 0.78em; user-select: text; -webkit-user-select: text; cursor: text;";
+        // Block mousedown bubbling so the user can select text in the result
+        // without starting a node drag. Also block wheel so the canvas
+        // pan/zoom doesn't steal scroll events from the scrollable children
+        // (long source payloads, system prompts, etc.) inside the result.
+        resultEl.addEventListener("mousedown", (e) => e.stopPropagation());
+        resultEl.addEventListener("wheel", (e) => e.stopPropagation(), { passive: true });
+        const placeholder = () => {
+            resultEl.empty();
+            resultEl.createEl("div", { text: srcNode ? "Click Dry run to probe." : "Connect a source first." }).style.color = "var(--text-faint)";
+        };
+        placeholder();
+
+        // Dry run button
+        h.addButton("Dry run", async () => {
+            if (!sh.sourceNodeId) { new Notice("No source connected"); return; }
+            const live = this.nodes.find(n => n.id === sh.sourceNodeId);
+            if (!live) { new Notice("Source node no longer exists"); return; }
+            resultEl.empty();
+
+            // Indeterminate progress bar while the probe runs. Shown during
+            // source-payload builds, file reads, and any LLM pings that may
+            // take a moment.
+            const loading = resultEl.createEl("div", { cls: "pr-graph-show-loading" });
+            loading.createEl("div", { cls: "pr-graph-progress-bar" });
+
+            try {
+                await this.runDryRunInto(resultEl, live);
+            } catch (e) {
+                resultEl.empty();
+                const err = resultEl.createEl("div", { text: `Error: ${e.message}` });
+                err.style.color = "var(--text-error, #e26a6a)";
+            }
+            // Auto-grow the show node to fit the fresh result. If the user
+            // had previously resize-locked the expanded height too small,
+            // drop that lock so the node expands around the new content.
+            // Width is preserved.
+            const layout = this.plugin.settings.prGraphLayout?.[node.id];
+            if (layout && layout.expanded && typeof layout.expanded.h === "number") {
+                delete layout.expanded.h;
+                await this.plugin.saveSettings();
+            }
+            if (node.el) {
+                node.el.style.height = "";
+                node.el.classList.remove("pr-graph-node-sized");
+            }
+            // Wires need to re-draw because the node just grew.
+            this.renderWires();
+        }, { cta: true });
+
+        if (srcNode) {
+            h.addButton("Disconnect source", async () => {
+                sh.sourceNodeId = "";
+                await this.plugin.saveSettings();
+                this.render();
+            });
+        }
+    }
+
+    // Probe an upstream node and render a compact "what would flow through
+    // this wire" snapshot into `el`. Purely read-only — mirrors what the
+    // runtime pipeline would see, but renders it inline in the show node.
+    //
+    // Output is split into two labeled bands per source kind: "▼ INPUT"
+    // (what the node receives / reads) and "▲ OUTPUT" (what it produces /
+    // writes), so the user can see both sides of the node at once.
+    async runDryRunInto(el, sourceNode) {
+        el.empty();
+
+        // Persistent progress bar at the top of the result panel. Stays
+        // visible through the entire async run (payload builds, LLM calls,
+        // structured rendering) and is removed in the finally block below
+        // so the user has continuous feedback while anything is in flight.
+        const progressWrap = el.createEl("div", { cls: "pr-graph-show-loading" });
+        progressWrap.style.cssText = "margin-bottom: 8px;";
+        progressWrap.createEl("div", { cls: "pr-graph-progress-bar" });
+
+        try {
+            return await this._runDryRunIntoInner(el, sourceNode);
+        } finally {
+            progressWrap.remove();
+        }
+    }
+
+    async _runDryRunIntoInner(el, sourceNode) {
+        const section = (label) => {
+            const h = el.createEl("div", { text: label });
+            h.style.cssText = "color: var(--text-muted); font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.05em; margin: 8px 0 2px 0;";
+            return h;
+        };
+        const band = (label) => {
+            const b = el.createEl("div", { text: label });
+            b.style.cssText = "color: var(--interactive-accent); font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; margin: 10px 0 4px 0; padding-top: 6px; border-top: 1px solid var(--background-modifier-border);";
+            return b;
+        };
+        const kv = (obj, filter) => {
+            const block = el.createEl("div");
+            block.style.cssText = "padding: 2px 0;";
+            let any = false;
+            for (const [k, v] of Object.entries(obj || {})) {
+                if (filter && !filter(k, v)) continue;
+                any = true;
+                const row = block.createEl("div");
+                const keyEl = row.createEl("span", { text: `${k}: ` });
+                keyEl.style.color = "var(--interactive-accent)";
+                const valStr = (v === null || v === undefined) ? "" : (typeof v === "object" ? JSON.stringify(v) : String(v));
+                row.createEl("span", { text: valStr });
+            }
+            if (!any) {
+                const empty = block.createEl("div", { text: "(empty)" });
+                empty.style.color = "var(--text-faint)";
+            }
+        };
+        const line = (text, muted = false) => {
+            const d = el.createEl("div", { text });
+            if (muted) d.style.color = "var(--text-muted)";
+            return d;
+        };
+
+        const plugin = this.plugin;
+        const app = this.app;
+
+        // ─ Header: which wire type this would travel on ─
+        const wireType = this.nodeOutputType(sourceNode.kind) || "(unknown)";
+        const hdr = el.createEl("div");
+        hdr.style.cssText = "font-size: 0.8em; color: var(--text-muted); margin-bottom: 6px;";
+        hdr.setText(`← ${sourceNode.title} • wire: ${wireType}`);
+
+        if (sourceNode.kind === "daily") {
+            band("▼ INPUT");
+            section("Daily folder");
+            line(plugin.settings.dailyNotesFolder || "(vault root)");
+            section("Scan window");
+            const today = new Date();
+            const twoWeeksAgo = new Date(today);
+            twoWeeksAgo.setDate(today.getDate() - 14);
+            line(`${formatDate(twoWeeksAgo)} → ${formatDate(today)} (last 14 days)`);
+
+            band("▲ OUTPUT");
+            const notes = plugin.findDailyNotesInRange(twoWeeksAgo, today) || [];
+            section(`Matched files (${notes.length})`);
+            if (notes.length === 0) { line("(none found)", true); return; }
+            for (const n of notes.slice(0, 20)) {
+                line(`• ${n.path || n.basename || String(n)}`);
+            }
+            if (notes.length > 20) line(`…and ${notes.length - 20} more`, true);
+
+            section("Fields extracted");
+            const pre = el.createEl("pre");
+            pre.style.cssText = "white-space: pre-wrap; margin: 2px 0; padding: 6px 8px; background: var(--background-primary); border-radius: 4px; max-height: 200px; overflow: auto;";
+            const lines = [];
+            for (const f of notes.slice(0, 6)) {
+                lines.push(`## ${f.basename}`);
+                const fm = app.metadataCache.getFileCache(f)?.frontmatter || {};
+                for (const [k, v] of Object.entries(fm)) {
+                    if (k === "position" || k === "periodic-ritual") continue;
+                    if (v === null || v === undefined || typeof v === "object") continue;
+                    lines.push(`${k}: ${v}`);
+                }
+                lines.push("");
+            }
+            pre.setText(lines.join("\n") || "(no extractable fields)");
+            return;
+        }
+
+        if (sourceNode.kind === "boundary") {
+            const id = sourceNode.refKey || sourceNode.id.replace(/^boundary-/, "").replace(/^custom-/, "custom:");
+            band("▼ INPUT");
+            section("Detector");
+            line(id);
+            section("Reference date");
+            line(formatDate(new Date()));
+
+            band("▲ OUTPUT");
+            try {
+                const data = await plugin.getPRBoundaryData(id, new Date());
+                section("Period");
+                line(`${formatDate(data.start)} → ${formatDate(data.end)}`);
+                section("Tokens");
+                kv(data.tokens);
+            } catch (e) {
+                const err = el.createEl("div", { text: `Could not resolve: ${e.message}` });
+                err.style.color = "var(--text-error, #e26a6a)";
+            }
+            return;
+        }
+
+        if (sourceNode.kind === "llm") {
+            const svc = sourceNode.primitive;
+            band("▼ INPUT");
+            section("Service name");
+            line(svc.name || "(unnamed)");
+            band("▲ OUTPUT");
+            section("Resolved config (sent with every call)");
+            kv({
+                provider: svc.provider,
+                model: svc.model || "(none)",
+                baseUrl: svc.baseUrl || "(default)",
+                "API key": svc.apiKey ? `set (${svc.apiKey.length} chars)` : "(not set)",
+            });
+            const containersUsing = (plugin.settings.prContainers || []).filter(c => c.llmServiceId === svc.id);
+            section(`Used by ${containersUsing.length} container(s)`);
+            if (containersUsing.length === 0) line("(none)", true);
+            for (const c of containersUsing) line(`• ${c.name || "(unnamed)"}`);
+            return;
+        }
+
+        if (sourceNode.kind === "reflection") {
+            const r = sourceNode.primitive;
+
+            band("▼ INPUT");
+            section("Mode");
+            const flags = [];
+            if (r.useLLM) flags.push("Send answers to LLM");
+            if (r.replaceAutoLLM) flags.push("Replace auto-LLM");
+            if (r.includeAlignmentContext) flags.push("Include alignment outputs");
+            line(flags.length > 0 ? flags.join(" • ") : "Pure Q&A (no LLM)");
+            if (r.promptPrepend) {
+                section("Prompt prepend (layered over container system prompt)");
+                const pre = el.createEl("pre");
+                pre.style.cssText = "white-space: pre-wrap; margin: 2px 0; padding: 4px 6px; background: var(--background-primary); border-radius: 4px;";
+                pre.setText(r.promptPrepend);
+            }
+            section(`Questions asked (${(r.questions || []).length})`);
+            for (const q of (r.questions || [])) {
+                const row = el.createEl("div");
+                row.setText(`• ${q.text || "(empty)"}`);
+            }
+
+            band("▲ OUTPUT");
+            // Questions that write to frontmatter
+            const outs = (r.questions || []).filter(q => q.outputToField && q.outputFieldName);
+            section("Frontmatter writes");
+            if (outs.length === 0) line("(none)", true);
+            for (const q of outs) line(`• ${q.outputFieldName}  ← answer to: ${q.text || "(empty)"}`);
+            // Variables injected back into the LLM prompt
+            const injects = (r.questions || []).filter(q => q.injectVar && q.varField);
+            section("LLM variable injections");
+            if (injects.length === 0) line("(none)", true);
+            for (const q of injects) line(`• {{${q.varField}}}  ← answer to: ${q.text || "(empty)"}`);
+            // Containers referencing this reflection — tells the user where
+            // the output actually lands.
+            const usedBy = (plugin.settings.prContainers || []).filter(c => c.reflectionId === r.id);
+            section(`Attached to ${usedBy.length} container(s)`);
+            if (usedBy.length === 0) line("(none)", true);
+            for (const c of usedBy) line(`• ${c.name || "(unnamed)"}`);
+            return;
+        }
+
+        if (sourceNode.kind === "alignment") {
+            const a = sourceNode.primitive;
+            const target = (plugin.settings.prContainers || []).find(c => c.id === a.containerId);
+            const outKey = (a.outputField || "").trim() || `alignment_${(a.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+
+            band("▼ INPUT");
+            section("Attached container");
+            line(target ? target.name : "(unattached)", !target);
+            section("Reads field");
+            line(`${a.dataField || "(none)"} (${a.dataFieldType || "inline"})`);
+            if (target) {
+                section("Live value (from most recent note)");
+                const file = await plugin.findMostRecentPRContainerNote(target);
+                if (!file) {
+                    line("(no generated note yet)", true);
+                } else {
+                    const fm = app.metadataCache.getFileCache(file)?.frontmatter || {};
+                    const v = fm[a.dataField];
+                    if (v === undefined) line("(field not present)", true);
+                    else line(String(v));
+                }
+            }
+            if (a.description) {
+                section("System prompt");
+                const pre = el.createEl("pre");
+                pre.style.cssText = "white-space: pre-wrap; margin: 2px 0; padding: 4px 6px; background: var(--background-primary); border-radius: 4px;";
+                pre.setText(a.description);
+            }
+
+            band("▲ OUTPUT");
+            section("Writes to");
+            line(`${outKey} on ${target?.name || "(unattached)"}`);
+            if (target) {
+                section("Last written value");
+                const file = await plugin.findMostRecentPRContainerNote(target);
+                if (!file) {
+                    line("(no generated note yet)", true);
+                } else {
+                    const fm = app.metadataCache.getFileCache(file)?.frontmatter || {};
+                    const v = fm[outKey];
+                    if (v === undefined) line("(not yet written)", true);
+                    else line(String(v));
+                }
+            }
+            return;
+        }
+
+        if (sourceNode.kind === "alignment-group") {
+            const g = sourceNode.primitive;
+            const s = plugin.settings;
+
+            band("▼ INPUT");
+            section("Prefix");
+            line(g.prefix || "alignment");
+
+            section("Guidelines source");
+            let sourceFile = null;
+            if (g.sourceKind === "data-source" && g.sourceId) {
+                const ds = (s.prDataSources || []).find(x => x.id === g.sourceId);
+                if (ds) {
+                    line(`${ds.name} (${ds.mode})`);
+                    sourceFile = plugin.resolveDataSourceLatest(ds);
+                } else line("(missing data source)", true);
+            } else if (g.sourceKind === "container" && g.sourceId) {
+                const sc = (s.prContainers || []).find(x => x.id === g.sourceId);
+                if (sc) {
+                    line(`${sc.name} (container)`);
+                    sourceFile = await plugin.findMostRecentPRContainerNote(sc);
+                } else line("(missing container)", true);
+            } else {
+                line("(not wired)", true);
+            }
+
+            let guidelines = {};
+            let resolvedRows = [];
+            if (sourceFile) {
+                section("Latest source note");
+                line(sourceFile.path);
+                // Use the shared resolver so the preview matches runtime
+                const src = await plugin.resolvePRAlignmentGroupSource(g);
+                if (src) {
+                    guidelines = src.guidelines || {};
+                    for (const k of Object.keys(guidelines)) {
+                        const cfg = plugin.resolvePRAlignmentConfig(g, k, src.sourceFm, src.sourceInline);
+                        resolvedRows.push({ ...cfg, guideline: guidelines[k] });
+                    }
+                }
+                section(`Auto-discovered guidelines (${Object.keys(guidelines).length})`);
+                if (Object.keys(guidelines).length === 0) line(`(no ${g.prefix || "alignment"}_* fields)`, true);
+                else {
+                    for (const r of resolvedRows) {
+                        const row = el.createEl("div");
+                        row.style.cssText = "padding: 4px 0; border-bottom: 1px dashed var(--background-modifier-border);";
+                        const hdr = row.createEl("div");
+                        const keyEl = hdr.createEl("span", { text: r.alignmentKey });
+                        keyEl.style.cssText = "color: var(--interactive-accent); font-weight: 600;";
+                        const modeBadge = hdr.createEl("span", { text: r.mode });
+                        modeBadge.style.cssText = "margin-left: 8px; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em; background: var(--text-muted); color: var(--background-primary);";
+                        const targetBadge = hdr.createEl("span", { text: `→ ${r.target}` });
+                        targetBadge.style.cssText = "margin-left: 6px; font-size: 0.75em; color: var(--text-faint); font-family: var(--font-monospace);";
+                        const guide = row.createEl("div", { text: r.guideline });
+                        guide.style.cssText = "margin-top: 2px; font-size: 0.85em; color: var(--text-normal);";
+                    }
+                }
+            }
+
+            section("Target container");
+            const target = (s.prContainers || []).find(c => c.id === g.containerId);
+            line(target ? target.name : "(not wired)", !target);
+
+            section("LLM service");
+            const svc = (s.prLLMServices || []).find(x => x.id === g.llmServiceId);
+            line(svc ? `${svc.name} — ${svc.provider}${svc.model ? " / " + svc.model : ""}` : "(not wired)", !svc);
+
+            section("System prompt");
+            if (g.systemPromptFile) {
+                line(g.systemPromptFile, true);
+                try {
+                    const sp = await plugin.loadTemplate(g.systemPromptFile);
+                    const pre = el.createEl("pre");
+                    pre.style.cssText = "white-space: pre-wrap; margin: 4px 0; padding: 6px 8px; background: var(--background-primary); border-radius: 4px; max-height: 180px; overflow: auto;";
+                    pre.setText(sp);
+                } catch (_) {}
+            } else line("(none)", true);
+
+            band("▲ OUTPUT");
+            if (target && sourceFile && Object.keys(guidelines).length > 0) {
+                section("Dry run — what would be written");
+                const spliceCount = resolvedRows.filter(r => r.mode === "prepend").length;
+                const llmCount    = resolvedRows.filter(r => r.mode === "separate" || r.mode === "rewrite").length;
+                line(`${spliceCount} splice write(s), ${llmCount} LLM write(s)${llmCount > 0 && !svc ? " — LLM service NOT wired, LLM alignments will be skipped" : ""}`, true);
+                try {
+                    const targetFile = await plugin.findMostRecentPRContainerNote(target);
+                    const targetData = await plugin.getPRBoundaryData(target.boundaryDetector, new Date());
+                    const result = await plugin.runPRAlignmentGroupPass(g, target, targetFile || null, { start: targetData.start, end: targetData.end }, { dryRun: true, silent: true });
+                    if (!result) {
+                        line("(dry run returned nothing — check console)", true);
+                    } else {
+                        const writes = result.writes || {};
+                        const existing = targetFile ? (app.metadataCache.getFileCache(targetFile)?.frontmatter || {}) : {};
+                        const keys = Object.keys(writes);
+                        if (keys.length === 0) {
+                            line("(nothing would be written)", true);
+                        } else {
+                            line(`${keys.length} key(s) would be written:`, true);
+                            const block = el.createEl("div");
+                            block.style.cssText = "background: var(--background-primary); border-radius: 4px; padding: 6px 8px; margin-top: 4px;";
+                            for (const k of keys) {
+                                const row = block.createEl("div");
+                                row.style.cssText = "padding: 4px 0; border-bottom: 1px dashed var(--background-modifier-border);";
+                                const hdr = row.createEl("div");
+                                const keyEl = hdr.createEl("span", { text: k });
+                                keyEl.style.cssText = "color: var(--interactive-accent); font-weight: 600;";
+                                const existed = Object.prototype.hasOwnProperty.call(existing, k);
+                                const badge = hdr.createEl("span");
+                                badge.style.cssText = "margin-left: 8px; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em;";
+                                if (existed) {
+                                    badge.setText("overwrites");
+                                    badge.style.background = "#f0a04b";
+                                    badge.style.color = "#000";
+                                } else {
+                                    badge.setText("new");
+                                    badge.style.background = "var(--interactive-accent)";
+                                    badge.style.color = "var(--text-on-accent, #fff)";
+                                }
+                                const val = row.createEl("div", { text: String(writes[k] ?? "") });
+                                val.style.cssText = "margin-top: 2px; color: var(--text-normal); white-space: pre-wrap; font-size: 0.85em;";
+                                if (existed) {
+                                    const prev = existing[k];
+                                    const prevStr = prev === null || prev === undefined ? "(empty)" : (typeof prev === "object" ? JSON.stringify(prev) : String(prev));
+                                    const was = row.createEl("div", { text: `was: ${prevStr}` });
+                                    was.style.cssText = "margin-top: 2px; color: var(--text-faint); font-size: 0.75em; font-style: italic;";
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    const err = el.createEl("div", { text: `Error: ${e.message}` });
+                    err.style.color = "var(--text-error, #e26a6a)";
+                }
+            } else {
+                line("(wire target + source to enable live run; LLM service needed only for separate/rewrite modes)", true);
+            }
+            return;
+        }
+
+        if (sourceNode.kind === "container") {
+            const c = sourceNode.primitive;
+
+            // Shared: resolve the current period up front — both sides need it.
+            let data = null;
+            try {
+                data = await plugin.getPRBoundaryData(c.boundaryDetector, new Date());
+            } catch (e) {
+                const err = el.createEl("div", { text: `Could not resolve boundary: ${e.message}` });
+                err.style.color = "var(--text-error, #e26a6a)";
+            }
+
+            // ═════════ INPUT ═════════
+            band("▼ INPUT");
+
+            section("Current period");
+            if (data) line(`${formatDate(data.start)} → ${formatDate(data.end)}`);
+            else line("(unresolved)", true);
+
+            if (data) {
+                section("Period tokens");
+                kv(data.tokens);
+            }
+
+            section("Data sources");
+            const srcs = getContainerDataSources(c);
+            if (srcs.length === 0) {
+                line("(none configured)", true);
+            } else {
+                for (const src of srcs) {
+                    if (src.type === "daily") line("• Daily notes");
+                    else if (src.type === "container") {
+                        const t = (plugin.settings.prContainers || []).find(x => x.id === src.containerId);
+                        line(`• ${t?.name || "(missing)"} (container)`);
+                    }
+                }
+            }
+
+            // Resolved source payload — what the LLM actually sees.
+            if (data) {
+                section("Resolved source payload");
+                try {
+                    const payload = await plugin.buildPRSourcePayload(c, data.start, data.end);
+                    line(`${payload.count} ${payload.label}`, true);
+                    const pre = el.createEl("pre");
+                    pre.style.cssText = "white-space: pre-wrap; margin: 4px 0; padding: 6px 8px; background: var(--background-primary); border-radius: 4px; max-height: 220px; overflow: auto;";
+                    pre.setText(payload.text || "(empty)");
+                } catch (e) {
+                    const err = el.createEl("div", { text: `Could not build payload: ${e.message}` });
+                    err.style.color = "var(--text-error, #e26a6a)";
+                }
+            }
+
+            section("System Prompt");
+            if (!c.systemPromptFile) {
+                line("(none — auto-LLM aggregation will be skipped)", true);
+            } else {
+                const spFile = app.vault.getAbstractFileByPath(c.systemPromptFile);
+                if (!spFile) {
+                    line(`(missing: ${c.systemPromptFile})`, true);
+                } else {
+                    line(c.systemPromptFile, true);
+                    try {
+                        // Show the file raw — runtime does not resolve {{...}}
+                        // tokens in the system prompt, so neither does the
+                        // preview. Period metadata is delivered via the user
+                        // message instead (see "# Period" header below).
+                        const sp = await plugin.loadTemplate(c.systemPromptFile);
+                        const pre = el.createEl("pre");
+                        pre.style.cssText = "white-space: pre-wrap; margin: 4px 0; padding: 6px 8px; background: var(--background-primary); border-radius: 4px; max-height: 180px; overflow: auto;";
+                        pre.setText(sp);
+                    } catch (e) { /* ignore */ }
+                }
+            }
+
+            section("LLM service");
+            const svc = c.llmServiceId ? (plugin.settings.prLLMServices || []).find(s => s.id === c.llmServiceId) : null;
+            if (!svc) line("(none attached)", true);
+            else line(`${svc.name} — ${svc.provider}${svc.model ? " / " + svc.model : ""}`);
+
+            // ═════════ OUTPUT ═════════
+            band("▲ OUTPUT");
+
+            section("Resolved file path");
+            if (!c.naming) {
+                line("(no naming convention set)", true);
+            } else if (data) {
+                const fileName = plugin.resolveTokens(c.naming, data.tokens);
+                const folderPath = c.saveDir || "";
+                const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
+                const existing = app.vault.getAbstractFileByPath(filePath);
+                line(`${filePath}${existing ? "  (exists)" : "  (would be created)"}`);
+            }
+
+            const refl = c.reflectionId ? (plugin.settings.prReflections || []).find(r => r.id === c.reflectionId) : null;
+            if (refl) {
+                section("Reflection attached");
+                const flags = [];
+                if (refl.useLLM) flags.push("LLM");
+                if (refl.replaceAutoLLM) flags.push("replace auto-LLM");
+                if (refl.includeAlignmentContext) flags.push("incl. alignments");
+                line(`${refl.name}${flags.length ? " (" + flags.join(", ") + ")" : ""}`);
+                line(`${(refl.questions || []).length} question(s)`, true);
+            }
+
+            const als = (plugin.settings.prAlignments || []).filter(a => a.containerId === c.id);
+            if (als.length > 0) {
+                section(`Alignments (${als.length})`);
+                for (const a of als) {
+                    const outKey = (a.outputField || "").trim() || `alignment_${(a.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+                    line(`• ${a.name} — reads ${a.dataField || "(no field)"} → ${outKey}`);
+                }
+            }
+
+            section("Most recent generated note");
+            const file = await plugin.findMostRecentPRContainerNote(c);
+            if (file) {
+                line(file.path);
+                section("Existing frontmatter");
+                const fm = app.metadataCache.getFileCache(file)?.frontmatter || {};
+                kv(fm, (k) => k !== "position" && k !== "periodic-ritual" && !k.startsWith("pr-"));
+            } else {
+                line("(none generated yet)", true);
+            }
+
+            // ─ Alignment groups attached to this container ─
+            const attachedGroups = (plugin.settings.prAlignmentGroups || []).filter(g => g.containerId === c.id);
+            if (attachedGroups.length > 0) {
+                section(`Alignment groups (${attachedGroups.length})`);
+                for (const g of attachedGroups) {
+                    line(`• ${g.name} — prefix ${g.prefix || "alignment"}`);
+                }
+            }
+
+            // ─ Live LLM dry run ─
+            // Actually call the LLM with the resolved system prompt + user
+            // message, parse the response, and show exactly which frontmatter
+            // keys would be written and how they'd interact with what's
+            // already on the note. Skipped when the container lacks a service
+            // or a prompt file.
+            if (c.llmServiceId && c.systemPromptFile && data) {
+                section("Live LLM call (dry run)");
+                line("Calling the LLM with the inputs above…", true);
+                try {
+                    const result = await plugin.runPRLLMAggregation(c, file || null, {
+                        start: data.start, end: data.end,
+                    }, { dryRun: true, silent: true });
+
+                    if (!result) {
+                        line("(call failed — check console / last-LLM-call debug modal)", true);
+                    } else if (result.empty) {
+                        line("(LLM returned empty or unparseable YAML)", true);
+                        if (result.responseText) {
+                            const pre = el.createEl("pre");
+                            pre.style.cssText = "white-space: pre-wrap; margin: 4px 0; padding: 6px 8px; background: var(--background-primary); border-radius: 4px; max-height: 180px; overflow: auto;";
+                            pre.setText(result.responseText);
+                        }
+                    } else {
+                        const parsed = result.parsed || {};
+                        const existing = file ? (app.metadataCache.getFileCache(file)?.frontmatter || {}) : {};
+                        const keys = Object.keys(parsed);
+                        line(`${keys.length} key(s) would be written:`, true);
+                        const block = el.createEl("div");
+                        block.style.cssText = "background: var(--background-primary); border-radius: 4px; padding: 6px 8px; margin-top: 4px;";
+                        for (const k of keys) {
+                            const row = block.createEl("div");
+                            row.style.cssText = "padding: 4px 0; border-bottom: 1px dashed var(--background-modifier-border);";
+                            const header = row.createEl("div");
+                            const keyEl = header.createEl("span", { text: k });
+                            keyEl.style.cssText = "color: var(--interactive-accent); font-weight: 600;";
+                            // Badge: new vs overwrite (empty → overwrite, present → overwrite, absent → new)
+                            const existed = Object.prototype.hasOwnProperty.call(existing, k);
+                            const badge = header.createEl("span");
+                            badge.style.cssText = "margin-left: 8px; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em;";
+                            if (existed) {
+                                badge.setText("overwrites");
+                                badge.style.background = "#f0a04b";
+                                badge.style.color = "#000";
+                            } else {
+                                badge.setText("new");
+                                badge.style.background = "var(--interactive-accent)";
+                                badge.style.color = "var(--text-on-accent, #fff)";
+                            }
+                            const v = parsed[k];
+                            const valStr = v === null || v === undefined ? "" : (typeof v === "object" ? JSON.stringify(v, null, 2) : String(v));
+                            const val = row.createEl("div", { text: valStr });
+                            val.style.cssText = "margin-top: 2px; color: var(--text-normal); white-space: pre-wrap; font-size: 0.85em;";
+                            if (existed) {
+                                const prev = existing[k];
+                                const prevStr = prev === null || prev === undefined ? "(empty)" : (typeof prev === "object" ? JSON.stringify(prev) : String(prev));
+                                const was = row.createEl("div", { text: `was: ${prevStr}` });
+                                was.style.cssText = "margin-top: 2px; color: var(--text-faint); font-size: 0.75em; font-style: italic;";
+                            }
+                        }
+                    }
+                } catch (e) {
+                    const err = el.createEl("div", { text: `LLM call error: ${e.message}` });
+                    err.style.color = "var(--text-error, #e26a6a)";
+                }
+            }
+            return;
+        }
+
+        line("(no probe available for this node kind)", true);
+    }
+
     // Compute the screen position of a socket within the viewport's
     // coordinate system (NOT the document — viewport coords).
     socketPos(nodeId, socketId) {
@@ -6197,12 +8042,15 @@ class PRGraphView extends ItemView {
 
         // Kind checkboxes
         const KINDS = [
-            { id: "container",  label: "Containers" },
-            { id: "boundary",   label: "Boundaries" },
-            { id: "llm",        label: "LLM Services" },
-            { id: "reflection", label: "Reflections" },
-            { id: "alignment",  label: "Alignments" },
-            { id: "daily",      label: "Daily source" },
+            { id: "container",        label: "Containers" },
+            { id: "boundary",         label: "Boundaries" },
+            { id: "llm",              label: "LLM Services" },
+            { id: "reflection",       label: "Reflections" },
+            { id: "alignment",        label: "Alignment" },
+            { id: "alignment-group",  label: "Alignment groups" },
+            { id: "daily",            label: "Daily source" },
+            { id: "data-source",      label: "Data sources" },
+            { id: "show",             label: "Show output probes" },
         ];
         const kindWrap = menu.createEl("div", { cls: "pr-graph-filter-section" });
         kindWrap.createEl("div", { text: "Show kinds", cls: "pr-graph-filter-section-label" });
@@ -6278,6 +8126,8 @@ class PRGraphView extends ItemView {
         const onDblClick = (e) => {
             // Sockets reserved for wire drag
             if (e.target.closest(".pr-graph-socket")) return;
+            // Resize grip owns its own double-click (reset size)
+            if (e.target.closest(".pr-graph-node-resize")) return;
             // Cancel any pending single-click action triggered by the first
             // click of this double-click sequence.
             if (this._pendingNodeTap) {
@@ -6347,7 +8197,15 @@ class PRGraphView extends ItemView {
             }
             const btn = document.createElement("button");
             btn.className = "pr-graph-ctx-item" + (item.danger ? " pr-graph-ctx-danger" : "");
-            btn.textContent = item.label;
+            // If the item supplies a color, render a colored pipe before
+            // the label text as a minimal kind identifier.
+            if (item.color) {
+                const pipe = document.createElement("span");
+                pipe.className = "pr-color-pipe";
+                pipe.style.backgroundColor = item.color;
+                btn.appendChild(pipe);
+            }
+            btn.appendChild(document.createTextNode(item.label));
             btn.addEventListener("click", async (e) => {
                 e.stopPropagation();
                 menu.remove();
@@ -6490,6 +8348,21 @@ class PRGraphView extends ItemView {
             for (const c of (s.prContainers || [])) {
                 if (c.boundaryDetector === `custom:${cbId}`) c.boundaryDetector = "calendar-week";
             }
+        } else if (node.kind === "alignment-group") {
+            s.prAlignmentGroups = (s.prAlignmentGroups || []).filter(g => g.id !== node.primitive.id);
+        } else if (node.kind === "show") {
+            s.prShowNodes = (s.prShowNodes || []).filter(sh => sh.id !== node.primitive.id);
+        } else if (node.kind === "data-source") {
+            s.prDataSources = (s.prDataSources || []).filter(ds => ds.id !== node.primitive.id);
+            // Strip any container.dataSource.sources entries that reference
+            // the deleted primitive, so orphaned wires don't linger.
+            for (const c of (s.prContainers || [])) {
+                const sources = getContainerDataSources(c);
+                const filtered = sources.filter(src => !(src.type === "dataSource" && src.dataSourceId === node.primitive.id));
+                if (filtered.length !== sources.length) {
+                    c.dataSource = { sources: filtered };
+                }
+            }
         }
         await this.plugin.saveSettings();
         this.render();
@@ -6511,6 +8384,7 @@ class PRGraphView extends ItemView {
             "separator",
             {
                 label: "Container",
+                color: this.colorForKind("container"),
                 onClick: async () => {
                     const c = makePRContainer({ name: "New container" });
                     this.plugin.settings.prContainers.push(c);
@@ -6521,6 +8395,7 @@ class PRGraphView extends ItemView {
             },
             {
                 label: "Reflection",
+                color: this.colorForKind("reflection"),
                 onClick: async () => {
                     const r = makePRReflection();
                     this.plugin.settings.prReflections.push(r);
@@ -6530,7 +8405,22 @@ class PRGraphView extends ItemView {
                 },
             },
             {
+                label: "Alignment group",
+                color: this.colorForKind("alignment-group"),
+                onClick: async () => {
+                    if (!Array.isArray(this.plugin.settings.prAlignmentGroups)) {
+                        this.plugin.settings.prAlignmentGroups = [];
+                    }
+                    const g = makePRAlignmentGroup();
+                    this.plugin.settings.prAlignmentGroups.push(g);
+                    seedPosition(`alignmentgroup-${g.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+            {
                 label: "Alignment",
+                color: this.colorForKind("alignment"),
                 onClick: async () => {
                     const a = makePRAlignment();
                     this.plugin.settings.prAlignments.push(a);
@@ -6541,6 +8431,7 @@ class PRGraphView extends ItemView {
             },
             {
                 label: "LLM service",
+                color: this.colorForKind("llm"),
                 onClick: async () => {
                     const svc = makePRLLMService();
                     this.plugin.settings.prLLMServices.push(svc);
@@ -6551,6 +8442,7 @@ class PRGraphView extends ItemView {
             },
             {
                 label: "Custom boundary",
+                color: this.colorForKind("boundary"),
                 onClick: async () => {
                     const cb = makePRCustomBoundary();
                     this.plugin.settings.prCustomBoundaries.push(cb);
@@ -6559,7 +8451,96 @@ class PRGraphView extends ItemView {
                     this.render();
                 },
             },
+            {
+                label: "Data source…",
+                color: this.colorForKind("data-source"),
+                onClick: () => this.openDataSourcePickerMenu(e, seedPosition),
+            },
+            {
+                label: "Show output (dry-run probe)",
+                color: this.colorForKind("show"),
+                onClick: async () => {
+                    if (!Array.isArray(this.plugin.settings.prShowNodes)) {
+                        this.plugin.settings.prShowNodes = [];
+                    }
+                    const sh = makePRShowNode();
+                    this.plugin.settings.prShowNodes.push(sh);
+                    seedPosition(`show-${sh.id}`);
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
         ]);
+    }
+
+    // Secondary menu opened when the user picks "Data source…" from the
+    // canvas context menu. Shows existing data sources + two shortcuts to
+    // create fresh ones from a file or folder picker.
+    openDataSourcePickerMenu(e, seedPosition) {
+        const items = [];
+        const existing = this.plugin.settings.prDataSources || [];
+        items.push({ label: "Data source", onClick: null });
+        items.push("separator");
+
+        const createAndDrop = async (ds) => {
+            if (!Array.isArray(this.plugin.settings.prDataSources)) {
+                this.plugin.settings.prDataSources = [];
+            }
+            this.plugin.settings.prDataSources.push(ds);
+            seedPosition(`datasource-${ds.id}`);
+            await this.plugin.saveSettings();
+            this.render();
+        };
+
+        items.push({
+            label: "+ New static (pick a note)",
+            onClick: () => {
+                new MarkdownFileSuggestModal(this.app, async (file) => {
+                    const ds = makePRDataSource({
+                        name: file.basename,
+                        mode: "static",
+                        notePath: file.path,
+                    });
+                    await createAndDrop(ds);
+                }).open();
+            },
+        });
+        items.push({
+            label: "+ New dynamic (pick a folder)",
+            onClick: () => {
+                new FolderSuggestModal(this.app, async (folder) => {
+                    const ds = makePRDataSource({
+                        name: folder.name || folder.path,
+                        mode: "dynamic",
+                        folderPath: folder.path,
+                    });
+                    await createAndDrop(ds);
+                }).open();
+            },
+        });
+
+        if (existing.length > 0) {
+            items.push("separator");
+            items.push({ label: "Existing", onClick: null });
+            for (const ds of existing) {
+                const subtitle = ds.mode === "static"
+                    ? (ds.notePath || "(no note)")
+                    : `${ds.folderPath || "(no folder)"}/ (dynamic)`;
+                items.push({
+                    label: `${ds.name || "(unnamed)"}  —  ${subtitle}`,
+                    onClick: async () => {
+                        // Dropping an "existing" data source is really just
+                        // positioning it on the canvas. Seed its layout
+                        // entry so it lands where the user clicked.
+                        seedPosition(`datasource-${ds.id}`);
+                        await this.plugin.saveSettings();
+                        this.render();
+                    },
+                });
+            }
+        }
+
+        this.showFloatingMenu(e.clientX, e.clientY, items);
     }
 
     // ─── Drag-to-wire (Phase 10b-1) ───
@@ -6576,6 +8557,8 @@ class PRGraphView extends ItemView {
     // Map a node kind to the socket TYPE it outputs.
     nodeOutputType(kind) {
         switch (kind) {
+            case "data-source":      return "data-source";  // user-defined note/folder source
+            case "alignment-group":  return "alignment";     // group writes to container in-alignment
             case "container":  return "data-source";  // containers feed other containers' data input
             case "daily":      return "data-source";
             case "boundary":   return "boundary";
@@ -6594,6 +8577,23 @@ class PRGraphView extends ItemView {
     // / alignment) match their socket ids 1:1.
     canConnect(fromNode, toNode, toSocketId) {
         if (!fromNode || !toNode) return false;
+        // Show-output probe accepts ANY output. Self-probe is pointless.
+        if (toNode.kind === "show") {
+            if (toSocketId !== "in-any") return false;
+            if (fromNode.kind === "show") return false;
+            return !!this.nodeOutputType(fromNode.kind);
+        }
+        // Alignment group accepts source wires (data-source OR container)
+        // into in-source, and LLM service into in-llm.
+        if (toNode.kind === "alignment-group") {
+            if (toSocketId === "in-source") {
+                return fromNode.kind === "data-source" || fromNode.kind === "container";
+            }
+            if (toSocketId === "in-llm") {
+                return fromNode.kind === "llm";
+            }
+            return false;
+        }
         if (toNode.kind !== "container") return false;
         const outType = this.nodeOutputType(fromNode.kind);
         if (!outType) return false;
@@ -6611,6 +8611,40 @@ class PRGraphView extends ItemView {
     // Apply a new connection — write the corresponding settings field.
     async applyConnection(fromNode, toNode, fromSocket, toSocket) {
         const containers = this.plugin.settings.prContainers || [];
+
+        // Show-output probe: store the upstream node id on the show primitive.
+        if (toNode.kind === "show") {
+            const sh = (this.plugin.settings.prShowNodes || []).find(s => `show-${s.id}` === toNode.id);
+            if (sh) {
+                sh.sourceNodeId = fromNode.id;
+                await this.plugin.saveSettings();
+                this.render();
+            }
+            return;
+        }
+
+        // Alignment group input wires: in-source (data-source or container)
+        // and in-llm (llm service). The wire from alignment-group → container
+        // is handled below in the in-alignment branch.
+        if (toNode.kind === "alignment-group") {
+            const group = (this.plugin.settings.prAlignmentGroups || []).find(g => `alignmentgroup-${g.id}` === toNode.id);
+            if (!group) return;
+            if (toSocket === "in-source") {
+                if (fromNode.kind === "data-source") {
+                    group.sourceKind = "data-source";
+                    group.sourceId = fromNode.id.replace(/^datasource-/, "");
+                } else if (fromNode.kind === "container") {
+                    group.sourceKind = "container";
+                    group.sourceId = fromNode.id.replace(/^container-/, "");
+                }
+            } else if (toSocket === "in-llm" && fromNode.kind === "llm") {
+                group.llmServiceId = fromNode.id.replace(/^llm-/, "");
+            }
+            await this.plugin.saveSettings();
+            this.render();
+            return;
+        }
+
         if (toNode.kind !== "container") return;
         const target = containers.find(c => `container-${c.id}` === toNode.id);
         if (!target) return;
@@ -6626,6 +8660,9 @@ class PRGraphView extends ItemView {
                 const sourceId = fromNode.id.replace(/^container-/, "");
                 if (sourceId === target.id) return; // can't self-reference
                 toAdd = { type: "container", containerId: sourceId };
+            } else if (fromNode.kind === "data-source") {
+                const sourceId = fromNode.id.replace(/^datasource-/, "");
+                toAdd = { type: "dataSource", dataSourceId: sourceId };
             }
             if (toAdd) {
                 const key = dataSourceKey(toAdd);
@@ -6657,6 +8694,10 @@ class PRGraphView extends ItemView {
                 const alignmentId = fromNode.id.replace(/^alignment-/, "");
                 const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
                 if (al) al.containerId = target.id;
+            } else if (fromNode.kind === "alignment-group") {
+                const groupId = fromNode.id.replace(/^alignmentgroup-/, "");
+                const group = (this.plugin.settings.prAlignmentGroups || []).find(g => g.id === groupId);
+                if (group) group.containerId = target.id;
             }
         }
 
@@ -6858,19 +8899,27 @@ class PRGraphView extends ItemView {
             if (drag.direction === "out") {
                 // Forward drag without a snap: hit-test for an input socket
                 // directly under the cursor.
-                if (!target) return;
-                const socket = target.closest(".pr-graph-socket-in");
-                if (!socket) return;
-                const nodeEl = socket.closest(".pr-graph-node");
-                if (!nodeEl) return;
-                const toNode = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
-                if (!toNode) return;
-                const toSocketId = socket.dataset.socketId;
-                if (!this.canConnect(drag.fromNode, toNode, toSocketId)) {
-                    new Notice(`Can't connect ${drag.fromNode.kind} → ${toSocketId}`);
+                const socket = target?.closest(".pr-graph-socket-in");
+                if (socket) {
+                    const nodeEl = socket.closest(".pr-graph-node");
+                    if (!nodeEl) return;
+                    const toNode = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+                    if (!toNode) return;
+                    const toSocketId = socket.dataset.socketId;
+                    if (!this.canConnect(drag.fromNode, toNode, toSocketId)) {
+                        new Notice(`Can't connect ${drag.fromNode.kind} → ${toSocketId}`);
+                        return;
+                    }
+                    await this.applyConnection(drag.fromNode, toNode, drag.fromSocketId, toSocketId);
                     return;
                 }
-                await this.applyConnection(drag.fromNode, toNode, drag.fromSocketId, toSocketId);
+                // Dropped on empty canvas — offer to create a Show-output
+                // probe here and wire it up in one shot. This is the fastest
+                // way to answer "what is this output actually producing?".
+                const onCanvas = target?.closest(".pr-graph-canvas");
+                if (onCanvas) {
+                    this.openOutputDragMenu(e, drag.fromNode, drag.fromSocketId);
+                }
                 return;
             }
 
@@ -6900,6 +8949,36 @@ class PRGraphView extends ItemView {
             window.removeEventListener("mousemove", onMouseMove);
             window.removeEventListener("mouseup", onMouseUp);
         };
+    }
+
+    // Menu opened when the user drags FROM an output socket and releases on
+    // empty canvas. Offers to create a Show-output probe at the drop point
+    // and wire it up in a single gesture — the fastest path to "what is
+    // this output producing?".
+    openOutputDragMenu(e, fromNode, fromSocketId) {
+        const rect = this.canvasEl.getBoundingClientRect();
+        const vx = (e.clientX - rect.left - this.panX) / this.zoom;
+        const vy = (e.clientY - rect.top - this.panY) / this.zoom;
+
+        this.showFloatingMenu(e.clientX, e.clientY, [
+            { label: `From: ${fromNode.title}`, onClick: null },
+            "separator",
+            {
+                label: "Add Show output here",
+                onClick: async () => {
+                    if (!Array.isArray(this.plugin.settings.prShowNodes)) {
+                        this.plugin.settings.prShowNodes = [];
+                    }
+                    const sh = makePRShowNode();
+                    sh.sourceNodeId = fromNode.id;
+                    this.plugin.settings.prShowNodes.push(sh);
+                    if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
+                    this.plugin.settings.prGraphLayout[`show-${sh.id}`] = { x: vx, y: vy };
+                    await this.plugin.saveSettings();
+                    this.render();
+                },
+            },
+        ]);
     }
 
     // Menu opened when the user drags FROM an empty container input socket
@@ -7100,6 +9179,27 @@ class PRGraphView extends ItemView {
         const containers = this.plugin.settings.prContainers || [];
         const target = containers.find(c => `container-${c.id}` === wire.to);
 
+        // Show-output probe wire: clear sourceNodeId on the show primitive.
+        if (wire.kind === "show") {
+            const sh = (this.plugin.settings.prShowNodes || []).find(s => `show-${s.id}` === wire.to);
+            if (sh) sh.sourceNodeId = "";
+            this.wires = this.wires.filter(w => w !== wire);
+            this.renderWires();
+            return true;
+        }
+
+        // Wires landing on an alignment-group's inputs
+        if (wire.to && wire.to.startsWith("alignmentgroup-")) {
+            const group = (this.plugin.settings.prAlignmentGroups || []).find(g => `alignmentgroup-${g.id}` === wire.to);
+            if (group) {
+                if (wire.toSocket === "in-source") { group.sourceKind = ""; group.sourceId = ""; }
+                else if (wire.toSocket === "in-llm") { group.llmServiceId = ""; }
+            }
+            this.wires = this.wires.filter(w => w !== wire);
+            this.renderWires();
+            return true;
+        }
+
         switch (wire.kind) {
             case "data-source":
                 // Multi-source: remove just the one source this wire
@@ -7111,6 +9211,8 @@ class PRGraphView extends ItemView {
                     if (wire.from === "daily") removeKey = "daily";
                     else if (wire.from.startsWith("container-")) {
                         removeKey = `container:${wire.from.replace(/^container-/, "")}`;
+                    } else if (wire.from.startsWith("datasource-")) {
+                        removeKey = `dataSource:${wire.from.replace(/^datasource-/, "")}`;
                     }
                     const filtered = sources.filter(s => dataSourceKey(s) !== removeKey);
                     target.dataSource = { sources: filtered };
@@ -7127,9 +9229,15 @@ class PRGraphView extends ItemView {
                 break;
             case "alignment":
                 {
-                    const alignmentId = wire.from.replace(/^alignment-/, "");
-                    const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
-                    if (al) al.containerId = "";
+                    if (wire.from.startsWith("alignmentgroup-")) {
+                        const groupId = wire.from.replace(/^alignmentgroup-/, "");
+                        const g = (this.plugin.settings.prAlignmentGroups || []).find(x => x.id === groupId);
+                        if (g) g.containerId = "";
+                    } else {
+                        const alignmentId = wire.from.replace(/^alignment-/, "");
+                        const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
+                        if (al) al.containerId = "";
+                    }
                 }
                 break;
         }
@@ -7144,6 +9252,27 @@ class PRGraphView extends ItemView {
         const containers = this.plugin.settings.prContainers || [];
         const targetContainerId = wire.to.replace(/^container-/, "");
         const target = containers.find(c => c.id === targetContainerId);
+
+        // Show-output probe wire: clear sourceNodeId on the show primitive.
+        if (wire.kind === "show") {
+            const sh = (this.plugin.settings.prShowNodes || []).find(s => `show-${s.id}` === wire.to);
+            if (sh) sh.sourceNodeId = "";
+            await this.plugin.saveSettings();
+            this.render();
+            return;
+        }
+
+        // Wires landing on an alignment-group's inputs (not on a container)
+        if (wire.to && wire.to.startsWith("alignmentgroup-")) {
+            const group = (this.plugin.settings.prAlignmentGroups || []).find(g => `alignmentgroup-${g.id}` === wire.to);
+            if (group) {
+                if (wire.toSocket === "in-source") { group.sourceKind = ""; group.sourceId = ""; }
+                else if (wire.toSocket === "in-llm") { group.llmServiceId = ""; }
+            }
+            await this.plugin.saveSettings();
+            this.render();
+            return;
+        }
 
         switch (wire.kind) {
             case "data-source":
@@ -7171,9 +9300,15 @@ class PRGraphView extends ItemView {
                 break;
             case "alignment":
                 {
-                    const alignmentId = wire.from.replace(/^alignment-/, "");
-                    const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
-                    if (al) al.containerId = "";
+                    if (wire.from.startsWith("alignmentgroup-")) {
+                        const groupId = wire.from.replace(/^alignmentgroup-/, "");
+                        const g = (this.plugin.settings.prAlignmentGroups || []).find(x => x.id === groupId);
+                        if (g) g.containerId = "";
+                    } else {
+                        const alignmentId = wire.from.replace(/^alignment-/, "");
+                        const al = (this.plugin.settings.prAlignments || []).find(a => a.id === alignmentId);
+                        if (al) al.containerId = "";
+                    }
                 }
                 break;
         }
@@ -7379,6 +9514,109 @@ class PRGraphView extends ItemView {
         };
     }
 
+    // Bottom-right resize grip on each node. Mousedown starts a resize
+    // drag that updates the node's width/height live, persisting them into
+    // prGraphLayout[id].w/h on mouseup. Double-click clears the override.
+    setupNodeResize() {
+        if (!this.viewportEl) return;
+        const MIN_W = 180;
+        const MIN_H = 120;
+        let active = null;
+
+        const onMouseDown = (e) => {
+            if (e.button !== 0) return;
+            const grip = e.target.closest(".pr-graph-node-resize");
+            if (!grip) return;
+            const nodeEl = grip.closest(".pr-graph-node");
+            if (!nodeEl) return;
+            const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+            if (!node) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const rect = nodeEl.getBoundingClientRect();
+            active = {
+                node,
+                nodeEl,
+                startMouseX: e.clientX,
+                startMouseY: e.clientY,
+                startW: rect.width / this.zoom,
+                startH: rect.height / this.zoom,
+            };
+            nodeEl.classList.add("pr-graph-node-sized", "pr-graph-node-resizing");
+        };
+
+        const onMouseMove = (e) => {
+            if (!active) return;
+            const dx = (e.clientX - active.startMouseX) / this.zoom;
+            const dy = (e.clientY - active.startMouseY) / this.zoom;
+            const w = Math.max(MIN_W, Math.round(active.startW + dx));
+            const h = Math.max(MIN_H, Math.round(active.startH + dy));
+            active.nodeEl.style.width = `${w}px`;
+            active.nodeEl.style.height = `${h}px`;
+            // Keep wires attached to this node while it resizes. The out
+            // socket's position changes with the width.
+            this.renderWires();
+        };
+
+        const onMouseUp = async () => {
+            if (!active) return;
+            const { node, nodeEl } = active;
+            const w = parseFloat(nodeEl.style.width);
+            const h = parseFloat(nodeEl.style.height);
+            nodeEl.classList.remove("pr-graph-node-resizing");
+            if (!this.plugin.settings.prGraphLayout) this.plugin.settings.prGraphLayout = {};
+            const cur = this.plugin.settings.prGraphLayout[node.id] || {};
+            // Save to the slot matching the current state. Collapsed and
+            // expanded get distinct sizes so chevron toggle swaps between
+            // two clearly different views.
+            const stateKey = this.isNodeExpanded(node) ? "expanded" : "collapsed";
+            cur[stateKey] = { w, h };
+            if (typeof cur.x !== "number") cur.x = node.x;
+            if (typeof cur.y !== "number") cur.y = node.y;
+            this.plugin.settings.prGraphLayout[node.id] = cur;
+            active = null;
+            await this.plugin.saveSettings();
+            this.renderWires();
+        };
+
+        const onDblClick = async (e) => {
+            const grip = e.target.closest(".pr-graph-node-resize");
+            if (!grip) return;
+            const nodeEl = grip.closest(".pr-graph-node");
+            if (!nodeEl) return;
+            const node = this.nodes.find(n => n.id === nodeEl.dataset.nodeId);
+            if (!node) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const layout = this.plugin.settings.prGraphLayout?.[node.id];
+            if (layout) {
+                // Reset only the current state's saved size; leave the
+                // other state's override alone.
+                const stateKey = this.isNodeExpanded(node) ? "expanded" : "collapsed";
+                delete layout[stateKey];
+                // Clean up any legacy top-level w/h from before per-state
+                // sizing, so they can't leak back in.
+                delete layout.w;
+                delete layout.h;
+                await this.plugin.saveSettings();
+            }
+            this.render();
+        };
+
+        this.viewportEl.addEventListener("mousedown", onMouseDown);
+        this.viewportEl.addEventListener("dblclick", onDblClick);
+        window.addEventListener("mousemove", onMouseMove);
+        window.addEventListener("mouseup", onMouseUp);
+
+        this._nodeResizeCleanup = () => {
+            this.viewportEl?.removeEventListener("mousedown", onMouseDown);
+            this.viewportEl?.removeEventListener("dblclick", onDblClick);
+            window.removeEventListener("mousemove", onMouseMove);
+            window.removeEventListener("mouseup", onMouseUp);
+        };
+    }
+
     setupNodeDrag() {
         if (!this.viewportEl) return;
         const viewport = this.viewportEl;
@@ -7398,6 +9636,7 @@ class PRGraphView extends ItemView {
         const onMouseDown = (e) => {
             if (e.button !== 0) return;
             if (e.target.closest(".pr-graph-socket")) return;
+            if (e.target.closest(".pr-graph-node-resize")) return;  // resize owns this
             const nodeEl = e.target.closest(".pr-graph-node");
             if (!nodeEl) return;
 
@@ -7526,6 +9765,7 @@ class PRGraphView extends ItemView {
     async onClose() {
         if (this._panZoomCleanup) this._panZoomCleanup();
         if (this._nodeDragCleanup) this._nodeDragCleanup();
+        if (this._nodeResizeCleanup) this._nodeResizeCleanup();
         if (this._wireDragCleanup) this._wireDragCleanup();
         if (this._wireClickCleanup) this._wireClickCleanup();
         if (this._ctxMenuCleanup) this._ctxMenuCleanup();
@@ -7766,7 +10006,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         this.expandedOutput = {};
         // Outer tab default. The legacy "Existing" tab has been removed; new
         // and existing installs land on Containers.
-        this.outerTab = "containers";
+        this.outerTab = "general";
         // Per-id expanded state for collapsible PR cards. Not persisted —
         // resets to expanded (true) on every fresh display() call for ids
         // that haven't been seen yet.
@@ -7782,12 +10022,12 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         const tabs = [
+            { id: "general",    label: "General" },
             { id: "containers", label: "Containers" },
             { id: "boundaries", label: "Boundaries" },
             { id: "reflection", label: "Reflection" },
             { id: "alignments", label: "Alignment" },
             { id: "llm",        label: "LLM" },
-            { id: "general",    label: "General" },
         ];
 
         const bar = containerEl.createDiv({ cls: "mr-tab-bar mr-outer-tab-bar" });
@@ -7804,13 +10044,13 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const body = containerEl.createDiv({ cls: "mr-tab-content" });
         switch (this.outerTab) {
+            case "general":     this.displayGeneral(body); break;
             case "containers":  this.displayContainersStub(body); break;
             case "boundaries":  this.displayBoundaries(body); break;
             case "reflection":  this.displayReflections(body); break;
             case "alignments":  this.displayAlignmentsStub(body); break;
             case "llm":         this.displayLLMStub(body); break;
-            case "general":     this.displayGeneral(body); break;
-            default:            this.displayContainersStub(body); break;
+            default:            this.displayGeneral(body); break;
         }
     }
 
@@ -8204,6 +10444,51 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     this.display();
                 });
             });
+
+        // Use system prompt toggle (local override, respects global master)
+        new Setting(card)
+            .setName("Use system prompt")
+            .setDesc("Send the system prompt above when this container runs its LLM call. When off, this container runs with an empty system role. Respects the global master in General — global off means system prompts are disabled regardless.")
+            .addToggle(t => t
+                .setValue(container.useSystemPrompt !== false)
+                .onChange(async v => {
+                    container.useSystemPrompt = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Framework reinforcement — markdown file picker. The file's contents
+        // get injected into the user message at the highest-attention slot
+        // (right before the YAML output instructions) when this container
+        // runs. Respects the global Frameworks master in General.
+        new Setting(card)
+            .setName("Framework")
+            .setDesc(container.framework || "None selected — the framework injection is skipped when empty.")
+            .addButton(btn => {
+                btn.setButtonText(container.framework ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        container.framework = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    container.framework = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(card)
+            .setName("Use framework")
+            .setDesc("Inject the framework file above when this container runs its LLM call. Off = skip even if a file is picked. Respects the global master in General.")
+            .addToggle(t => t
+                .setValue(container.useFramework !== false)
+                .onChange(async v => {
+                    container.useFramework = v;
+                    await this.plugin.saveSettings();
+                }));
 
         // ── Reflection picker (Phase 6 rework) ──
         // Single dropdown referencing a reflection profile from the
@@ -8602,39 +10887,359 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
     displayAlignmentsStub(containerEl) {
         const s = this.plugin.settings;
         if (!Array.isArray(s.prAlignments)) s.prAlignments = [];
+        if (!Array.isArray(s.prAlignmentGroups)) s.prAlignmentGroups = [];
 
         containerEl.createEl("h2", { text: "Alignment" });
         const intro = containerEl.createEl("p");
         intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
-        intro.setText("Measurable anchors attached to a container. Each alignment names a daily field to read, a description of what is being measured, and an output frontmatter key. The plugin runs an LLM pass per alignment after the main aggregation, surfacing patterns of consistency, drift, and absence — not compliance scoring.");
+        intro.setText("Alignment Groups run gap analysis after a container generates its note. Each group wires to a guidelines source (a DataSource or another container), an LLM service, and a target container. Individual alignments inside the group are auto-discovered from the source note by prefix — every field matching {prefix}_* becomes a gap-analysis target. The LLM returns the same keys with analysis as values, and they get merged into the target container's frontmatter.");
 
-        const containers = s.prContainers || [];
-        if (containers.length === 0) {
-            const empty = containerEl.createEl("p");
-            empty.style.cssText = "color: var(--text-faint); margin: 16px 0;";
-            empty.setText("Add at least one container in the Containers tab before creating alignments.");
-            return;
-        }
+        // ── Alignment Groups section (primary) ──
+        containerEl.createEl("h3", { text: "Alignment Groups" }).style.marginTop = "24px";
 
-        if (s.prAlignments.length === 0) {
+        if (s.prAlignmentGroups.length === 0) {
             const empty = containerEl.createEl("p");
-            empty.style.cssText = "color: var(--text-faint); margin: 16px 0;";
-            empty.setText("No alignments yet. Click below to add one.");
+            empty.style.cssText = "color: var(--text-faint); margin: 8px 0;";
+            empty.setText("No alignment groups yet. Create one here, then wire it up in the graph view (source → group → container).");
         } else {
-            for (let i = 0; i < s.prAlignments.length; i++) {
-                this.renderPRAlignmentCard(containerEl, s.prAlignments[i], i);
+            for (let i = 0; i < s.prAlignmentGroups.length; i++) {
+                this.renderPRAlignmentGroupCard(containerEl, s.prAlignmentGroups[i], i);
             }
         }
 
         new Setting(containerEl)
             .addButton(btn => btn
-                .setButtonText("+ Add alignment")
+                .setButtonText("+ Add alignment group")
                 .setCta()
                 .onClick(async () => {
-                    s.prAlignments.push(makePRAlignment());
+                    s.prAlignmentGroups.push(makePRAlignmentGroup());
                     await this.plugin.saveSettings();
                     this.display();
                 }));
+
+        // ── Single alignments (shown only if any exist) ──
+        if (s.prAlignments.length > 0) {
+            containerEl.createEl("h3", { text: "Single alignments" }).style.marginTop = "32px";
+            const legacyIntro = containerEl.createEl("p");
+            legacyIntro.style.cssText = "color: var(--text-faint); font-size: 0.85em; max-width: 60ch;";
+            legacyIntro.setText("Single per-container alignments. Still run at boundary time; Alignment Groups are the newer, more flexible option.");
+            for (let i = 0; i < s.prAlignments.length; i++) {
+                this.renderPRAlignmentCard(containerEl, s.prAlignments[i], i);
+            }
+        }
+    }
+
+    renderPRAlignmentGroupCard(parent, group, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv({ cls: "mr-pr-card" });
+        card.dataset.prCardId = group.id;
+
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+        const nameInput = header.createEl("input", { type: "text", value: group.name || "", cls: "mr-pr-name-input" });
+        nameInput.placeholder = "Alignment group name";
+        nameInput.addEventListener("change", async () => {
+            group.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
+        deleteBtn.title = "Delete alignment group";
+        deleteBtn.addEventListener("click", async () => {
+            s.prAlignmentGroups.splice(idx, 1);
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const body = card.createDiv({ cls: "mr-pr-card-body" });
+
+        new Setting(body)
+            .setName("Prefix")
+            .setDesc("Composes the output frontmatter keys and determines which source-note fields are auto-discovered as guidelines. For example, prefix=\"alignment\" reads every alignment_* field from the source note.")
+            .addText(t => t
+                .setPlaceholder("alignment")
+                .setValue(group.prefix || "alignment")
+                .onChange(async v => {
+                    group.prefix = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Target container
+        const target = (s.prContainers || []).find(c => c.id === group.containerId);
+        new Setting(body)
+            .setName("Target container")
+            .setDesc(target ? target.name : "(wire this group to a container's in-alignment socket in the graph view)")
+            .addDropdown(d => {
+                d.addOption("", "— none —");
+                for (const c of (s.prContainers || [])) {
+                    d.addOption(c.id, c.name || "(unnamed)");
+                }
+                d.setValue(group.containerId || "");
+                d.onChange(async v => {
+                    group.containerId = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // Source
+        new Setting(body)
+            .setName("Guidelines source")
+            .setDesc("Pick a data source or a container to pull guidelines from. Can also be wired in the graph view.")
+            .addDropdown(d => {
+                d.addOption("", "— none —");
+                for (const ds of (s.prDataSources || [])) {
+                    d.addOption(`data-source:${ds.id}`, `${ds.name} (data source, ${ds.mode})`);
+                }
+                for (const c of (s.prContainers || [])) {
+                    d.addOption(`container:${c.id}`, `${c.name} (container)`);
+                }
+                const cur = group.sourceKind && group.sourceId ? `${group.sourceKind}:${group.sourceId}` : "";
+                d.setValue(cur);
+                d.onChange(async v => {
+                    if (!v) { group.sourceKind = ""; group.sourceId = ""; }
+                    else {
+                        const [kind, id] = v.split(":");
+                        group.sourceKind = kind;
+                        group.sourceId = id;
+                    }
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // LLM service
+        new Setting(body)
+            .setName("LLM service")
+            .addDropdown(d => {
+                d.addOption("", "— none —");
+                for (const svc of (s.prLLMServices || [])) {
+                    d.addOption(svc.id, svc.name || "(unnamed)");
+                }
+                d.setValue(group.llmServiceId || "");
+                d.onChange(async v => {
+                    group.llmServiceId = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // System prompt
+        new Setting(body)
+            .setName("System prompt")
+            .setDesc(group.systemPromptFile || "None selected — the group will skip if no prompt is set.")
+            .addButton(btn => {
+                btn.setButtonText(group.systemPromptFile ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        group.systemPromptFile = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    group.systemPromptFile = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(body)
+            .setName("Use system prompt")
+            .setDesc("Send the system prompt above when this group runs its LLM call. Respects the global master in General.")
+            .addToggle(t => t
+                .setValue(group.useSystemPrompt !== false)
+                .onChange(async v => {
+                    group.useSystemPrompt = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Framework reinforcement — markdown file picker (same pattern as
+        // the system prompt picker above). Injected at the end of the user
+        // message right before the per-alignment output instructions.
+        new Setting(body)
+            .setName("Framework")
+            .setDesc(group.framework || "None selected — the framework injection is skipped when empty.")
+            .addButton(btn => {
+                btn.setButtonText(group.framework ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        group.framework = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    group.framework = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(body)
+            .setName("Use framework")
+            .setDesc("Inject the framework file above when this group runs its LLM call. Off = skip even if a file is picked.")
+            .addToggle(t => t
+                .setValue(group.useFramework !== false)
+                .onChange(async v => {
+                    group.useFramework = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(body)
+            .setName("Include aggregated summary")
+            .setDesc("When on, the freshly aggregated container frontmatter (the main aggregation's output) gets sent to the LLM as extra context alongside the raw subdivision activity. Useful when the gap analysis should reason about the compressed summary rather than just the raw daily notes.")
+            .addToggle(t => t
+                .setValue(group.includeAggregatedSummary !== false)
+                .onChange(async v => {
+                    group.includeAggregatedSummary = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // ── Output shape defaults ──
+        const shapeHeader = body.createEl("h4", { text: "Output shape" });
+        shapeHeader.style.cssText = "margin: 16px 0 8px 0; color: var(--text-muted); font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.05em;";
+
+        new Setting(body)
+            .setName("Default mode")
+            .setDesc("How each discovered alignment is written by default. Source-note meta keys and per-alignment overrides below can change this per alignment.")
+            .addDropdown(d => d
+                .addOption("separate", "separate — LLM narrative to {prefix}_{name}")
+                .addOption("rewrite",  "rewrite — LLM concise string replaces target")
+                .addOption("prepend",  "prepend — template splice with subdivision entries (no LLM)")
+                .setValue(group.defaultMode || "separate")
+                .onChange(async v => {
+                    group.defaultMode = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+
+        new Setting(body)
+            .setName("Default target key")
+            .setDesc("Template for the frontmatter key each alignment writes to. Available tokens: {prefix}, {name}. Example: {prefix}_{name} keeps results in their own namespace; {name} blends them directly into the container's existing fields.")
+            .addText(t => t
+                .setPlaceholder("{prefix}_{name}")
+                .setValue(group.defaultTarget || "{prefix}_{name}")
+                .onChange(async v => {
+                    group.defaultTarget = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        const defaultMode = group.defaultMode || "separate";
+        if (defaultMode === "prepend") {
+            new Setting(body)
+                .setName("Default template")
+                .setDesc("Template string used for prepend mode. Tokens: {guideline} (source guideline), {entries} (joined subdivision field values for this alignment's short name), {existing} (current target key value on container note), {name} (alignment short name). Default if blank: \"**{guideline}** — {entries}\"")
+                .addText(t => t
+                    .setPlaceholder("**{guideline}** — {existing}")
+                    .setValue(group.defaultTemplate || "")
+                    .onChange(async v => {
+                        group.defaultTemplate = v;
+                        await this.plugin.saveSettings();
+                    }));
+        }
+
+        // ── Discovered alignments table ──
+        // Scans the wired source note for {prefix}_* base keys and shows one
+        // row per discovered alignment. Each row lets the user override the
+        // resolved config. Refresh button re-scans if the source changes.
+        const tableHeader = body.createEl("h4", { text: "Discovered alignments" });
+        tableHeader.style.cssText = "margin: 16px 0 8px 0; color: var(--text-muted); font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.05em;";
+
+        const tableWrap = body.createDiv();
+        const renderTable = async () => {
+            tableWrap.empty();
+            if (!group.sourceKind || !group.sourceId) {
+                const hint = tableWrap.createEl("p");
+                hint.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 0;";
+                hint.setText("Wire a source first (via the Guidelines source dropdown above or the graph view) to auto-discover alignments.");
+                return;
+            }
+            const src = await this.plugin.resolvePRAlignmentGroupSource(group);
+            if (!src || Object.keys(src.guidelines).length === 0) {
+                const hint = tableWrap.createEl("p");
+                hint.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 0;";
+                hint.setText(`No ${group.prefix || "alignment"}_* fields found in the source note.`);
+                return;
+            }
+            const pathHint = tableWrap.createEl("p");
+            pathHint.style.cssText = "color: var(--text-muted); font-size: 0.8em; margin: 0 0 8px 0; font-family: var(--font-monospace);";
+            pathHint.setText(src.sourceFile.path);
+
+            for (const alignmentKey of Object.keys(src.guidelines)) {
+                const resolved = this.plugin.resolvePRAlignmentConfig(group, alignmentKey, src.sourceFm, src.sourceInline);
+                const row = tableWrap.createDiv();
+                row.style.cssText = "display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; padding: 6px 0; border-bottom: 1px dashed var(--background-modifier-border); align-items: center;";
+
+                const label = row.createDiv();
+                label.style.cssText = "font-family: var(--font-monospace); font-size: 0.85em; color: var(--interactive-accent); overflow: hidden; text-overflow: ellipsis;";
+                label.title = src.guidelines[alignmentKey];
+                label.setText(alignmentKey);
+
+                // Target override
+                const targetInput = row.createEl("input", { type: "text" });
+                targetInput.style.cssText = "font-size: 0.8em; padding: 2px 4px;";
+                targetInput.placeholder = resolved.target;
+                const curOverride = (group.overrides || {})[alignmentKey] || {};
+                if (curOverride.target) targetInput.value = curOverride.target;
+                targetInput.addEventListener("change", async () => {
+                    if (!group.overrides) group.overrides = {};
+                    if (!group.overrides[alignmentKey]) group.overrides[alignmentKey] = {};
+                    if (targetInput.value.trim()) group.overrides[alignmentKey].target = targetInput.value.trim();
+                    else delete group.overrides[alignmentKey].target;
+                    await this.plugin.saveSettings();
+                });
+
+                // Mode override
+                const modeSel = row.createEl("select");
+                modeSel.style.cssText = "font-size: 0.8em; padding: 2px 4px;";
+                for (const m of ["", "separate", "rewrite", "prepend"]) {
+                    const opt = modeSel.createEl("option", { value: m, text: m || "(default)" });
+                    if ((curOverride.mode || "") === m) opt.selected = true;
+                }
+                modeSel.addEventListener("change", async () => {
+                    if (!group.overrides) group.overrides = {};
+                    if (!group.overrides[alignmentKey]) group.overrides[alignmentKey] = {};
+                    if (modeSel.value) group.overrides[alignmentKey].mode = modeSel.value;
+                    else delete group.overrides[alignmentKey].mode;
+                    await this.plugin.saveSettings();
+                });
+
+                // Template override (only meaningful for splice modes)
+                const templateInput = row.createEl("input", { type: "text" });
+                templateInput.style.cssText = "font-size: 0.8em; padding: 2px 4px; font-family: var(--font-monospace);";
+                templateInput.placeholder = resolved.template || "—";
+                if (curOverride.template) templateInput.value = curOverride.template;
+                templateInput.addEventListener("change", async () => {
+                    if (!group.overrides) group.overrides = {};
+                    if (!group.overrides[alignmentKey]) group.overrides[alignmentKey] = {};
+                    if (templateInput.value.trim()) group.overrides[alignmentKey].template = templateInput.value.trim();
+                    else delete group.overrides[alignmentKey].template;
+                    await this.plugin.saveSettings();
+                });
+
+                // Resolved summary (read-only)
+                const summary = row.createDiv();
+                summary.style.cssText = "font-size: 0.75em; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+                summary.setText(`→ ${resolved.target} (${resolved.mode})`);
+                summary.title = `mode: ${resolved.mode}\ntarget: ${resolved.target}\ntemplate: ${resolved.template || "(none)"}\nguideline: ${src.guidelines[alignmentKey]}`;
+            }
+
+            const legendWrap = tableWrap.createDiv();
+            legendWrap.style.cssText = "display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; padding: 4px 0 0 0; font-size: 0.7em; color: var(--text-faint);";
+            legendWrap.createEl("div", { text: "alignment key" });
+            legendWrap.createEl("div", { text: "target override" });
+            legendWrap.createEl("div", { text: "mode override" });
+            legendWrap.createEl("div", { text: "resolved" });
+        };
+
+        new Setting(body)
+            .addButton(btn => btn
+                .setButtonText("Refresh discovered alignments")
+                .onClick(() => renderTable()));
+
+        renderTable();
     }
 
     renderPRAlignmentCard(parent, alignment, idx) {
@@ -9114,9 +11719,109 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 }));
     }
 
+    renderPRDataSourceCard(parent, ds, idx) {
+        const s = this.plugin.settings;
+
+        const card = parent.createDiv({ cls: "mr-pr-card" });
+        card.dataset.prCardId = ds.id;
+
+        const header = card.createDiv({ cls: "mr-pr-card-header" });
+        const nameInput = header.createEl("input", { type: "text", value: ds.name || "", cls: "mr-pr-name-input" });
+        nameInput.placeholder = "Data source name";
+        nameInput.addEventListener("change", async () => {
+            ds.name = nameInput.value;
+            await this.plugin.saveSettings();
+        });
+
+        const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
+        deleteBtn.title = "Delete data source";
+        deleteBtn.addEventListener("click", async () => {
+            // Also strip orphaned references from container sources.
+            for (const c of (s.prContainers || [])) {
+                const sources = getContainerDataSources(c);
+                const filtered = sources.filter(src => !(src.type === "dataSource" && src.dataSourceId === ds.id));
+                if (filtered.length !== sources.length) c.dataSource = { sources: filtered };
+            }
+            s.prDataSources.splice(idx, 1);
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const body = card.createDiv({ cls: "mr-pr-card-body" });
+
+        new Setting(body)
+            .setName("Mode")
+            .setDesc("Static references one specific note. Dynamic scans a folder — container consumers filter by period, alignment groups read the latest note.")
+            .addDropdown(d => d
+                .addOption("static", "Static (single note)")
+                .addOption("dynamic", "Dynamic (folder)")
+                .setValue(ds.mode || "static")
+                .onChange(async v => {
+                    ds.mode = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+
+        if ((ds.mode || "static") === "static") {
+            new Setting(body)
+                .setName("Note")
+                .setDesc(ds.notePath || "None selected")
+                .addButton(btn => {
+                    btn.setButtonText(ds.notePath ? "Change" : "Choose").onClick(() => {
+                        new MarkdownFileSuggestModal(this.app, async (file) => {
+                            ds.notePath = file.path;
+                            if (!ds.name || ds.name === "New data source") ds.name = file.basename;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }).open();
+                    });
+                })
+                .addExtraButton(btn => {
+                    btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                        ds.notePath = "";
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+                });
+        } else {
+            new Setting(body)
+                .setName("Folder")
+                .setDesc(ds.folderPath || "None selected")
+                .addButton(btn => {
+                    btn.setButtonText(ds.folderPath ? "Change" : "Choose").onClick(() => {
+                        new FolderSuggestModal(this.app, async (folder) => {
+                            ds.folderPath = folder.path;
+                            if (!ds.name || ds.name === "New data source") ds.name = folder.name || folder.path;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }).open();
+                    });
+                })
+                .addExtraButton(btn => {
+                    btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                        ds.folderPath = "";
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+                });
+        }
+    }
+
     displayGeneral(containerEl) {
         const s = this.plugin.settings;
         containerEl.createEl("h2", { text: "General" });
+
+        // ── Readme / Help link ──
+        const helpBox = containerEl.createDiv();
+        helpBox.style.cssText = "display: flex; align-items: center; gap: 12px; padding: 10px 14px; margin: 0 0 16px 0; background: var(--background-secondary); border-left: 3px solid var(--interactive-accent); border-radius: 4px;";
+        const helpText = helpBox.createDiv();
+        helpText.style.cssText = "flex: 1; color: var(--text-muted); font-size: 0.9em; line-height: 1.4;";
+        helpText.setText("New to Periodic Ritual, or not sure where to start? The README has a beginner-friendly quick start plus deep dives into alignment groups, data sources, and the graph view.");
+        const helpBtn = helpBox.createEl("button", { text: "📖 Open README" });
+        helpBtn.style.cssText = "flex-shrink: 0; background: var(--interactive-accent); color: var(--text-on-accent, #fff); border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-weight: 500;";
+        helpBtn.addEventListener("click", () => {
+            window.open("https://github.com/PoweredbyPugs/monthly-ritual/blob/main/README.md", "_blank");
+        });
 
         // ── Periodic Ritual behavior ──
         new Setting(containerEl)
@@ -9126,6 +11831,33 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .setValue(!!s.prAutoGenerateOnLoad)
                 .onChange(async v => {
                     s.prAutoGenerateOnLoad = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // ── Feature masters — global on/off for system prompts and frameworks ──
+        const featureHeader = containerEl.createEl("h3", { text: "Features" });
+        featureHeader.style.marginTop = "24px";
+        const featureIntro = containerEl.createEl("p");
+        featureIntro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch;";
+        featureIntro.setText("Master switches for two LLM input channels. When a master is off, every container and alignment group runs without that channel — even if its local toggle is on. Use the masters to kill all system prompts or frameworks across the vault in one click (for debugging, A/B testing, or temporarily stripping the model down to bare inputs).");
+
+        new Setting(containerEl)
+            .setName("Enable system prompts (global)")
+            .setDesc("Master switch for every container and alignment group's system prompt. When off, the model sees an empty system role and relies entirely on the user message. Each container and group can also turn this off locally.")
+            .addToggle(t => t
+                .setValue(s.prSystemPromptsGlobalEnabled !== false)
+                .onChange(async v => {
+                    s.prSystemPromptsGlobalEnabled = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Enable frameworks (global)")
+            .setDesc("Master switch for Framework Reinforcement injection. A framework is a short markdown snippet you can attach to any container or alignment group; it gets placed at the end of the user message, right before the output instructions — the highest-attention slot. Use it when you want procedural thinking guidance (mental models, lenses, checklists) that survive long source payloads.")
+            .addToggle(t => t
+                .setValue(s.prFrameworksGlobalEnabled !== false)
+                .onChange(async v => {
+                    s.prFrameworksGlobalEnabled = v;
                     await this.plugin.saveSettings();
                 }));
 
@@ -9153,6 +11885,40 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const dailyNote = containerEl.createEl("p");
         dailyNote.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 4px 0 0 0;";
         dailyNote.setText(`Currently: ${s.dailyNotesFolder || "(vault root)"}`);
+
+        // ── Data sources ──
+        containerEl.createEl("h3", { text: "Data sources" }).style.marginTop = "24px";
+        const dsIntro = containerEl.createEl("p");
+        dsIntro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch;";
+        dsIntro.setText("Reusable named references to notes or folders. Wire them into container data inputs and alignment groups in the graph view. Static sources read one file; dynamic sources scan a folder (container consumers filter by period, alignment groups read the latest).");
+
+        if (!Array.isArray(s.prDataSources)) s.prDataSources = [];
+
+        if (s.prDataSources.length === 0) {
+            const empty = containerEl.createEl("p");
+            empty.style.cssText = "color: var(--text-faint); font-size: 0.85em; margin: 8px 0;";
+            empty.setText("No data sources yet.");
+        }
+
+        for (let i = 0; i < s.prDataSources.length; i++) {
+            this.renderPRDataSourceCard(containerEl, s.prDataSources[i], i);
+        }
+
+        new Setting(containerEl)
+            .addButton(btn => btn
+                .setButtonText("+ Add static source")
+                .onClick(async () => {
+                    s.prDataSources.push(makePRDataSource({ mode: "static" }));
+                    await this.plugin.saveSettings();
+                    this.display();
+                }))
+            .addButton(btn => btn
+                .setButtonText("+ Add dynamic source")
+                .onClick(async () => {
+                    s.prDataSources.push(makePRDataSource({ mode: "dynamic" }));
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
 
         // ── Astrology toggles ──
         containerEl.createEl("h3", { text: "Astrology" }).style.marginTop = "24px";

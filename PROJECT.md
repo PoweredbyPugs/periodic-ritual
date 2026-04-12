@@ -7,28 +7,29 @@
 
 ## Overview
 
-Maintains any combination of independent **container types** — calendar week, calendar month, calendar quarter, calendar year, lunar cycle, lunar phase, solar cycle, solar zodiac, plus user-defined custom boundaries. Each container is configured the same way: a template, a save directory, a boundary detector, a data source (or multiple), an optional LLM service + system prompt, optional reflection profile, optional alignments.
+Maintains any combination of independent **container types** — calendar week, calendar month, calendar quarter, calendar year, lunar cycle, lunar phase, solar cycle, solar zodiac, plus user-defined custom boundaries. Each container has a template, save directory, boundary detector, data source(s), optional LLM service + system prompt + framework reinforcement, optional reflection profile, optional alignment groups.
 
 **The plugin's job is narrow:**
 1. Detect a container's boundary has been crossed.
 2. Create the container note from a template.
-3. Gather source notes in range (daily notes by default, or other container notes for hierarchical roll-ups).
-4. Hand them to an LLM with the system-prompt MD file.
+3. Run alignment group passes (gap analysis against guideline notes).
+4. Gather source notes and hand them to an LLM with the system-prompt MD file + framework file.
 5. Write the LLM's YAML output to the container's frontmatter.
-6. Optionally run alignment passes and/or a reflection Q&A flow.
+6. Optionally run a reflection Q&A flow on demand.
 
 Templater scripts in the user's vault render note bodies via Dataview. The plugin owns frontmatter; templater owns presentation.
 
 ## Design principles
 
 1. **The system-prompt MD file is the customization layer.** Settings stay tiny. Behavior changes by editing markdown, not code.
-2. **Containers are independent.** No mutually-exclusive modes. Any combination. Each has its own LLM service if desired.
-3. **The LLM does aggregation.** No hand-rolled field pipeline. The plugin shovels source data and a prompt at an LLM and writes the result.
-4. **Anti-fragile.** Skip a week, nothing breaks. Empty periods still generate notes. The LLM aggregates whatever exists.
-5. **Goals are anchors, not prisons.** Alignments surface patterns. They do not produce shame, compliance scores, or red/green dashboards.
-6. **Templater stays.** It renders bodies via Dataview. The plugin owns frontmatter; templater owns presentation. Complementary.
-7. **Daily Ritual is upstream.** Periodic Ritual reads what Daily Ritual already writes. It does not modify daily notes.
-8. **Multi-source.** A container can read from daily notes + any number of other containers simultaneously. Merged, deduped, fed to the LLM as one payload.
+2. **The framework file is the thinking-model layer.** Injected at the highest-attention slot in the user message (right before output instructions) so procedural guidance, mental models, and lenses survive long source payloads.
+3. **Containers are independent.** No mutually-exclusive modes. Any combination. Each has its own LLM service if desired.
+4. **The LLM does aggregation.** No hand-rolled field pipeline. The plugin shovels source data and a prompt at an LLM and writes the result.
+5. **Anti-fragile.** Skip a week, nothing breaks. Empty periods still generate notes. The LLM aggregates whatever exists.
+6. **Goals are anchors, not prisons.** Alignments surface patterns. They do not produce shame, compliance scores, or red/green dashboards.
+7. **Templater stays.** It renders bodies via Dataview. The plugin owns frontmatter; templater owns presentation. Complementary.
+8. **Daily Ritual is upstream.** Periodic Ritual reads what Daily Ritual already writes. It does not modify daily notes.
+9. **Multi-source.** A container can read from daily notes + other containers + named data sources simultaneously. Merged, deduped, fed to the LLM as one payload.
 
 ## Repo and build
 
@@ -41,12 +42,13 @@ Templater scripts in the user's vault render note bodies via Dataview. The plugi
 
 ```
 monthly-ritual/
-├── main.js          — all plugin code (~7500 lines as of Phase 10)
+├── main.js          — all plugin code (~9000+ lines as of Phase 11)
 ├── manifest.json    — name: "Periodic Ritual", id: "monthly-ritual"
 ├── styles.css       — graph view + settings styling
 ├── data.json        — user settings (gitignored)
 ├── PROJECT.md       — this file
-├── README.md        — user-facing docs
+├── README.md        — user-facing docs (beginner-friendly quick start + deep dives)
+├── bulbasaur.gif    — loader animation asset
 ├── prompts/         — starter system prompts (5 files, embedded in main.js too)
 └── boundaries/      — sample custom boundary scripts (3 files)
 ```
@@ -55,7 +57,7 @@ monthly-ritual/
 
 ## Primitives
 
-Five first-class objects plus the Container (which references all of them). Each lives in its own top-level settings tab AND is a node type in the graph view.
+Eight first-class objects. Each lives in its own settings section and is a node type in the graph view.
 
 ### Container
 
@@ -66,6 +68,9 @@ The unit of periodic aggregation.
   id: "pr-...",
   name: "Weekly Review",
   enabled: true,
+  useSystemPrompt: true,       // local toggle, respects global master in General
+  useFramework: true,          // local toggle, respects global master in General
+  framework: "Frameworks/wu-xing-lens.md",  // file path, read at runtime
   boundaryDetector: "calendar-week",
   generateAt: "start" | "end",
   template: "Templates/weekly.md",
@@ -74,91 +79,28 @@ The unit of periodic aggregation.
   metadataPlacement: "frontmatter" | "inline" | "none",
   metadataInlineKey: "periodic-ritual",
   // Multi-source: array of { type: "daily" } | { type: "container", containerId }
-  // Empty array is valid — container has no data sources until one is added.
+  //             | { type: "dataSource", dataSourceId }
   dataSource: { sources: [{ type: "daily" }] },
   systemPromptFile: "Templates/prompts/weekly-prompt.md",
   llmServiceId: "lsv-...",
   reflectionId: "rf-...",
-  lastGeneratedEnd: "2026-04-12",  // tracks catch-up resume point
+  lastGeneratedEnd: "2026-04-12",
 }
 ```
 
 ### Boundary
 
-Built-in or custom. Seven built-ins: calendar-week, calendar-month, calendar-quarter, calendar-year, lunar-cycle, lunar-phase, solar-cycle, sun-ingress (Solar Zodiac). Helios-backed ones require the Moon Phase plugin (`obsidian-moon` → baratie:3000 server by default).
+Built-in or custom. Seven built-ins: calendar-week, calendar-month, calendar-quarter, calendar-year, lunar-cycle, lunar-phase, solar-cycle, sun-ingress (Solar Zodiac). Custom boundaries are user-provided JS modules:
 
-Custom boundaries are user-provided JS modules:
 ```js
 module.exports = function(date, app, plugin) {
   return { start: Date, end: Date, tokens: { ... } };
 };
 ```
 
-Each custom boundary has `{ id, name, scriptPath, description }`. The description is prepended to the container's system prompt as orienting context ("this period is a Ki cycle...") so the LLM knows what kind of period it's looking at even when the calculation is opaque.
-
-The Boundaries tab shows every built-in with View source (embedded standalone JS module source, copyable) and Fork as custom (drops a copy in a vault folder the user picks). Custom boundaries get full edit UI + Test against today button.
-
-### Reflection
-
-Reusable Q&A profile. Attached to a container via `container.reflectionId`.
-
-```js
-{
-  id: "rf-...",
-  name: "Weekly reflection",
-  questions: [
-    {
-      text: "What did you learn this week?",
-      injectVar: true,
-      varField: "summary",
-      varFieldType: "frontmatter",
-      varSource: "previous-period" | "note" | "container-current" | "container-previous",
-      varNotePath: "",
-      varSourceContainerId: "",
-      outputToField: true,
-      outputFieldName: "learning",
-      outputFieldType: "inline",
-      outputTargetContainer: "" | "daily-today" | "<pr-container-id>",
-    },
-    // ...
-  ],
-  useLLM: false,               // does submitting answers trigger an LLM call
-  replaceAutoLLM: false,       // does this reflection replace the container's auto-LLM at boundary
-  includeAlignmentContext: false, // include alignment outputs in the LLM call
-  promptPrepend: "",           // optional markdown layered on top of the system prompt
-}
-```
-
-Variable injection sources:
-- `previous-period` — previous note of the same container (e.g., last week)
-- `note` — a specific .md file by path
-- `container-current` — current corresponding note of another PR container
-- `container-previous` — previous note of another PR container
-
-Output targets:
-- empty — active container note
-- `daily-today` — today's daily note (Daily Ritual companion target)
-- `<container-id>` — another PR container's current note
-
-### Alignment
-
-Measurable anchor attached to one container. Runs as a separate focused LLM pass that reads one daily field across the period and writes a short observation to a frontmatter key.
-
-```js
-{
-  id: "al-...",
-  name: "Morning mobility",
-  containerId: "pr-...",
-  dataField: "health",
-  dataFieldType: "inline" | "frontmatter",
-  description: "30 min mobility daily. Surface patterns of consistency and avoidance.",
-  outputField: "alignment_morning_mobility",  // auto-derived from name if empty
-}
-```
+Each custom boundary has `{ id, name, scriptPath, description }`. The description is prepended to the container's system prompt as orienting context.
 
 ### LLM Service
-
-Provider configuration referenced by containers.
 
 ```js
 {
@@ -167,182 +109,199 @@ Provider configuration referenced by containers.
   provider: "gemini" | "openai" | "anthropic" | "openrouter" | "lmstudio" | "openclaw",
   apiKey: "...",
   model: "gemini-2.0-flash-exp",
-  baseUrl: "",  // used by lmstudio and openclaw
+  baseUrl: "",
 }
 ```
 
-Six providers. LM Studio and OpenClaw are local; both take a configurable base URL. OpenClaw selects agents via the model field (`openclaw/default`, `openclaw/mei`, etc.) — the model fetcher lists them as agent targets.
+Six providers. All HTTP uses `requestUrl` to bypass CORS.
 
-All HTTP uses Obsidian's `requestUrl` to bypass CORS — local servers without CORS headers (LM Studio, OpenClaw, custom Helios) work natively.
+### Data Source
+
+Named, reusable reference to a note or folder. Two modes:
+- **static** — one specific note, always read that file
+- **dynamic** — a folder of notes; consumer determines the query:
+  - Container consumer → period-filtered (by `pr-start/end` frontmatter, mtime fallback)
+  - Alignment group consumer → single latest note (by mtime)
+
+```js
+{
+  id: "ds-...",
+  name: "Life charter",
+  mode: "static" | "dynamic",
+  notePath: "Core/Charter.md",     // static only
+  folderPath: "Journal/Months",    // dynamic only
+}
+```
+
+Defined in Settings → General → Data sources. Rendered as teal nodes in the graph view. Output wires into container `in-data` sockets or alignment group `in-source` sockets.
+
+### Alignment Group
+
+Gap-analysis pass attached to a container. Reads guidelines from a source (DataSource or container), auto-discovers `{prefix}_*` fields as individual alignments, compares against the container's subdivision activity, writes results back to the container's frontmatter.
+
+```js
+{
+  id: "ag-...",
+  name: "Life alignments",
+  prefix: "alignment",
+  containerId: "",               // wire-driven (target container)
+  sourceKind: "data-source",     // wire-driven or dropdown
+  sourceId: "ds-...",
+  llmServiceId: "lsv-...",
+  systemPromptFile: "Prompts/gap-analysis.md",
+  useSystemPrompt: true,
+  useFramework: true,
+  framework: "Frameworks/alignment-framework.md",
+  includeAggregatedSummary: true,
+  defaultMode: "separate",
+  defaultTarget: "{prefix}_{name}",
+  defaultTemplate: "",
+  overrides: {},                 // per-alignment: { mode, target, template }
+}
+```
+
+**Four output modes** per discovered alignment:
+| Mode | LLM? | What it does |
+|---|---|---|
+| `separate` | yes | LLM narrative → `{prefix}_{name}` key |
+| `rewrite` | yes | LLM concise string → replaces target key |
+| `prepend` | **no** | Template splice with `{entries}` from subdivisions |
+
+**Per-alignment config precedence:**
+1. Source-note meta keys (`alignment_health_target`, `_mode`, `_template`) — highest
+2. Group `overrides` map — middle
+3. Group `defaultMode` / `defaultTarget` / `defaultTemplate` — fallback
+
+**Template tokens** (prepend only): `{guideline}`, `{entries}`, `{existing}`, `{name}`
+
+`{entries}` = collected subdivision field values for the alignment's short name, joined with ", ".
+
+**LLM bundling:** all LLM-mode alignments in a group are sent in ONE API call. Splice-mode alignments run as pure string operations — no tokens, no latency.
+
+**Instructions isolation:** the bundled prompt explicitly tells the LLM to treat each alignment independently, not cross-reference, not merge concepts across dimensions.
+
+### Reflection
+
+Reusable Q&A profile. Attached to a container via `container.reflectionId`. Runs on demand, not at boundary.
+
+```js
+{
+  id: "rf-...",
+  name: "Weekly reflection",
+  questions: [ ... ],           // inject + output config per question
+  useLLM: false,
+  replaceAutoLLM: false,
+  includeAlignmentContext: false,
+  promptPrepend: "",
+}
+```
+
+### Show Output (graph-only)
+
+Debugging/inspection node. One universal `in-any` input, no output. "Dry Run" button probes the wired upstream node and renders inline structured output (▼ INPUT / ▲ OUTPUT). Actually calls the LLM for containers and alignment groups (dry-run mode: skips file writes, returns parsed keys for preview). Progress bar stays visible through the entire async run.
 
 ---
 
 ## Generation pipeline (at boundary)
 
-1. **Boundary check.** On plugin load (if `prAutoGenerateOnLoad`), walk every enabled container in topological order (by dataSource dependencies). For each, ask the boundary detector "has a new period started since lastGeneratedEnd?"
-2. **Note creation.** Read the container's template. Apply token resolution (Obsidian core `{{title}}/{{date:FMT}}`, plus PR-specific `{{week}}`, `{{month-name}}`, `{{phase-emoji}}`, etc.). Resolve the naming convention to a filename. Create the file with `vault.create`. Stamp per-note metadata (`id`, `boundary`, `start`, `end`) to the configured placement (frontmatter nested key, inline marker, or none).
-3. **Open the file** in a leaf so templater scripts that read `app.workspace.getActiveFile()` see the right file.
-4. **Main LLM aggregation** (unless suppressed by a `replaceAutoLLM` reflection):
-   - Build the source payload: walk `dataSource.sources`, collect daily notes + other-container notes in range, dedupe by path, format each as a `## <filename>` section with frontmatter + inline fields (body excluded to save tokens).
-   - Compose the user message: period header → reflection answers (if any) → previous frontmatter (for "both" re-runs) → alignment outputs (if `includeAlignmentContext`) → source notes payload.
-   - Build the system prompt: container's system prompt MD file content, prepended with the boundary description.
-   - Call the LLM via the configured service.
-   - Parse the YAML response (with code-fence + doc-marker stripping) and merge into the container note's frontmatter via `processFrontMatter`.
-5. **Alignment passes.** For each alignment attached to the container: pull the named daily field from every daily in range, send as a focused LLM payload with the alignment description as system prompt, write the response to the alignment's output key on the container note.
-6. **Update `lastGeneratedEnd`.** Saves the period's end date so next run resumes from there.
-7. **Notice.** "Generated [container name]: [filename]." No blocking modals.
+1. **Boundary check.** Walk every enabled container in topological order (by dataSource dependencies). Ask the boundary detector "has a new period started since lastGeneratedEnd?"
+2. **Note creation.** Template → token resolution → `vault.create` → metadata stamp → open file.
+3. **Alignment groups run FIRST.** For each group attached to this container:
+   - Resolve guidelines source → latest note
+   - Auto-discover `{prefix}_*` fields (skip meta keys)
+   - Resolve per-alignment config (mode, target, template)
+   - Splice-mode writes run immediately (no LLM)
+   - LLM-mode alignments bundled into one API call using the **group's own system prompt** (NOT the container's) + **group's framework file** (if set)
+   - Write results to container frontmatter
+4. **Main LLM aggregation** (unless suppressed by `replaceAutoLLM` reflection):
+   - Uses the **container's system prompt** (NOT the alignment group's) + **container's framework file** (if set)
+   - Reads source payload + previous frontmatter (which now includes alignment outputs from step 3)
+   - Container's system prompt can reference alignment results narratively
+   - Parse YAML response, merge into frontmatter
+5. **Legacy single alignments** (if any) run after main aggregation.
+6. **Update `lastGeneratedEnd`.**
 
-If auto-generate is off, all of this happens manually via the "Generate container note" command or the "Generate now" button on the container card / node.
+**System prompts never bleed between layers.** Each LLM call uses its own system prompt file. The alignment group call and the main container call are completely isolated — different system prompts, different framework files, different instruction blocks.
 
-### Reflection flow (on-demand)
+### Framework reinforcement
 
-Runs when the user invokes "Reflect on container" (or the context-aware version that auto-detects the active file's container). Opens the `ReflectionModal` (same class Daily Ritual uses) with the reflection's questions. On submit:
+A markdown file whose contents get injected into the LLM user message at the highest-attention position (right before the YAML output instructions). More reliable than system prompts for procedural thinking guidance, mental models, and analytical lenses.
 
-1. **Write each answer to its output field** (active container note, another container's current note, or today's daily note).
-2. **If `includeAlignmentContext`:** run alignments first (instead of after) so they're in the frontmatter when the LLM reads it.
-3. **If `useLLM`:** run `runPRLLMAggregation` with answers + injected context + (conditionally) previous frontmatter + alignment outputs.
-4. **If `replaceAutoLLM` and alignments haven't run yet:** run them now.
+Two global master switches in General: "Enable system prompts" and "Enable frameworks". When off, all containers/groups run without that channel. Each container/group also has local `useSystemPrompt` and `useFramework` toggles.
+
+### YAML safety
+
+All LLM calls append a YAML formatting requirements tail (no colons in values, no quotes, no doc markers). The `parsePRLLMResponse` function also runs a pre-parse sanitizer (`sanitizePRYamlForParse`) that auto-quotes ambiguous values before handing them to `parseYaml`.
 
 ---
 
-## Graph view (Phase 10)
+## Graph view (Phase 10+11)
 
-Node-based visual editor. Custom-built for PR's primitive set — no third-party library. DOM nodes inside a pannable/zoomable viewport, SVG layer for bezier wires.
-
-### Access
-
-- Ribbon icon: "Periodic Ritual Graph" (fork icon)
-- Command: `Periodic Ritual: Open graph view`
-- Settings → Containers tab → "Open graph view" button
+Node-based visual editor. Custom-built — no third-party library. DOM nodes + SVG bezier wires inside a pannable/zoomable viewport.
 
 ### Node kinds
 
-| Node | Source | Editable title | Inline widgets | Full inline editor |
-|---|---|---|---|---|
-| **Container** | `prContainers` | yes | Enabled toggle | Boundary, generate at, template, save dir, naming (with live preview), metadata, data sources, LLM service, system prompt, reflection, generate button |
-| **Reflection** | `prReflections` | yes | Send to LLM, Replace auto, Inc. alignments toggles | Prompt prepend, full questions list with per-question inject + output panels |
-| **Alignment** | `prAlignments` | yes | Field text | Container picker, field type, description, output key |
-| **LLM Service** | `prLLMServices` | yes | — | Provider, base URL (conditional), API key, model + fetch button |
-| **Custom Boundary** | `prCustomBoundaries` | yes | — | Script picker, description, test button |
-| **Built-in Boundary** | implicit | no | — | — (inspect only) |
-| **Daily source** | implicit | no | — | — (inspect only) |
+| Node | Source | Kind pill color |
+|---|---|---|
+| **Container** | `prContainers` | blue (accent) |
+| **Boundary** (built-in) | implicit | blue-gray |
+| **Boundary** (custom) | `prCustomBoundaries` | blue-gray |
+| **LLM Service** | `prLLMServices` | green |
+| **Reflection** | `prReflections` | purple |
+| **Alignment** | `prAlignments` | orange |
+| **Alignment Group** | `prAlignmentGroups` | darker orange |
+| **Data Source** | `prDataSources` | teal |
+| **Daily source** | implicit | faint |
+| **Show Output** | `prShowNodes` | gray |
 
-Nodes have sockets on the sides: containers have 5 input sockets on the left (data, boundary, llm, reflection, alignment), every node has one output socket on the right. Sockets hover-label their type and scale on hover.
+All nodes have a colored kind pill in the header. Canvas context menus (add node) have colored pipes next to each option.
 
-### Interactions
+Sockets:
+- **Container**: 5 inputs (data, boundary, llm, reflection, alignment) + 1 output
+- **Alignment Group**: 2 inputs (source, llm) + 1 output (→ container in-alignment)
+- **Show Output**: 1 universal input (in-any), no output
+- **Data Source**: 1 output, no inputs
+- All other nodes: 1 output, no inputs
 
-| Action | Effect |
-|---|---|
-| Wheel | Zoom (0.25x–3x), centered on cursor |
-| Drag empty canvas | Pan |
-| Ctrl/Cmd + drag empty canvas | Marquee selection |
-| Click node (no modifier) | Toggle expand/collapse (250ms deferred) |
-| Double-click node | Open settings to that primitive's tab, scroll to its card with accent flash |
-| Double-click empty canvas | Add menu at click point |
-| Right-click node | Context menu: Inspect output, View system prompt (containers), Edit in settings, Enable/Disable (containers), Duplicate (containers/reflections), Delete |
-| Right-click wire | Delete option |
-| Right-click empty canvas | Add menu (Container, Reflection, Alignment, LLM service, Custom boundary) |
-| Drag output socket → input socket | Create connection (snap within 50px of compatible sockets) |
-| Drag empty input socket → empty canvas | Opens create-source menu with compatible options |
-| Drag empty input socket → compatible output | Wire it up |
-| Drag connected input socket | Detach wire, drag free, reconnect on drop or stay disconnected |
-| Click a wire | Delete |
-| Ctrl/Cmd + click node | Toggle membership in selection |
-| Drag selected node | Moves every selected node together |
-| Delete / Backspace (selection) | Delete all selected primitives |
-| Cmd/Ctrl + C (selection) | Copy selected to in-memory clipboard |
-| Cmd/Ctrl + V (clipboard set) | Paste with new ids, positions offset 30/30 |
-| Cmd/Ctrl + A | Select all primitive nodes |
-| Escape | Clear selection |
+### Node sizing
 
-### Snap connect
-
-During wire drag, the closest compatible socket within 50 viewport-pixels of the cursor gets a pulsing accent ring and the ghost wire locks on. Release lands the connection on the snapped socket regardless of exact cursor position.
-
-### Filter popover
-
-Toolbar → 🔍 Filter button. Three controls:
-- **Kind checkboxes** (show containers / boundaries / LLM services / reflections / alignments / daily source)
-- **Focus on container** dropdown: reduces the graph to one container's full dependency graph (upstream sources + downstream consumers, recursively)
-- **Enabled containers only** toggle
-
-### Inspect output
-
-Right-click any node → "Inspect output". Per-kind read-only modal:
-- Container: data sources, current period, most recent generated note path + open button, filtered frontmatter, alignment outputs section
-- Boundary: description, current period from today, full token map
-- Reflection: mode flags, prompt prepend, question list with [inject:field] [output:field] tags
-- Alignment: wired-to container, reads field, writes-to key, description
-- LLM service: provider / model / baseUrl / key status
-- Daily: folder + recent count
-
-### Empty-state canvas
-
-When there are no primitive nodes yet, the canvas still renders with the toolbar and dotted-grid background. A small overlay at the center reads "Blank graph — right-click or double-click anywhere to add a container, reflection, alignment, LLM service, or custom boundary." Pointer-events disabled on the overlay so the canvas interactions work through it.
+Each node has a resize grip (bottom-right corner). Collapsed and expanded states have **independent saved sizes** — chevron toggle swaps between them. Double-click the grip resets the current state's override.
 
 ### Persistence
 
-Node positions and expanded state save to `settings.prGraphLayout = { [nodeId]: { x, y, expanded } }`. Selection, filters, and clipboard are in-memory only.
+`settings.prGraphLayout = { [nodeId]: { x, y, expanded, collapsed: {w,h}, expanded: {w,h} } }`
 
 ---
 
 ## Settings structure
 
-Six outer tabs (the legacy "Existing" tab was deleted in Phase 8f):
+Seven outer tabs, General first:
 
-- **Containers** — list of container cards with full edit UI. "Open graph view" button in the header.
-- **Boundaries** — built-in cards (read-only with View source / Fork as custom) and custom cards (editable).
-- **Reflection** — reusable reflection profiles with full editor.
-- **Alignment** — alignment definitions attached to containers.
+- **General** — README link, auto-generate toggle, Features section (global system-prompt + framework masters), data sources list, daily notes folder, astrology toggles, Zodiac Calendar settings.
+- **Containers** — container cards. Each: enabled, boundary, generate-at, template, save dir, naming (live preview), metadata, data sources list, LLM service, system prompt + use-system-prompt toggle, framework picker + use-framework toggle, reflection, Generate now.
+- **Boundaries** — built-in cards + custom cards.
+- **Reflection** — reflection profiles with questions + mode toggles.
+- **Alignment** — Alignment Groups (primary, with discovered-alignments table per group) + single alignments (if any exist).
 - **LLM** — provider service definitions.
-- **General** — auto-generate toggle, daily notes folder, astrology toggles, Zodiac Calendar settings (timezone, separate solar and lunar note folders, per-phase naming).
-
-Settings tab card renderers stamp `data-pr-card-id` on each card so the graph view's double-click can scroll to the exact card and flash an accent pulse.
-
----
-
-## Companion: Daily Ritual
-
-Cross-plugin integration (one change on each side):
-
-- **Daily Ritual → Periodic Ritual (read):** DR's question inject sources now include "Current note of a Periodic Ritual container" — looks up a PR container by id, finds its most recent generated note, reads the named field from frontmatter (or inline) to inject above the daily question.
-- **Periodic Ritual → Daily Ritual (write):** PR reflection question output targets now include "Today's daily note" — writes the answer to the daily note matching today's date via `parseDateFromFilename`.
-
-Both plugins treat each other as optional dependencies. DR hides the PR source option when PR isn't installed; PR's daily-note target works without DR being present.
 
 ---
 
 ## Phase history
 
-| Phase | What shipped |
+| Phase | What |
 |---|---|
-| **0** | Scaffolding: new outer tabs (Containers / Boundaries / Reflection / Alignment / LLM / Existing / General), additive settings keys, legacy UI preserved in Existing tab |
-| **1** | Single container card with Calendar Week detector, template + save dir + naming tokens, no LLM |
-| **2** | LLM services with 6 providers, per-container system prompt, YAML merge into frontmatter, CORS fix via requestUrl, 5 starter prompts, data-shape documentation |
-| **3** | Auto-generation at boundary with topological catch-up, on/off toggle, generateAt start-vs-end setting |
-| **4a** | Calendar Month / Quarter / Year detectors |
-| **4b** | Lunar Cycle / Lunar Phase / Sun Ingress (Helios-backed) detectors |
-| **4c** | Boundaries tab, custom JS module backend, boundary description prepended to system prompt, Solar Cycle detector |
-| **5** | (merged into 4b/4c) |
-| **6** | Reflection as a first-class tab with reusable profiles, per-question inject + output, useLLM and replaceAutoLLM toggles decoupled from Q&A collection |
-| **7** | Alignment module — per-container measurable anchors with focused LLM passes |
-| **8a–f** | dataSource for hierarchical roll-up, cross-container reflection pull/push, topological sort, lunar token convenience, General tab consolidation, Existing tab deletion |
-| **9** | Active-file-aware reflection command, debug modal showing last LLM call, Mermaid hierarchy diagram, README rewrite, sample custom boundary scripts, cross-plugin DR↔PR interop |
-| **10a** | Graph view scaffold: node rendering, pan/zoom, drag to move, click to edit |
-| **10b** | Wire drag, click-to-delete, right-click menus, inline parameter widgets |
-| **10c** | Collapsible nodes, full inline edit forms for all primitive types, filter popover, scroll-to-card on double-click |
-| **10c polish** | Socket hover labels, alignment-context toggle on reflection, drag from empty input, rewire connected inputs, multi-select with marquee, snap-connect, multi-source data, container→container wire fix, inspect modal, blank-canvas empty state |
-
----
-
-## Non-goals (v1)
-
-- No mobile-specific UI
-- No daily-note modification (read-only)
-- No cross-container analysis ("how does my Aries period compare to my Pisces period")
-- No built-in dashboards or charts (templater + Dataview in the body)
-- No conflict resolution if two containers write the same frontmatter key (user is responsible)
-- No streak tracking, compliance scores, or red/green status (anti-fragile by design)
+| 0 | Tab structure, "Existing" legacy settings preserved, additive only |
+| 1 | Container primitives: template, save dir, naming, token resolution |
+| 2 | LLM aggregation via configurable services |
+| 3 | Auto-generation on load (boundary-driven catch-up) |
+| 4 | Boundary rework: custom JS, descriptions, Fork-as-custom |
+| 5 | Multi-provider LLM: Gemini, OpenAI, Anthropic, OpenRouter, LM Studio, OpenClaw |
+| 6 | Reflection rework: reusable profiles with Q&A, cross-container inject/output |
+| 7 | Alignments: daily-field measurement per container |
+| 8 | Multi-source containers, cross-container data flow, topological catch-up |
+| 9 | README + starter prompts rewrite |
+| 10 | Graph view: custom node editor with pan/zoom, wire drag, snap, multi-select, marquee, filter, inspect, copy/paste, inline editors |
+| 11 | Show Output nodes (dry-run probes with live LLM calls), Data Sources (static/dynamic note/folder references), Alignment Groups (auto-discovered gap analysis with prepend/rewrite/separate modes, per-alignment config, one LLM call per group, framework reinforcement), Framework feature (file-based injection at highest-attention slot), global system-prompt/framework masters, node resize with per-state sizing, YAML safety (sanitizer + LLM instructions), inline field regex fix (cross-line bleed), colored kind pipes in menus |
 
 ---
 
@@ -350,14 +309,13 @@ Both plugins treat each other as optional dependencies. DR hides the PR source o
 
 | Term | Meaning |
 |---|---|
-| Container | A periodic note (week, month, chapter, lunar phase, ...). The unit of aggregation. |
-| Boundary | A date-range calculator. Built-in (calendar math / Helios HTTP) or custom JS. |
-| Data source | Where a container reads from: daily notes, or another container, or any combination. |
-| Reflection | Reusable Q&A profile attached to a container. Questions support inject + output. |
-| Alignment | Measurable anchor attached to a container. One focused LLM pass per period. |
-| LLM service | A `{provider, api key, model}` bundle. Containers reference services by id. |
-| System prompt | Markdown file sent as the system role during LLM aggregation. The customization layer. |
-| Helios | Local API server (`baratie:3000` by default) for ephemeris data. Provided by the Moon Phase plugin. |
-| Graph view | Node-based visual editor for the full primitive set. |
-| Topological sort | Catch-up order so a container's sources generate before it does. |
-| lastGeneratedEnd | ISO date of the most recent period a container generated a note for. Resume point for catch-up. |
+| **Container** | A periodic note class (weekly, monthly, lunar, etc.) |
+| **Boundary detector** | Function that returns `{start, end, tokens}` for a date |
+| **Source payload** | The text blob sent to the LLM (frontmatter + inline fields from source notes, no body content) |
+| **Alignment Group** | Gap-analysis primitive: reads guidelines, compares against subdivisions, writes to container |
+| **Data Source** | Named note/folder reference (static or dynamic) |
+| **Framework** | Markdown file injected at highest-attention position in the LLM user message |
+| **Splice mode** | Alignment output mode that uses a template string with `{guideline}`, `{entries}`, `{existing}` tokens — no LLM call |
+| **Show Output** | Graph-only probe node for dry-running any upstream node |
+| **processFrontMatter** | Obsidian API for safe YAML writes — parse → mutate → serialize |
+| **Helios** | Local ephemeris server (baratie:3000) used by lunar/solar boundary detectors |
