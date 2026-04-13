@@ -550,6 +550,16 @@ function makePRContainer(overrides = {}) {
         //           what happened during the period — generating mid-period
         //           would be premature.
         generateAt: "start",
+        // Write-back: run alignments + LLM on the EXISTING note at a
+        // second boundary point. Empty = no write-back. "end" = write
+        // when the period ends. "start" = write when the next period
+        // starts (unusual but valid). The note must already exist.
+        writeBackAt: "",
+        // When in the lifecycle the main LLM aggregation fires.
+        //   "generate"  — only at note creation (generateAt time)
+        //   "writeback" — only at write-back (writeBackAt time)
+        //   "both"      — at both passes (default)
+        runLLMAt: "both",
         template: "",
         saveDir: "",
         naming: "",
@@ -694,22 +704,37 @@ function makePRAlignment(overrides = {}) {
     return Object.assign({
         id: "al-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
         name: "New alignment",
-        // Which container this alignment is attached to. Empty string means
-        // unassigned — the alignment exists in settings but doesn't fire on
-        // any container generation until you pick one.
         containerId: "",
         // Daily field to pull. e.g. "health" for inline `health::` or
         // frontmatter `health:`.
         dataField: "",
         dataFieldType: "inline",  // "inline" | "frontmatter"
-        // Markdown text describing what's being measured. Sent to the LLM as
-        // context for the alignment pass — e.g., "30 min mobility/cardio
-        // daily, 80% sleep score average. Surface patterns of consistency
-        // and avoidance, not compliance scoring."
+        // Markdown text describing what's being measured. Used as the inline
+        // system prompt when no systemPromptFile is set. Also doubles as the
+        // guideline text for the {guideline} template token in prepend mode.
         description: "",
-        // Frontmatter key on the container note where the LLM observation
-        // is written. Defaults to alignment_<sanitized-name>.
+        // Namespace prefix for auto-composing the output key. When outputField
+        // is empty, the result lands on `{prefix}_{sanitized-name}`. When
+        // outputField is explicitly set, it takes precedence over the prefix.
+        prefix: "alignment",
+        // Explicit output key override. When non-empty, overrides prefix+name.
         outputField: "",
+        // Output shape — same three modes as alignment groups.
+        //   "separate" — LLM narrative to own key (default, legacy behavior)
+        //   "rewrite"  — LLM concise string replaces target key
+        //   "prepend"  — template splice with {guideline}, {entries}, {existing}, {name}
+        mode: "separate",
+        template: "",    // for prepend mode; default: "**{guideline}** — {entries}"
+        // Own LLM service — empty = fall back to the container's llmServiceId.
+        llmServiceId: "",
+        // File-based system prompt — empty = fall back to description as
+        // the inline system prompt (legacy behavior).
+        systemPromptFile: "",
+        // Framework reinforcement file — injected at highest-attention slot.
+        framework: "",
+        // Local toggles — respects global masters in General.
+        useSystemPrompt: true,
+        useFramework: true,
     }, overrides);
 }
 
@@ -766,6 +791,16 @@ function makePRAlignmentGroup(overrides = {}) {
         useFramework: true,
         framework: "",
         includeAggregatedSummary: true,  // feed the container's fresh frontmatter as extra context
+        // When in the lifecycle this group fires.
+        //   "generate"  — only at note creation (generateAt time)
+        //   "writeback" — only at write-back (writeBackAt time)
+        //   "both"      — at both passes (default)
+        runAt: "both",
+        // Where the output gets written on the container note.
+        //   "frontmatter" — processFrontMatter (default)
+        //   "inline"      — body inline fields (key:: value)
+        //   "body"        — body markers ({{pr:key}})
+        writeTo: "frontmatter",
         // Per-alignment output shape.
         //   defaultMode:
         //     - "separate" → LLM writes narrative to {prefix}_{name} key
@@ -783,6 +818,13 @@ function makePRAlignmentGroup(overrides = {}) {
         defaultTarget: "{prefix}_{name}",
         defaultTemplate: "",
         overrides: {},
+        // When combined is true, all discovered alignments feed into ONE
+        // LLM call that returns a single unified narrative. Individual
+        // per-alignment modes are ignored. The result is written to
+        // combinedOutputKey (defaults to {prefix}_combined).
+        combined: false,
+        combinedOutputKey: "",
+        combinedMaxSentences: 10,
     }, overrides);
 }
 
@@ -3055,11 +3097,17 @@ class MonthlyRitualPlugin extends Plugin {
             const folderPath = container.saveDir || "";
             const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
 
-            // If a note for this period already exists, treat it as already
-            // generated for the purpose of auto-catch-up: update
-            // lastGeneratedEnd so subsequent runs skip past it.
+            // If a note for this period already exists:
+            //   - If this is a write-back pass (opts.writeBack), run the
+            //     full alignment + LLM pipeline against the existing note
+            //     and write results to frontmatter, inline fields, and
+            //     body markers.
+            //   - Otherwise, treat it as already generated and skip.
             const existing = this.app.vault.getAbstractFileByPath(filePath);
             if (existing) {
+                if (opts.writeBack && existing instanceof TFile) {
+                    return await this.writeBackToPRContainerNote(container, existing, data, opts);
+                }
                 if (!opts.silent) new Notice(`Already exists: ${filePath}`);
                 container.lastGeneratedEnd = formatDate(data.end);
                 await this.saveSettings();
@@ -3140,11 +3188,18 @@ class MonthlyRitualPlugin extends Plugin {
             // so the main summary can reference alignment outputs. The main
             // call is then given includePreviousFrontmatter so it sees the
             // group results the groups just wrote.
+            //
+            // Each primitive checks opts.phase against its own runAt /
+            // runLLMAt setting. Phase "generate" is the note-creation pass;
+            // "writeback" is the second pass on an existing note.
+            const phase = opts.phase || "generate";
             if (!skipAutoLLM) {
-                await this.runPRAlignmentGroupsForContainer(container, file, range, opts);
+                await this.runPRAlignmentGroupsForContainer(container, file, range, { ...opts, phase });
             }
 
-            if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM) {
+            const runLLMAt = container.runLLMAt || "both";
+            const shouldRunLLM = runLLMAt === "both" || runLLMAt === phase;
+            if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM && shouldRunLLM) {
                 await this.runPRLLMAggregation(container, file, range, {
                     ...opts,
                     includePreviousFrontmatter: true,
@@ -3152,16 +3207,159 @@ class MonthlyRitualPlugin extends Plugin {
             }
 
             // Legacy single alignments still run AFTER main aggregation so
-            // existing flows are unaffected. New alignment groups are the
-            // supported path; legacy only exists for backwards compat.
+            // existing flows are unaffected.
             if (!skipAutoLLM) {
                 await this.runPRAlignmentsForContainer(container, file, range, opts);
             }
+
+            // Propagate frontmatter values to body (inline fields + markers)
+            // so {{pr:key}} and key:: lines are updated after every pass,
+            // not just during write-back.
+            await this.propagatePRFrontmatterToBody(file);
 
             return file;
         } catch (e) {
             if (!opts.silent) new Notice(`Error generating ${container.name}: ${e.message}`);
             console.error("Periodic Ritual:", e);
+        }
+    }
+
+    // ─── Write-back: run the full pipeline on an existing note ───
+    //
+    // Called when a container has writeBackAt set and the note already
+    // exists. Runs the same alignment-group → main-LLM → legacy-alignment
+    // pipeline as generatePRContainerNote, but skips note creation. After
+    // the frontmatter is written, also scans the note body for:
+    //   - Inline fields (`key:: old`) → replaced with `key:: new`
+    //   - Body markers (`{{pr:key}}`) → replaced with the value
+    async writeBackToPRContainerNote(container, file, data, opts = {}) {
+        if (!opts.silent) new Notice(`${container.name}: writing back to ${file.path}…`);
+
+        const reflection = this.getPRReflectionForContainer(container);
+        const skipAutoLLM = !!(reflection && reflection.replaceAutoLLM);
+        const range = { start: data.start, end: data.end };
+        const phase = "writeback";
+
+        // Same pipeline order as generatePRContainerNote, but phase =
+        // "writeback" so only primitives with runAt matching fire.
+        // 1. Alignment groups first
+        if (!skipAutoLLM) {
+            await this.runPRAlignmentGroupsForContainer(container, file, range, { ...opts, phase });
+        }
+        // 2. Main LLM aggregation (respects container.runLLMAt)
+        const runLLMAt = container.runLLMAt || "both";
+        const shouldRunLLM = runLLMAt === "both" || runLLMAt === phase;
+        if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM && shouldRunLLM) {
+            await this.runPRLLMAggregation(container, file, range, {
+                ...opts,
+                includePreviousFrontmatter: true,
+            });
+        }
+        // 3. Legacy single alignments
+        if (!skipAutoLLM) {
+            await this.runPRAlignmentsForContainer(container, file, range, opts);
+        }
+
+        // After all frontmatter writes are done, read the final state and
+        // propagate values into the note body (inline fields + markers).
+        await this.propagatePRFrontmatterToBody(file);
+
+        container.lastGeneratedEnd = formatDate(data.end);
+        await this.saveSettings();
+
+        if (!opts.silent) new Notice(`${container.name}: write-back complete`);
+        return file;
+    }
+
+    // Scan the note body for two kinds of replaceable tokens and update
+    // them with the current frontmatter values:
+    //
+    //   1. Inline fields: `key:: old value` → `key:: new value`
+    //      Only replaces keys that exist in frontmatter so we don't clobber
+    //      user-managed inline fields that have no frontmatter counterpart.
+    //
+    //   2. Body markers: `{{pr:key}}` → the frontmatter value as plain text.
+    //      These are one-shot: once replaced, the marker is gone. If you
+    //      want it back, re-add it manually or re-create the note.
+    async propagatePRFrontmatterToBody(file) {
+        if (!file) return;
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter || {};
+        const keys = Object.keys(fm).filter(k =>
+            k !== "periodic-ritual" && k !== "position" && !k.startsWith("pr-")
+        );
+        if (keys.length === 0) return;
+
+        let content = await this.app.vault.read(file);
+        let changed = false;
+
+        for (const k of keys) {
+            const v = fm[k];
+            if (v === null || v === undefined) continue;
+            const valStr = typeof v === "object" ? JSON.stringify(v) : String(v);
+
+            // 1. Inline field replacement: `key:: old` → `key:: new`
+            const inlineRe = new RegExp(`^(${escapeRegex(k)}::)[ \\t]*(.*)$`, "m");
+            if (inlineRe.test(content)) {
+                content = content.replace(inlineRe, `$1 ${valStr}`);
+                changed = true;
+            }
+
+            // 2. Body marker replacement: {{pr:key}} → value
+            const marker = `{{pr:${k}}}`;
+            if (content.includes(marker)) {
+                content = content.split(marker).join(valStr);
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            await this.app.vault.modify(file, content);
+        }
+    }
+
+    // Write a key-value map to a container note using the specified target.
+    // Called by alignment group passes instead of raw processFrontMatter so
+    // each group can choose where its output lands.
+    async writePRKeysToNote(file, writes, writeTo) {
+        if (!file || Object.keys(writes).length === 0) return;
+        const target = writeTo || "frontmatter";
+
+        if (target === "frontmatter") {
+            await this.app.fileManager.processFrontMatter(file, fm => {
+                for (const [k, v] of Object.entries(writes)) fm[k] = v;
+            });
+            return;
+        }
+
+        let content = await this.app.vault.read(file);
+        let changed = false;
+
+        for (const [k, v] of Object.entries(writes)) {
+            const valStr = (v === null || v === undefined) ? "" :
+                (typeof v === "object" ? JSON.stringify(v) : String(v));
+
+            if (target === "inline") {
+                // Replace existing inline field, or append if not found
+                const re = new RegExp(`^(${escapeRegex(k)}::)[ \\t]*(.*)$`, "m");
+                if (re.test(content)) {
+                    content = content.replace(re, `$1 ${valStr}`);
+                } else {
+                    // Append as a new inline field at the end of the body
+                    content = content.trimEnd() + `\n${k}:: ${valStr}\n`;
+                }
+                changed = true;
+            } else if (target === "body") {
+                const marker = `{{pr:${k}}}`;
+                if (content.includes(marker)) {
+                    content = content.split(marker).join(valStr);
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed) {
+            await this.app.vault.modify(file, content);
         }
     }
 
@@ -3813,11 +4011,16 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     //   "container-current" — current corresponding note of another container
     //                         (uses findMostRecentPRContainerNote on that container)
     //   "container-previous"— previous note of another container
-    async resolvePRInjectedVar(question, container) {
+    async resolvePRInjectedVar(question, container, currentFile) {
         if (!question || !question.injectVar || !question.varField) return "";
         let sourceFile = null;
         const src = question.varSource || "previous-period";
-        if (src === "note" && question.varNotePath) {
+        if (src === "current" && currentFile) {
+            // Current note — the note being reflected on (last boundary
+            // crossed in this container). Already has frontmatter from
+            // the main aggregation + alignments by the time reflection runs.
+            sourceFile = currentFile;
+        } else if (src === "note" && question.varNotePath) {
             const f = this.app.vault.getAbstractFileByPath(question.varNotePath);
             if (f && f instanceof TFile) sourceFile = f;
         } else if (src === "container-current" && question.varSourceContainerId) {
@@ -3992,7 +4195,7 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         // model sees the context the user was responding to.
         const injectedVars = [];
         for (const q of reflection.questions) {
-            injectedVars.push(await this.resolvePRInjectedVar(q, container));
+            injectedVars.push(await this.resolvePRInjectedVar(q, container, file));
         }
 
         new ReflectionModal(this.app, reflection.questions, injectedVars, async (answers) => {
@@ -4062,23 +4265,78 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
             if (!opts.silent) new Notice(`Alignment "${alignment.name}": no data field configured`);
             return;
         }
-        if (!alignment.description || !alignment.description.trim()) {
-            if (!opts.silent) new Notice(`Alignment "${alignment.name}": no description configured`);
+
+        const mode = alignment.mode || "separate";
+        const prefix = (alignment.prefix || "alignment").trim();
+        const shortName = (alignment.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_");
+        const outputKey = (alignment.outputField || "").trim() || `${prefix}_${shortName}`;
+
+        // ── Collect subdivision entries for the tracked field ──
+        const entriesStr = await this.collectPRFieldFromSubdivisions(
+            container, range.start, range.end, alignment.dataField
+        );
+
+        // ── Prepend mode: pure template splice, no LLM ──
+        if (mode === "prepend") {
+            const currentFm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
+            const existing = currentFm[outputKey] ?? "";
+            const existingStr = typeof existing === "object" ? JSON.stringify(existing) : String(existing);
+            const defaultTemplate = "**{guideline}** — {entries}";
+            const tmpl = (alignment.template || "").trim() || defaultTemplate;
+            const spliced = this.applyPRAlignmentTemplate(tmpl, {
+                guideline: alignment.description || "",
+                entries:   entriesStr,
+                existing:  existingStr,
+                name:      shortName,
+            });
+            try {
+                await this.app.fileManager.processFrontMatter(file, fm => {
+                    fm[outputKey] = spliced;
+                });
+                if (!opts.silent) new Notice(`Alignment "${alignment.name}": wrote to ${outputKey} (prepend)`);
+            } catch (e) {
+                new Notice(`Alignment "${alignment.name}": failed to write — ${e.message}`);
+            }
             return;
         }
 
-        const service = this.getPRLLMService(container.llmServiceId);
+        // ── LLM modes: separate or rewrite ──
+
+        // Resolve LLM service — own service overrides container's
+        const serviceId = alignment.llmServiceId || container.llmServiceId;
+        const service = this.getPRLLMService(serviceId);
         if (!service || !service.model) {
-            if (!opts.silent) new Notice(`Alignment "${alignment.name}": container has no usable LLM service`);
+            if (!opts.silent) new Notice(`Alignment "${alignment.name}": no usable LLM service`);
             return;
         }
 
-        // Collect the named field from each daily note in range
+        // Build system prompt — file-based if set, otherwise inline description
+        let systemPrompt = "";
+        const globalSP = this.settings.prSystemPromptsGlobalEnabled !== false;
+        const useSP = globalSP && alignment.useSystemPrompt !== false;
+        if (useSP && alignment.systemPromptFile) {
+            try { systemPrompt = await this.loadTemplate(alignment.systemPromptFile); } catch (_) {}
+        }
+        if (!systemPrompt && alignment.description && alignment.description.trim()) {
+            // Fall back to description as inline system prompt (legacy behavior)
+            systemPrompt = [
+                `# Alignment: ${alignment.name}`,
+                "",
+                alignment.description.trim(),
+                "",
+                "# Your task",
+                "",
+                mode === "rewrite"
+                    ? `Look at the daily values below for "${alignment.dataField}". Return ONLY a concise string (5-20 words) capturing how close the actuals are to this alignment. No YAML, no headings.`
+                    : `Look at the daily values below for "${alignment.dataField}". Surface patterns of consistency, drift, and absence — not compliance scoring. Return ONLY a short observation (1-3 sentences). No YAML, no headings, no preamble.`,
+            ].join("\n");
+        }
+
+        // Collect per-day field values for the user message (list format)
         const endInclusive = new Date(range.end);
         endInclusive.setHours(23, 59, 59, 999);
         const dailies = this.findDailyNotesInRange(range.start, endInclusive);
-
-        const entries = [];
+        const entryLines = [];
         for (const dn of dailies) {
             let val = "";
             if (alignment.dataFieldType === "frontmatter") {
@@ -4092,31 +4350,43 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
                 const m = body.match(re);
                 val = m ? m[1].trim() : "";
             }
-            if (val) entries.push(`- ${dn.basename}: ${val}`);
+            if (val) entryLines.push(`- ${dn.basename}: ${val}`);
         }
 
-        // Compose the LLM payload
-        const systemPrompt = [
-            `# Alignment: ${alignment.name}`,
-            "",
-            alignment.description.trim(),
-            "",
-            "# Your task",
-            "",
-            `Look at the daily values below for the field "${alignment.dataField}" across the period. Surface patterns of consistency, drift, and absence — not compliance scoring. Return ONLY a single string: a short observation (1-3 sentences) on how this alignment is going. No YAML, no markdown headings, no preamble.`,
-        ].join("\n");
-
-        const userMessage = [
+        const parts = [
             `# Period`,
             `start: ${formatDate(range.start)}`,
             `end: ${formatDate(range.end)}`,
             `daily_count: ${dailies.length}`,
-            `entries_with_value: ${entries.length}`,
+            `entries_with_value: ${entryLines.length}`,
             "",
             `# Daily values for "${alignment.dataField}"`,
             "",
-            entries.length > 0 ? entries.join("\n") : "(no entries in range)",
-        ].join("\n");
+            entryLines.length > 0 ? entryLines.join("\n") : "(no entries in range)",
+        ];
+
+        // Framework reinforcement
+        const globalFW = this.settings.prFrameworksGlobalEnabled !== false;
+        const useFW = globalFW && alignment.useFramework !== false && alignment.framework;
+        if (useFW) {
+            try {
+                const fwText = await this.loadTemplate(alignment.framework);
+                if (fwText && fwText.trim()) {
+                    parts.push("", "# Framework reinforcement", "", fwText.trim());
+                }
+            } catch (_) {}
+        }
+
+        // YAML hygiene tail
+        parts.push("");
+        parts.push("# Output format");
+        if (mode === "rewrite") {
+            parts.push(`Return ONLY a concise string (5-20 words) for the key \`${outputKey}\`. No YAML block, no headings. Plain text only.`);
+        } else {
+            parts.push(`Return ONLY a short observation (1-3 sentences) for the key \`${outputKey}\`. No YAML block, no headings. Plain text only.`);
+        }
+
+        const userMessage = parts.join("\n");
 
         const provider = PROVIDERS[service.provider];
         if (!provider) {
@@ -4128,15 +4398,25 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         try {
             if (!opts.silent) new Notice(`Alignment "${alignment.name}": running…`);
             const url = provider.buildUrl(service);
-            const body = provider.buildBody(userMessage, service, systemPrompt);
+            const bodyJson = provider.buildBody(userMessage, service, systemPrompt);
             const headers = {
                 "Content-Type": "application/json",
                 ...(provider.headers ? provider.headers(service) : {}),
             };
-            const r = await requestUrl({
-                url, method: "POST", headers,
-                body: JSON.stringify(body),
-                throw: false,
+            const r = await requestUrl({ url, method: "POST", headers, body: JSON.stringify(bodyJson), throw: false });
+            this.recordPRLastLLMCall({
+                timestamp: new Date().toISOString(),
+                container: `${container.name} → ${alignment.name}`,
+                service: service.name,
+                provider: service.provider,
+                model: service.model,
+                url,
+                requestHeaders: headers,
+                requestBody: bodyJson,
+                responseStatus: r.status,
+                responseRaw: r.text || "",
+                systemPrompt,
+                userMessage,
             });
             if (r.status < 200 || r.status >= 300) {
                 throw new Error(`${r.status}: ${(r.text || "").slice(0, 300)}`);
@@ -4152,9 +4432,6 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
             if (!opts.silent) new Notice(`Alignment "${alignment.name}": empty response`);
             return;
         }
-
-        // Pick the output frontmatter key. Default: alignment_<sanitized-name>.
-        const outputKey = (alignment.outputField || "").trim() || `alignment_${(alignment.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
 
         try {
             await this.app.fileManager.processFrontMatter(file, fm => {
@@ -4187,7 +4464,12 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
     //   - the extracted guidelines
     // Then parses the YAML response and merges keys into the container note.
     async runPRAlignmentGroupsForContainer(container, file, range, opts = {}) {
-        const groups = (this.settings.prAlignmentGroups || []).filter(g => g.containerId === container.id);
+        const phase = opts.phase || "generate";
+        const groups = (this.settings.prAlignmentGroups || []).filter(g => {
+            if (g.containerId !== container.id) return false;
+            const runAt = g.runAt || "both";
+            return runAt === "both" || runAt === phase;
+        });
         if (groups.length === 0) return;
         for (const g of groups) {
             await this.runPRAlignmentGroupPass(g, container, file, range, opts);
@@ -4392,6 +4674,11 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         if (Object.keys(guidelines).length === 0) {
             if (!opts.silent) new Notice(`${group.name}: no ${group.prefix}_* fields found in ${sourceFile.path}`);
             return;
+        }
+
+        // ── Combined mode: all alignments → one unified narrative ──
+        if (group.combined || (group.defaultMode || "separate") === "combined") {
+            return await this._runPRAlignmentGroupCombined(group, container, file, range, src, opts);
         }
 
         // 2. Resolve per-alignment config — split into splice-only vs LLM-required
@@ -4604,15 +4891,156 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             };
         }
 
-        // 6. Write all staged keys in one processFrontMatter call
+        // 6. Write all staged keys using the group's configured target
         if (!file || writeKeys.length === 0) return;
         try {
-            await this.app.fileManager.processFrontMatter(file, fm => {
-                for (const k of writeKeys) fm[k] = writes[k];
-            });
-            if (!opts.silent) new Notice(`${group.name}: wrote ${writeKeys.length} alignment(s)`);
+            await this.writePRKeysToNote(file, writes, group.writeTo || "frontmatter");
+            if (!opts.silent) new Notice(`${group.name}: wrote ${writeKeys.length} alignment(s) to ${group.writeTo || "frontmatter"}`);
         } catch (e) {
-            if (!opts.silent) new Notice(`${group.name}: failed to write frontmatter — ${e.message}`);
+            if (!opts.silent) new Notice(`${group.name}: failed to write — ${e.message}`);
+        }
+    }
+
+    // Combined-mode alignment group: all discovered alignments → one
+    // unified LLM call → one output key. The model sees every guideline
+    // together and returns a single holistic narrative instead of per-key
+    // YAML. Written to `combinedOutputKey` (default `{prefix}_combined`).
+    async _runPRAlignmentGroupCombined(group, container, file, range, src, opts = {}) {
+        const { sourceFile, sourceLabel, guidelines } = src;
+        const prefix = (group.prefix || "alignment").trim();
+        const outputKey = (group.combinedOutputKey || "").trim() || `${prefix}_combined`;
+
+        const service = this.getPRLLMService(group.llmServiceId);
+        if (!service || !service.model) {
+            if (!opts.silent) new Notice(`${group.name}: no usable LLM service for combined mode`);
+            return;
+        }
+
+        let systemPrompt = "";
+        const globalSP = this.settings.prSystemPromptsGlobalEnabled !== false;
+        const useSP = globalSP && group.useSystemPrompt !== false;
+        if (useSP && group.systemPromptFile) {
+            try { systemPrompt = await this.loadTemplate(group.systemPromptFile); } catch (_) {}
+        }
+
+        const payload = await this.buildPRSourcePayload(container, range.start, range.end);
+
+        const parts = [
+            "# Period",
+            `start: ${formatDate(range.start)}`,
+            `end: ${formatDate(range.end)}`,
+            `source: ${payload.label || "daily notes"}`,
+            `count: ${payload.count}`,
+            "",
+        ];
+
+        if (group.includeAggregatedSummary !== false && file) {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const aggregated = cache?.frontmatter || {};
+            const lines = [];
+            for (const [k, v] of Object.entries(aggregated)) {
+                if (k === "periodic-ritual" || k === "position" || k.startsWith("pr-")) continue;
+                if (k.startsWith(prefix + "_")) continue;
+                if (v === null || v === undefined) continue;
+                if (typeof v === "object") lines.push(`${k}: ${JSON.stringify(v)}`);
+                else lines.push(`${k}: ${v}`);
+            }
+            if (lines.length > 0) {
+                parts.push("# Aggregated container summary", "", ...lines, "");
+            }
+        }
+
+        parts.push(`# Guidelines (from ${sourceLabel} — ${sourceFile.path})`, "");
+        for (const [k, v] of Object.entries(guidelines)) {
+            parts.push(`- **${k}**: ${v}`);
+        }
+        parts.push("");
+
+        const globalFW = this.settings.prFrameworksGlobalEnabled !== false;
+        const useFW = globalFW && group.useFramework !== false && group.framework;
+        if (useFW) {
+            try {
+                const fwText = await this.loadTemplate(group.framework);
+                if (fwText && fwText.trim()) {
+                    parts.push("# Framework reinforcement", "", fwText.trim(), "");
+                }
+            } catch (_) {}
+        }
+
+        parts.push("# Instructions", "");
+        parts.push(`Return a YAML block with exactly one key: \`${outputKey}\`.`);
+        parts.push("");
+        const maxSentences = group.combinedMaxSentences || 10;
+        parts.push(`The value must be a single unified narrative (up to ${maxSentences} sentences) that addresses ALL of the guidelines above together. Weave connections between dimensions where they exist. Be concise and specific — cite numbers, counts, and patterns, not vague generalities.`);
+        parts.push("");
+        parts.push("**YAML formatting requirements:**");
+        parts.push("- Use plain, unquoted string values. Commas, semicolons, periods, and internal punctuation are fine.");
+        parts.push("- Do NOT place a colon followed by a space (`: `) inside the value — rephrase instead.");
+        parts.push("- Do NOT start the value with `-`, `#`, `[`, or `{`.");
+        parts.push("- Do NOT wrap the value in quotes.");
+        parts.push("- Do NOT return YAML document markers (`---`).");
+        parts.push("- Keep it to ONE short paragraph. No line breaks inside the value.");
+        parts.push("");
+        parts.push(`# Source activity (${payload.label || "daily notes"})`, "", payload.text);
+
+        const userMessage = parts.join("\n");
+
+        const provider = PROVIDERS[service.provider];
+        if (!provider) {
+            if (!opts.silent) new Notice(`${group.name}: unknown provider`);
+            return;
+        }
+
+        let responseText;
+        try {
+            if (!opts.silent) new Notice(`${group.name}: combined analysis via ${service.name}…`);
+            const url = provider.buildUrl(service);
+            const bodyJson = provider.buildBody(userMessage, service, systemPrompt);
+            const headers = {
+                "Content-Type": "application/json",
+                ...(provider.headers ? provider.headers(service) : {}),
+            };
+            const r = await requestUrl({ url, method: "POST", headers, body: JSON.stringify(bodyJson), throw: false });
+            this.recordPRLastLLMCall({
+                timestamp: new Date().toISOString(),
+                container: `${container.name} → ${group.name} (combined)`,
+                service: service.name, provider: service.provider, model: service.model,
+                url, requestHeaders: headers, requestBody: bodyJson,
+                responseStatus: r.status, responseRaw: r.text || "",
+                systemPrompt, userMessage,
+            });
+            if (r.status < 200 || r.status >= 300) {
+                throw new Error(`${r.status}: ${(r.text || "").slice(0, 300)}`);
+            }
+            responseText = provider.extractText(r.json);
+        } catch (e) {
+            if (!opts.silent) new Notice(`${group.name}: LLM call failed — ${e.message}`);
+            console.error("Periodic Ritual alignment-group combined error:", e);
+            return;
+        }
+
+        if (!responseText) {
+            if (!opts.silent) new Notice(`${group.name}: empty response`);
+            return opts.dryRun ? { parsed: { [outputKey]: "" }, writes: {}, guidelines, systemPrompt, userMessage, empty: true, combined: true } : undefined;
+        }
+
+        // Parse through the standard YAML pipeline (fence stripping +
+        // sanitizer) so the combined response gets the same safety
+        // treatment as every other LLM output.
+        const parsed = this.parsePRLLMResponse(responseText);
+        const value = parsed[outputKey] || responseText.trim();
+        const writes = { [outputKey]: value };
+
+        if (opts.dryRun) {
+            return { parsed: writes, writes, guidelines, systemPrompt, userMessage, combined: true, outputKey };
+        }
+
+        if (!file) return;
+        try {
+            await this.writePRKeysToNote(file, writes, group.writeTo || "frontmatter");
+            if (!opts.silent) new Notice(`${group.name}: wrote combined analysis to ${outputKey} (${group.writeTo || "frontmatter"})`);
+        } catch (e) {
+            if (!opts.silent) new Notice(`${group.name}: failed to write — ${e.message}`);
         }
     }
 
@@ -4775,6 +5203,40 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
 
         if (multi) {
             new Notice(`${container.name}: generated ${created} note(s)`);
+        }
+
+        // Write-back pass: if the container has writeBackAt set, check if
+        // there's an existing note for a period whose boundary has been
+        // crossed on the write-back side. For example, generateAt=start
+        // + writeBackAt=end means: when the period ENDS, re-run the
+        // pipeline on the already-existing note.
+        const writeBackAt = container.writeBackAt || "";
+        if (writeBackAt) {
+            // Find the most recently ENDED period that has an existing note
+            // but may not have been written back to yet. We use a simple
+            // heuristic: if the current period has ended (or is the one we
+            // just generated), check if its note exists and run the write-back.
+            try {
+                // Check the previous period (just ended)
+                const prevDate = addDays(currentRange.start, -1);
+                const prevRange = await this.getPRBoundaryData(container.boundaryDetector, prevDate);
+                if (prevRange && prevRange.end < now) {
+                    const prevFileName = this.resolveTokens(container.naming, prevRange.tokens);
+                    const prevFolder = container.saveDir || "";
+                    const prevPath = prevFolder ? `${prevFolder}/${prevFileName}.md` : `${prevFileName}.md`;
+                    const prevFile = this.app.vault.getAbstractFileByPath(prevPath);
+                    if (prevFile && prevFile instanceof TFile) {
+                        // Only write back if the period end matches the writeBackAt timing
+                        const shouldWriteBack = (writeBackAt === "end" && prevRange.end < now)
+                            || (writeBackAt === "start" && prevRange.start <= now);
+                        if (shouldWriteBack) {
+                            await this.writeBackToPRContainerNote(container, prevFile, prevRange, { silent: false });
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error(`Periodic Ritual: write-back check failed for ${container.name}`, e);
+            }
         }
     }
 
@@ -5186,7 +5648,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         // opens the modal for the picked one.
         this.addCommand({
             id: "pr-reflect",
-            name: "Periodic Ritual: Reflect on container",
+            name: "Periodic Ritual: Reflect",
             callback: () => this.pickAndReflectPRContainer(),
         });
 
@@ -5261,26 +5723,35 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         return null;
     }
 
-    pickAndReflectPRContainer() {
-        // Phase 9: if the active file belongs to a PR container with a
-        // reflection profile attached, run reflection on it directly
-        // instead of opening the picker. The picker is the fallback.
-        this.detectPRContainerFromActiveFile().then(detected => {
-            if (detected && detected.reflectionId) {
-                this.runPRContainerReflection(detected);
-                return;
-            }
-            const containers = (this.settings.prContainers || []).filter(c => !!c.reflectionId);
-            if (containers.length === 0) {
-                new Notice("No Periodic Ritual containers have a reflection profile attached. Define one in the Reflection tab and pick it on a container in the Containers tab.");
-                return;
-            }
-            const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
-                await this.runPRContainerReflection(container);
-            });
-            modal.setPlaceholder("Pick a container to reflect on…");
-            modal.open();
+    async pickAndReflectPRContainer() {
+        // Collect containers that have a reflection attached AND have a
+        // generated note for the current period (boundary crossed). Only
+        // these appear in the picker — there's nothing to reflect on if
+        // the note hasn't been generated yet.
+        const candidates = [];
+        const withReflection = (this.settings.prContainers || []).filter(c => !!c.reflectionId);
+        if (withReflection.length === 0) {
+            new Notice("No containers have a reflection profile attached. Attach one in Settings → Containers.");
+            return;
+        }
+        for (const c of withReflection) {
+            const file = await this.findMostRecentPRContainerNote(c);
+            if (file) candidates.push(c);
+        }
+        if (candidates.length === 0) {
+            new Notice("No containers with reflections have a generated note for the current period. Generate one first.");
+            return;
+        }
+        if (candidates.length === 1) {
+            // Only one eligible — skip the picker and go straight to Q&A.
+            await this.runPRContainerReflection(candidates[0]);
+            return;
+        }
+        const modal = new PRContainerPickerModal(this.app, candidates, async (container) => {
+            await this.runPRContainerReflection(container);
         });
+        modal.setPlaceholder("Pick a container to reflect on…");
+        modal.open();
     }
 
     // Fuzzy picker over all configured PR containers (enabled or not).
@@ -5673,7 +6144,10 @@ class PRGraphView extends ItemView {
             });
         }
 
-        // ── Alignment nodes (always shown, attached or not) ──
+        // ── Legacy alignment nodes — only rendered if prAlignments has entries.
+        // New alignments are created as alignment groups (which also handle
+        // single-alignment use cases). This block exists purely for backward
+        // compat so old data still shows nodes.
         for (const a of alignments) {
             nodes.push({
                 id: `alignment-${a.id}`,
@@ -6128,7 +6602,7 @@ class PRGraphView extends ItemView {
             container:         "container",
             reflection:        "reflection",
             alignment:         "alignment",
-            "alignment-group": "alignment group",
+            "alignment-group": "alignment",
             llm:               "llm service",
             daily:             "source",
             show:              "show output",
@@ -6495,6 +6969,30 @@ class PRGraphView extends ItemView {
             (v) => { c.generateAt = v; }
         );
 
+        // Run LLM at
+        h.addLabeledDropdown(
+            "Run LLM at",
+            [
+                { value: "both",      label: "Both passes" },
+                { value: "generate",  label: "Generate only" },
+                { value: "writeback", label: "Write-back only" },
+            ],
+            () => c.runLLMAt || "both",
+            (v) => { c.runLLMAt = v; }
+        );
+
+        // Write back at
+        h.addLabeledDropdown(
+            "Write back at",
+            [
+                { value: "",      label: "None (single pass)" },
+                { value: "end",   label: "End of period" },
+                { value: "start", label: "Start of next period" },
+            ],
+            () => c.writeBackAt || "",
+            (v) => { c.writeBackAt = v; }
+        );
+
         // Template picker
         h.addPicker("Template", c.template, "(none)",
             () => new MarkdownFileSuggestModal(this.app, async (file) => {
@@ -6791,8 +7289,9 @@ class PRGraphView extends ItemView {
             const allContainers = s.prContainers || [];
             addLabeledDropdown("Source",
                 [
-                    { value: "previous-period",  label: "Previous period (this container)" },
-                    { value: "note",             label: "Specific note" },
+                    { value: "current",            label: "Current note (last boundary crossed)" },
+                    { value: "previous-period",    label: "Previous period (this container)" },
+                    { value: "note",               label: "Specific note" },
                     { value: "container-current",  label: "Current note of another container" },
                     { value: "container-previous", label: "Previous note of another container" },
                 ],
@@ -7006,6 +7505,26 @@ class PRGraphView extends ItemView {
             () => g.prefix, (v) => { g.prefix = v; }
         );
 
+        h.addLabeledDropdown("Run at",
+            [
+                { value: "both",      label: "Both passes" },
+                { value: "generate",  label: "Generate only" },
+                { value: "writeback", label: "Write-back only" },
+            ],
+            () => g.runAt || "both",
+            (v) => { g.runAt = v; }
+        );
+
+        h.addLabeledDropdown("Write to",
+            [
+                { value: "frontmatter", label: "Frontmatter" },
+                { value: "inline",      label: "Inline (key:: value)" },
+                { value: "body",        label: "Body marker ({{pr:key}})" },
+            ],
+            () => g.writeTo || "frontmatter",
+            (v) => { g.writeTo = v; }
+        );
+
         // Target container picker — same field a wire to in-alignment sets.
         const targetOpts = [{ value: "", label: "— None —" }];
         for (const c of (s.prContainers || [])) {
@@ -7075,7 +7594,7 @@ class PRGraphView extends ItemView {
             async () => { g.framework = ""; await this.plugin.saveSettings(); this.render(); }
         );
 
-        h.addLabeledToggle("Include aggregated summary",
+        h.addLabeledToggle("Include container frontmatter",
             () => g.includeAggregatedSummary !== false,
             (v) => { g.includeAggregatedSummary = v; }
         );
@@ -7086,15 +7605,29 @@ class PRGraphView extends ItemView {
                 { value: "separate", label: "separate (LLM narrative)" },
                 { value: "rewrite",  label: "rewrite (LLM concise)" },
                 { value: "prepend",  label: "prepend (splice, no LLM)" },
+                { value: "combined", label: "combined (one unified narrative)" },
             ],
             () => g.defaultMode || "separate",
             (v) => { g.defaultMode = v; }
         );
-        h.addLabeledText("Default target", "{prefix}_{name}",
-            () => g.defaultTarget || "{prefix}_{name}",
-            (v) => { g.defaultTarget = v; }
-        );
         const dm = g.defaultMode || "separate";
+        if (dm === "combined") {
+            const combinedDefault = `${(g.prefix || "alignment").trim()}_combined`;
+            h.addLabeledText("Combined key", combinedDefault,
+                () => g.combinedOutputKey || "",
+                (v) => { g.combinedOutputKey = v; }
+            );
+            h.addLabeledText("Max sentences", "10",
+                () => String(g.combinedMaxSentences || 10),
+                (v) => { g.combinedMaxSentences = parseInt(v, 10) || 10; }
+            );
+        }
+        if (dm !== "combined") {
+            h.addLabeledText("Default target", "{prefix}_{name}",
+                () => g.defaultTarget || "{prefix}_{name}",
+                (v) => { g.defaultTarget = v; }
+            );
+        }
         if (dm === "prepend") {
             h.addLabeledText("Default template", "**{guideline}** — {entries}",
                 () => g.defaultTemplate || "",
@@ -7102,8 +7635,13 @@ class PRGraphView extends ItemView {
             );
         }
 
-        const hint = body.createEl("div", { cls: "pr-graph-form-preview" });
-        hint.setText(`Per-alignment overrides live in Settings → Alignment → this group's card. Source-note meta keys (alignment_health_mode / _target / _template) take highest priority.`);
+        // Info icon — hover or click to see override documentation
+        const infoRow = body.createEl("div");
+        infoRow.style.cssText = "display: flex; align-items: center; gap: 6px; margin-top: 8px;";
+        const infoIcon = infoRow.createEl("span");
+        infoIcon.style.cssText = "display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--text-muted); color: var(--text-muted); font-size: 0.7em; font-weight: 600; font-family: serif; cursor: help; flex-shrink: 0;";
+        infoIcon.setText("i");
+        infoIcon.title = "Per-alignment overrides\n\nPrecedence (highest → lowest):\n1. Source-note meta keys:\n   alignment_health_mode: rewrite\n   alignment_health_target: health\n   alignment_health_template: **{guideline}** — {entries}\n\n2. Per-alignment overrides in Settings → Alignment → Discovered alignments table\n\n3. Group defaults (Default mode / Default target / Default template above)\n\nTokens for prepend templates:\n  {guideline} — source note value\n  {entries} — subdivision field values joined with comma\n  {existing} — current target key value on container\n  {name} — alignment short name";
     }
 
     // Data source primitive — mode (static/dynamic) + note or folder picker.
@@ -7736,12 +8274,65 @@ class PRGraphView extends ItemView {
                 line("(none generated yet)", true);
             }
 
-            // ─ Alignment groups attached to this container ─
+            // ─ Alignment groups attached to this container — dry-run each ─
             const attachedGroups = (plugin.settings.prAlignmentGroups || []).filter(g => g.containerId === c.id);
             if (attachedGroups.length > 0) {
                 section(`Alignment groups (${attachedGroups.length})`);
                 for (const g of attachedGroups) {
-                    line(`• ${g.name} — prefix ${g.prefix || "alignment"}`);
+                    const modeLbl = (g.defaultMode || "separate") === "combined" ? "combined" : g.defaultMode || "separate";
+                    line(`• ${g.name} — prefix ${g.prefix || "alignment"} (${modeLbl})`);
+                }
+
+                // Actually dry-run each alignment group so their output
+                // appears in the container probe alongside the main LLM.
+                if (data) {
+                    for (const g of attachedGroups) {
+                        section(`Alignment dry run: ${g.name}`);
+                        try {
+                            const agResult = await plugin.runPRAlignmentGroupPass(g, c, file || null, { start: data.start, end: data.end }, { dryRun: true, silent: true });
+                            if (!agResult || agResult.empty) {
+                                line("(empty or no output)", true);
+                            } else {
+                                const agWrites = agResult.writes || agResult.parsed || {};
+                                const agKeys = Object.keys(agWrites);
+                                if (agKeys.length === 0) {
+                                    line("(nothing would be written)", true);
+                                } else {
+                                    const existing = file ? (app.metadataCache.getFileCache(file)?.frontmatter || {}) : {};
+                                    for (const k of agKeys) {
+                                        const row = el.createEl("div");
+                                        row.style.cssText = "padding: 4px 0; border-bottom: 1px dashed var(--background-modifier-border);";
+                                        const hdr = row.createEl("div");
+                                        const keyEl = hdr.createEl("span", { text: k });
+                                        keyEl.style.cssText = "color: var(--interactive-accent); font-weight: 600;";
+                                        const existed = Object.prototype.hasOwnProperty.call(existing, k);
+                                        const badge = hdr.createEl("span");
+                                        badge.style.cssText = "margin-left: 8px; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em;";
+                                        if (existed) {
+                                            badge.setText("overwrites");
+                                            badge.style.background = "#f0a04b";
+                                            badge.style.color = "#000";
+                                        } else {
+                                            badge.setText("new");
+                                            badge.style.background = "var(--interactive-accent)";
+                                            badge.style.color = "var(--text-on-accent, #fff)";
+                                        }
+                                        const val = row.createEl("div", { text: String(agWrites[k] ?? "") });
+                                        val.style.cssText = "margin-top: 2px; color: var(--text-normal); white-space: pre-wrap; font-size: 0.85em;";
+                                        if (existed) {
+                                            const prev = existing[k];
+                                            const prevStr = prev === null || prev === undefined ? "(empty)" : (typeof prev === "object" ? JSON.stringify(prev) : String(prev));
+                                            const was = row.createEl("div", { text: `was: ${prevStr}` });
+                                            was.style.cssText = "margin-top: 2px; color: var(--text-faint); font-size: 0.75em; font-style: italic;";
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            const err = el.createEl("div", { text: `Alignment error: ${e.message}` });
+                            err.style.color = "var(--text-error, #e26a6a)";
+                        }
+                    }
                 }
             }
 
@@ -8046,8 +8637,7 @@ class PRGraphView extends ItemView {
             { id: "boundary",         label: "Boundaries" },
             { id: "llm",              label: "LLM Services" },
             { id: "reflection",       label: "Reflections" },
-            { id: "alignment",        label: "Alignment" },
-            { id: "alignment-group",  label: "Alignment groups" },
+            { id: "alignment-group",  label: "Alignments" },
             { id: "daily",            label: "Daily source" },
             { id: "data-source",      label: "Data sources" },
             { id: "show",             label: "Show output probes" },
@@ -8405,7 +8995,7 @@ class PRGraphView extends ItemView {
                 },
             },
             {
-                label: "Alignment group",
+                label: "Alignment",
                 color: this.colorForKind("alignment-group"),
                 onClick: async () => {
                     if (!Array.isArray(this.plugin.settings.prAlignmentGroups)) {
@@ -8414,17 +9004,6 @@ class PRGraphView extends ItemView {
                     const g = makePRAlignmentGroup();
                     this.plugin.settings.prAlignmentGroups.push(g);
                     seedPosition(`alignmentgroup-${g.id}`);
-                    await this.plugin.saveSettings();
-                    this.render();
-                },
-            },
-            {
-                label: "Alignment",
-                color: this.colorForKind("alignment"),
-                onClick: async () => {
-                    const a = makePRAlignment();
-                    this.plugin.settings.prAlignments.push(a);
-                    seedPosition(`alignment-${a.id}`);
                     await this.plugin.saveSettings();
                     this.render();
                 },
@@ -9628,6 +10207,7 @@ class PRGraphView extends ItemView {
         let dragStartNodeX = 0;
         let dragStartNodeY = 0;
         let moved = false;
+        let lastMouseDownEvent = null;
 
         // Group-drag state when the user grabs a selected node — every
         // selected node moves by the same delta.
@@ -9680,6 +10260,7 @@ class PRGraphView extends ItemView {
             dragStartNodeX = node.x;
             dragStartNodeY = node.y;
             moved = false;
+            lastMouseDownEvent = e;
             nodeEl.style.zIndex = "10";
             e.preventDefault();
             e.stopPropagation();
@@ -9736,20 +10317,72 @@ class PRGraphView extends ItemView {
                 }
                 await this.plugin.saveSettings();
             }
-            // Single click on a node → toggle expand (deferred 250ms so a
-            // double click can cancel and open settings instead).
+            // Single click on a node:
+            //   1. Select it (clear previous selection unless Ctrl held).
+            //      This makes Delete/Backspace work immediately after click.
+            //   2. Toggle expand/collapse (deferred 250ms so a double click
+            //      can cancel and open settings instead).
             if (!moved) {
-                if (this._pendingNodeTap) clearTimeout(this._pendingNodeTap);
-                const clickedNode = node;
-                this._pendingNodeTap = setTimeout(async () => {
-                    this._pendingNodeTap = null;
-                    if (!this.nodeIsPrimitive(clickedNode)) return;
-                    await this.setNodeExpanded(clickedNode, !this.isNodeExpanded(clickedNode));
-                    this.render();
-                }, 250);
+                // Selection — standard editor behavior: click = solo select,
+                // Ctrl+click = toggle multi-select.
+                if (node && this.nodeIsPrimitive(node)) {
+                    if (lastMouseDownEvent && (lastMouseDownEvent.ctrlKey || lastMouseDownEvent.metaKey)) {
+                        if (this.selection.has(node.id)) this.selection.delete(node.id);
+                        else this.selection.add(node.id);
+                    } else {
+                        this.selection.clear();
+                        this.selection.add(node.id);
+                    }
+                    for (const n of this.nodes) {
+                        if (n.el) n.el.classList.toggle("pr-graph-node-selected", this.selection.has(n.id));
+                    }
+                }
+
+                // Skip expand/collapse when the click landed on an
+                // interactive element (toggle, input, button, select,
+                // textarea, label wrapping a toggle). These should handle
+                // their own events without triggering a layout change.
+                const clickTarget = lastMouseDownEvent?.target;
+                const isInteractive = clickTarget && (
+                    clickTarget.closest("input") ||
+                    clickTarget.closest("select") ||
+                    clickTarget.closest("textarea") ||
+                    clickTarget.closest("button") ||
+                    clickTarget.closest(".pr-graph-widget-toggle") ||
+                    clickTarget.closest(".pr-graph-form-select") ||
+                    clickTarget.closest(".pr-graph-form-text") ||
+                    clickTarget.closest(".pr-graph-form-textarea") ||
+                    clickTarget.closest(".pr-graph-form-button") ||
+                    clickTarget.closest(".pr-graph-form-picker-buttons") ||
+                    clickTarget.closest(".pr-graph-node-resize")
+                );
+
+                if (!isInteractive) {
+                    if (this._pendingNodeTap) clearTimeout(this._pendingNodeTap);
+                    const clickedNode = node;
+                    this._pendingNodeTap = setTimeout(async () => {
+                        this._pendingNodeTap = null;
+                        if (!this.nodeIsPrimitive(clickedNode)) return;
+                        await this.setNodeExpanded(clickedNode, !this.isNodeExpanded(clickedNode));
+                        this.render();
+                    }, 250);
+                }
             }
+            lastMouseDownEvent = null;
             groupStarts = null;
         };
+
+        // Click on empty canvas (not on a node) → clear selection so
+        // Delete/Backspace doesn't accidentally fire on a stale selection.
+        viewport.addEventListener("click", (e) => {
+            if (e.target.closest(".pr-graph-node")) return;
+            if (this.selection.size > 0) {
+                this.selection.clear();
+                for (const n of this.nodes) {
+                    if (n.el) n.el.classList.remove("pr-graph-node-selected");
+                }
+            }
+        });
 
         viewport.addEventListener("mousedown", onMouseDown);
         window.addEventListener("mousemove", onMouseMove);
@@ -10187,6 +10820,35 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 dd.setValue(container.generateAt || "start");
                 dd.onChange(async v => {
                     container.generateAt = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // ── Write-back at ──
+        new Setting(card)
+            .setName("Run LLM at")
+            .setDesc("When the main LLM aggregation fires. 'Generate' = only at note creation. 'Write-back' = only at write-back. 'Both' = at both passes.")
+            .addDropdown(dd => {
+                dd.addOption("both", "Both passes");
+                dd.addOption("generate", "Generate only");
+                dd.addOption("writeback", "Write-back only");
+                dd.setValue(container.runLLMAt || "both");
+                dd.onChange(async v => {
+                    container.runLLMAt = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        new Setting(card)
+            .setName("Write back at")
+            .setDesc("Run alignments + LLM on the EXISTING note at a second boundary point. Use this when the note is created at the start of a period but you want the LLM aggregation to run at the end (when all daily data exists). Leave as 'None' for single-pass containers.")
+            .addDropdown(dd => {
+                dd.addOption("", "None (single pass)");
+                dd.addOption("end", "End of period");
+                dd.addOption("start", "Start of next period");
+                dd.setValue(container.writeBackAt || "");
+                dd.onChange(async v => {
+                    container.writeBackAt = v;
                     await this.plugin.saveSettings();
                 });
             });
@@ -10748,6 +11410,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     new Setting(panel)
                         .setName("Source")
                         .addDropdown(dd => {
+                            dd.addOption("current", "Current note (last boundary crossed)");
                             dd.addOption("previous-period", "Previous period of THIS container");
                             dd.addOption("note", "A specific note");
                             dd.addOption("container-current", "Current note of ANOTHER container");
@@ -10886,21 +11549,17 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
     // Phase 7: real Alignment tab. List of alignments with full edit UI.
     displayAlignmentsStub(containerEl) {
         const s = this.plugin.settings;
-        if (!Array.isArray(s.prAlignments)) s.prAlignments = [];
         if (!Array.isArray(s.prAlignmentGroups)) s.prAlignmentGroups = [];
 
         containerEl.createEl("h2", { text: "Alignment" });
         const intro = containerEl.createEl("p");
         intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
-        intro.setText("Alignment Groups run gap analysis after a container generates its note. Each group wires to a guidelines source (a DataSource or another container), an LLM service, and a target container. Individual alignments inside the group are auto-discovered from the source note by prefix — every field matching {prefix}_* becomes a gap-analysis target. The LLM returns the same keys with analysis as values, and they get merged into the target container's frontmatter.");
-
-        // ── Alignment Groups section (primary) ──
-        containerEl.createEl("h3", { text: "Alignment Groups" }).style.marginTop = "24px";
+        intro.setText("Alignments run gap analysis when a container generates its note. Each alignment wires to a guidelines source (a DataSource or another container), an LLM service, and a target container. Individual alignment dimensions are auto-discovered from the source note by prefix — every field matching {prefix}_* becomes a gap-analysis target. Works for single alignments too — just put one field in the source note.");
 
         if (s.prAlignmentGroups.length === 0) {
             const empty = containerEl.createEl("p");
             empty.style.cssText = "color: var(--text-faint); margin: 8px 0;";
-            empty.setText("No alignment groups yet. Create one here, then wire it up in the graph view (source → group → container).");
+            empty.setText("No alignments yet. Create one here, then wire it up in the graph view (source → alignment → container).");
         } else {
             for (let i = 0; i < s.prAlignmentGroups.length; i++) {
                 this.renderPRAlignmentGroupCard(containerEl, s.prAlignmentGroups[i], i);
@@ -10909,24 +11568,13 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .addButton(btn => btn
-                .setButtonText("+ Add alignment group")
+                .setButtonText("+ Add alignment")
                 .setCta()
                 .onClick(async () => {
                     s.prAlignmentGroups.push(makePRAlignmentGroup());
                     await this.plugin.saveSettings();
                     this.display();
                 }));
-
-        // ── Single alignments (shown only if any exist) ──
-        if (s.prAlignments.length > 0) {
-            containerEl.createEl("h3", { text: "Single alignments" }).style.marginTop = "32px";
-            const legacyIntro = containerEl.createEl("p");
-            legacyIntro.style.cssText = "color: var(--text-faint); font-size: 0.85em; max-width: 60ch;";
-            legacyIntro.setText("Single per-container alignments. Still run at boundary time; Alignment Groups are the newer, more flexible option.");
-            for (let i = 0; i < s.prAlignments.length; i++) {
-                this.renderPRAlignmentCard(containerEl, s.prAlignments[i], i);
-            }
-        }
     }
 
     renderPRAlignmentGroupCard(parent, group, idx) {
@@ -10937,14 +11585,14 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const header = card.createDiv({ cls: "mr-pr-card-header" });
         const nameInput = header.createEl("input", { type: "text", value: group.name || "", cls: "mr-pr-name-input" });
-        nameInput.placeholder = "Alignment group name";
+        nameInput.placeholder = "Alignment name";
         nameInput.addEventListener("change", async () => {
             group.name = nameInput.value;
             await this.plugin.saveSettings();
         });
 
         const deleteBtn = header.createEl("button", { text: "×", cls: "mr-pr-delete-btn" });
-        deleteBtn.title = "Delete alignment group";
+        deleteBtn.title = "Delete alignment";
         deleteBtn.addEventListener("click", async () => {
             s.prAlignmentGroups.splice(idx, 1);
             await this.plugin.saveSettings();
@@ -10963,6 +11611,34 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     group.prefix = v;
                     await this.plugin.saveSettings();
                 }));
+
+        new Setting(body)
+            .setName("Run at")
+            .setDesc("When this alignment fires in the container's lifecycle. 'Generate' = only at note creation. 'Write-back' = only at write-back. 'Both' = at both passes.")
+            .addDropdown(dd => {
+                dd.addOption("both", "Both passes");
+                dd.addOption("generate", "Generate only");
+                dd.addOption("writeback", "Write-back only");
+                dd.setValue(group.runAt || "both");
+                dd.onChange(async v => {
+                    group.runAt = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        new Setting(body)
+            .setName("Write to")
+            .setDesc("Where this alignment's output lands on the container note. Frontmatter = YAML block. Inline = key:: value in the body. Body marker = replaces {{pr:key}} in the body.")
+            .addDropdown(dd => {
+                dd.addOption("frontmatter", "Frontmatter");
+                dd.addOption("inline", "Inline (key:: value)");
+                dd.addOption("body", "Body marker ({{pr:key}})");
+                dd.setValue(group.writeTo || "frontmatter");
+                dd.onChange(async v => {
+                    group.writeTo = v;
+                    await this.plugin.saveSettings();
+                });
+            });
 
         // Target container
         const target = (s.prContainers || []).find(c => c.id === group.containerId);
@@ -11088,8 +11764,8 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(body)
-            .setName("Include aggregated summary")
-            .setDesc("When on, the freshly aggregated container frontmatter (the main aggregation's output) gets sent to the LLM as extra context alongside the raw subdivision activity. Useful when the gap analysis should reason about the compressed summary rather than just the raw daily notes.")
+            .setName("Include container frontmatter")
+            .setDesc("When on, the container note's existing frontmatter (summary fields, themes, etc.) is sent to the alignment LLM as extra context alongside the raw subdivision data. Useful when the alignment should reason about the summarized view, not just raw daily values. Note: alignment runs BEFORE the main aggregation at boundary time, so this context comes from any prior run or template defaults, not the current generation.")
             .addToggle(t => t
                 .setValue(group.includeAggregatedSummary !== false)
                 .onChange(async v => {
@@ -11105,9 +11781,10 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
             .setName("Default mode")
             .setDesc("How each discovered alignment is written by default. Source-note meta keys and per-alignment overrides below can change this per alignment.")
             .addDropdown(d => d
-                .addOption("separate", "separate — LLM narrative to {prefix}_{name}")
-                .addOption("rewrite",  "rewrite — LLM concise string replaces target")
-                .addOption("prepend",  "prepend — template splice with subdivision entries (no LLM)")
+                .addOption("separate", "separate — LLM narrative per alignment")
+                .addOption("rewrite",  "rewrite — LLM concise string per alignment")
+                .addOption("prepend",  "prepend — template splice, no LLM")
+                .addOption("combined", "combined — one unified narrative for all alignments")
                 .setValue(group.defaultMode || "separate")
                 .onChange(async v => {
                     group.defaultMode = v;
@@ -11127,6 +11804,29 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 }));
 
         const defaultMode = group.defaultMode || "separate";
+        if (defaultMode === "combined") {
+            const combinedDefault = `${(group.prefix || "alignment").trim()}_combined`;
+            new Setting(body)
+                .setName("Combined output key")
+                .setDesc(`Frontmatter key for the unified narrative. Leave blank to default to ${combinedDefault}.`)
+                .addText(t => t
+                    .setPlaceholder(combinedDefault)
+                    .setValue(group.combinedOutputKey || "")
+                    .onChange(async v => {
+                        group.combinedOutputKey = v;
+                        await this.plugin.saveSettings();
+                    }));
+            new Setting(body)
+                .setName("Max sentences")
+                .setDesc("How many sentences the LLM is allowed for the combined narrative.")
+                .addText(t => t
+                    .setPlaceholder("10")
+                    .setValue(String(group.combinedMaxSentences || 10))
+                    .onChange(async v => {
+                        group.combinedMaxSentences = parseInt(v, 10) || 10;
+                        await this.plugin.saveSettings();
+                    }));
+        }
         if (defaultMode === "prepend") {
             new Setting(body)
                 .setName("Default template")
@@ -11248,7 +11948,6 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const card = parent.createDiv({ cls: "mr-pr-card" });
         card.dataset.prCardId = alignment.id;
 
-        // Header: name input + delete
         const header = card.createDiv({ cls: "mr-pr-card-header" });
         const nameInput = header.createEl("input", { type: "text", value: alignment.name || "", cls: "mr-pr-name-input" });
         nameInput.placeholder = "Alignment name";
@@ -11270,7 +11969,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         // Container picker
         new Setting(body)
             .setName("Container")
-            .setDesc("Which container this alignment is attached to. The alignment runs after the container's main aggregation.")
+            .setDesc("Which container this alignment is attached to.")
             .addDropdown(dd => {
                 dd.addOption("", "— None —");
                 for (const c of (s.prContainers || [])) {
@@ -11283,10 +11982,10 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 });
             });
 
-        // Data field
+        // Data field + field type
         new Setting(body)
             .setName("Data field")
-            .setDesc("Daily field to pull values from. e.g. \"health\" reads inline health:: from each daily note in the container's range.")
+            .setDesc("Daily field to pull values from. e.g. \"health\" reads inline health:: or frontmatter health: from each daily note.")
             .addText(t => t
                 .setPlaceholder("health")
                 .setValue(alignment.dataField || "")
@@ -11295,7 +11994,6 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        // Data field type
         new Setting(body)
             .setName("Field type")
             .addDropdown(dd => {
@@ -11308,29 +12006,151 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 });
             });
 
-        // Description
+        // Description — doubles as inline system prompt when no file is set
         new Setting(body)
             .setName("Description")
-            .setDesc("What you're measuring and how the LLM should think about it. Sent as the system prompt for this alignment's LLM pass. Example: \"30 min mobility/cardio daily, 80% sleep score average. Surface patterns of consistency and avoidance, not compliance.\"")
+            .setDesc("What you're measuring. Used as the system prompt when no system prompt file is set below. Also becomes the {guideline} token for prepend mode templates.")
             .addTextArea(t => {
                 t.setValue(alignment.description || "")
                     .onChange(async v => {
                         alignment.description = v;
                         await this.plugin.saveSettings();
                     });
-                t.inputEl.rows = 4;
+                t.inputEl.rows = 3;
                 t.inputEl.style.width = "100%";
             });
 
-        // Output field
+        // Mode
         new Setting(body)
-            .setName("Output frontmatter key")
-            .setDesc("Frontmatter key on the container note where the LLM observation gets written. Leave blank to default to alignment_<sanitized-name>.")
+            .setName("Mode")
+            .setDesc("separate = LLM narrative to its own key. rewrite = LLM concise string replaces the target key. prepend = template splice with {entries} from subdivisions, no LLM.")
+            .addDropdown(dd => {
+                dd.addOption("separate", "separate (LLM narrative)");
+                dd.addOption("rewrite", "rewrite (LLM concise)");
+                dd.addOption("prepend", "prepend (splice, no LLM)");
+                dd.setValue(alignment.mode || "separate");
+                dd.onChange(async v => {
+                    alignment.mode = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        // Prefix + output key
+        new Setting(body)
+            .setName("Prefix")
+            .setDesc("Namespace prefix. Output key auto-computes to {prefix}_{name} when the Output key field below is empty.")
             .addText(t => t
-                .setPlaceholder("alignment_morning_mobility")
+                .setPlaceholder("alignment")
+                .setValue(alignment.prefix || "alignment")
+                .onChange(async v => {
+                    alignment.prefix = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        const shortName = (alignment.name || "unnamed").toLowerCase().replace(/[^a-z0-9]+/g, "_");
+        const resolvedKey = (alignment.outputField || "").trim() || `${(alignment.prefix || "alignment").trim()}_${shortName}`;
+        new Setting(body)
+            .setName("Output key")
+            .setDesc(`Explicit override for the frontmatter key. Leave blank to use ${resolvedKey}.`)
+            .addText(t => t
+                .setPlaceholder(resolvedKey)
                 .setValue(alignment.outputField || "")
                 .onChange(async v => {
                     alignment.outputField = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Template (prepend mode only)
+        if ((alignment.mode || "separate") === "prepend") {
+            new Setting(body)
+                .setName("Template")
+                .setDesc("Splice format for prepend mode. Tokens: {guideline} (description), {entries} (subdivision field values), {existing} (current target key value), {name}. Default: **{guideline}** — {entries}")
+                .addText(t => t
+                    .setPlaceholder("**{guideline}** — {entries}")
+                    .setValue(alignment.template || "")
+                    .onChange(async v => {
+                        alignment.template = v;
+                        await this.plugin.saveSettings();
+                    }));
+        }
+
+        // LLM service (own, or fall back to container's)
+        const llmOpts = [{ id: "", label: "— Use container's LLM —" }];
+        for (const svc of (s.prLLMServices || [])) {
+            llmOpts.push({ id: svc.id, label: svc.name || "(unnamed)" });
+        }
+        new Setting(body)
+            .setName("LLM service")
+            .setDesc("Pick an LLM for this alignment specifically, or leave blank to use the container's LLM service.")
+            .addDropdown(dd => {
+                for (const opt of llmOpts) dd.addOption(opt.id, opt.label);
+                dd.setValue(alignment.llmServiceId || "");
+                dd.onChange(async v => {
+                    alignment.llmServiceId = v;
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        // System prompt file (overrides description as system prompt)
+        new Setting(body)
+            .setName("System prompt file")
+            .setDesc(alignment.systemPromptFile || "None — using Description above as inline system prompt.")
+            .addButton(btn => {
+                btn.setButtonText(alignment.systemPromptFile ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        alignment.systemPromptFile = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    alignment.systemPromptFile = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(body)
+            .setName("Use system prompt")
+            .setDesc("When off, runs with an empty system role (description is also skipped). Respects the global master in General.")
+            .addToggle(t => t
+                .setValue(alignment.useSystemPrompt !== false)
+                .onChange(async v => {
+                    alignment.useSystemPrompt = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Framework file
+        new Setting(body)
+            .setName("Framework")
+            .setDesc(alignment.framework || "None — no framework injection for this alignment.")
+            .addButton(btn => {
+                btn.setButtonText(alignment.framework ? "Change" : "Choose").onClick(() => {
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        alignment.framework = file.path;
+                        await this.plugin.saveSettings();
+                        this.display();
+                    }).open();
+                });
+            })
+            .addExtraButton(btn => {
+                btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                    alignment.framework = "";
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+
+        new Setting(body)
+            .setName("Use framework")
+            .setDesc("Inject the framework file above when this alignment runs. Respects the global master in General.")
+            .addToggle(t => t
+                .setValue(alignment.useFramework !== false)
+                .onChange(async v => {
+                    alignment.useFramework = v;
                     await this.plugin.saveSettings();
                 }));
     }
