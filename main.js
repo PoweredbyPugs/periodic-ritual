@@ -618,14 +618,19 @@ function makePRQuestion(text) {
         varSource: "previous-period",
         varNotePath: "",               // for "note"
         varSourceContainerId: "",      // for "container-current" / "container-previous"
-        // Output to field — write the answer directly to a field. Default
-        // target is the active container note. Setting outputTargetContainer
-        // to a PR container id pushes the answer to that container's
-        // current corresponding note instead.
+        // Output to field — write the answer directly to a field. Target
+        // options mirror the inject/source options exactly:
+        //   "current"           — active container's current note (default)
+        //   "previous-period"   — previous note of the SAME container
+        //   "note"              — a specific .md file by path
+        //   "container-current" — current note of another container
+        //   "container-previous"— previous note of another container
         outputToField: false,
         outputFieldName: "",
-        outputFieldType: "inline",     // "inline" | "frontmatter"
-        outputTargetContainer: "",     // empty = active container; otherwise PR container id
+        outputFieldType: "inline",         // "inline" | "frontmatter"
+        outputTarget: "current",
+        outputNotePath: "",                // for "note"
+        outputTargetContainerId: "",       // for "container-current" / "container-previous"
     };
 }
 
@@ -2289,6 +2294,13 @@ class MonthlyRitualPlugin extends Plugin {
                     console.error("Periodic Ritual: auto-generate failed", e);
                 });
             }, 2000);
+            // Also poll every 10 minutes so boundaries crossed while Obsidian
+            // stays open (e.g. midnight into a new week) still trigger catch-up.
+            this.registerInterval(window.setInterval(() => {
+                this.runPRAutoGenerate().catch(e => {
+                    console.error("Periodic Ritual: interval auto-generate failed", e);
+                });
+            }, 10 * 60 * 1000));
         }
     }
 
@@ -2323,6 +2335,28 @@ class MonthlyRitualPlugin extends Plugin {
         }
         if (!this.settings.subdivisionReflection || typeof this.settings.subdivisionReflection !== "object") {
             this.settings.subdivisionReflection = makeReflectionConfig();
+        }
+        // One-time migration: old reflection questions used a single
+        // `outputTargetContainer` dropdown that mixed ""/"daily-today"/<id>.
+        // New shape mirrors the inject source options via `outputTarget`
+        // + `outputNotePath` + `outputTargetContainerId`.
+        for (const rf of (this.settings.prReflections || [])) {
+            for (const q of (rf.questions || [])) {
+                if (q.outputTarget) continue; // already migrated
+                const legacy = q.outputTargetContainer;
+                if (legacy === undefined || legacy === null || legacy === "") {
+                    q.outputTarget = "current";
+                } else if (legacy === "daily-today") {
+                    console.warn("Periodic Ritual: dropped legacy 'daily-today' output target on question:", q.text || "(untitled)");
+                    q.outputTarget = "current";
+                } else {
+                    q.outputTarget = "container-current";
+                    q.outputTargetContainerId = legacy;
+                }
+                if (q.outputNotePath === undefined) q.outputNotePath = "";
+                if (q.outputTargetContainerId === undefined) q.outputTargetContainerId = "";
+                delete q.outputTargetContainer;
+            }
         }
     }
 
@@ -3264,11 +3298,61 @@ class MonthlyRitualPlugin extends Plugin {
         // propagate values into the note body (inline fields + markers).
         await this.propagatePRFrontmatterToBody(file);
 
-        container.lastGeneratedEnd = formatDate(data.end);
+        // Track when write-back last ran so the catch-up check won't re-fire
+        // it every reload. Note: do NOT touch lastGeneratedEnd here — this
+        // pass runs on a PREVIOUS period and would regress the high-water
+        // mark used by the forward-walking catch-up logic.
+        container.lastWriteBackEnd = formatDate(data.end);
         await this.saveSettings();
+
+        // Also stamp the note's periodic-ritual blob with `writeback=true`.
+        // data.json doesn't sync across devices; the vault does. A second
+        // device seeing this marker will skip its own write-back even when
+        // its local lastWriteBackEnd is stale.
+        await this.updatePRMetadataOnFile(file, container, { writeback: "true" });
 
         if (!opts.silent) new Notice(`${container.name}: write-back complete`);
         return file;
+    }
+
+    // Merge patchFields into the existing periodic-ritual metadata blob on
+    // the file, preserving placement (frontmatter vs inline marker). Unknown
+    // keys in the blob survive because parsePRMetadataBlob/formatPRMetadataBlob
+    // round-trip any string key=value. Caller passes only the fields to add
+    // or overwrite; existing fields (id, boundary, start, end) are untouched.
+    async updatePRMetadataOnFile(file, container, patchFields) {
+        const placement = container?.metadataPlacement || "frontmatter";
+        if (placement === "none") return;
+
+        const current = (await this.readPRMetadataFromFile(file, container)) || {};
+        const merged = { ...current, ...patchFields };
+        const blob = formatPRMetadataBlob(merged);
+
+        if (placement === "frontmatter") {
+            try {
+                await this.app.fileManager.processFrontMatter(file, (fm) => {
+                    fm["periodic-ritual"] = blob;
+                });
+            } catch (e) {
+                console.error(`Periodic Ritual: failed to update PR frontmatter blob on ${file.path}`, e);
+            }
+            return;
+        }
+
+        if (placement === "inline") {
+            const key = container.metadataInlineKey || "periodic-ritual";
+            try {
+                const content = await this.app.vault.read(file);
+                const escaped = escapeRegex(key);
+                const fieldRegex = new RegExp(`${escaped}::[ \\t]*[^\\n]*`, "m");
+                const next = fieldRegex.test(content)
+                    ? content.replace(fieldRegex, `${key}:: ${blob}`)
+                    : content.trimEnd() + `\n\n%%\n${key}:: ${blob}\n%%\n`;
+                await this.app.vault.modify(file, next);
+            } catch (e) {
+                console.error(`Periodic Ritual: failed to update inline PR blob on ${file.path}`, e);
+            }
+        }
     }
 
     // Scan the note body for two kinds of replaceable tokens and update
@@ -4074,61 +4158,118 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         return files[0] || null;
     }
 
-    // Write a single answer to its configured output field. Default target
-    // is the active container's file. When question.outputTargetContainer
-    // is set, the answer goes to the corresponding current note of that
-    // other PR container, OR to today's daily note when the special value
-    // "daily-today" is used (cross-plugin Daily Ritual integration).
+    // Write a single answer to its configured output field. Target options
+    // mirror the inject source options exactly:
+    //   current            — active container's current note (default)
+    //   previous-period    — previous note of the active container
+    //   note               — a specific .md file by path
+    //   container-current  — current note of another PR container
+    //   container-previous — previous note of another PR container
     // Inline fields go in the body; frontmatter fields go via
     // processFrontMatter so we don't hand-edit YAML.
-    async writePRAnswerToField(activeFile, question, answer) {
+    async writePRAnswerToField(activeFile, activeContainer, question, answer) {
         if (!question || !question.outputToField || !question.outputFieldName) return;
         const ans = (answer || "").trim();
         if (!ans) return;
 
-        // Resolve target file: active container by default, or another
-        // container's current note, or today's daily note.
-        let file = activeFile;
-        if (question.outputTargetContainer === "daily-today") {
-            const dailyFile = this.findTodaysDailyNote();
-            if (dailyFile) {
-                file = dailyFile;
-            } else {
-                new Notice(`Question "${question.text}": no daily note for today found in ${this.settings.dailyNotesFolder || "vault root"}. Skipping output.`);
+        const target = question.outputTarget || "current";
+        let file = null;
+
+        if (target === "current") {
+            file = activeFile;
+        } else if (target === "previous-period") {
+            if (!activeContainer) {
+                new Notice(`Question "${question.text}": no active container to resolve previous-period target.`);
                 return;
             }
-        } else if (question.outputTargetContainer) {
-            const targetContainer = (this.settings.prContainers || []).find(c => c.id === question.outputTargetContainer);
-            if (targetContainer) {
-                const targetFile = await this.findMostRecentPRContainerNote(targetContainer);
-                if (targetFile) {
-                    file = targetFile;
-                } else {
-                    new Notice(`Question "${question.text}": target container "${targetContainer.name}" has no recent note. Skipping output.`);
-                    return;
-                }
+            file = await this.findPreviousPRContainerNote(activeContainer);
+            if (!file) {
+                new Notice(`Question "${question.text}": no previous-period note found for "${activeContainer.name}". Skipping output.`);
+                return;
             }
+        } else if (target === "note") {
+            if (!question.outputNotePath) {
+                new Notice(`Question "${question.text}": output target is "note" but no path is set. Skipping.`);
+                return;
+            }
+            const f = this.app.vault.getAbstractFileByPath(question.outputNotePath);
+            if (!(f instanceof TFile)) {
+                new Notice(`Question "${question.text}": output note ${question.outputNotePath} not found. Skipping.`);
+                return;
+            }
+            file = f;
+        } else if (target === "container-current" || target === "container-previous") {
+            const otherId = question.outputTargetContainerId;
+            if (!otherId) {
+                new Notice(`Question "${question.text}": output target is "${target}" but no container is picked. Skipping.`);
+                return;
+            }
+            const otherContainer = (this.settings.prContainers || []).find(c => c.id === otherId);
+            if (!otherContainer) {
+                new Notice(`Question "${question.text}": output target container not found. Skipping.`);
+                return;
+            }
+            file = target === "container-current"
+                ? await this.findMostRecentPRContainerNote(otherContainer)
+                : await this.findPreviousPRContainerNote(otherContainer);
+            if (!file) {
+                new Notice(`Question "${question.text}": "${otherContainer.name}" has no ${target === "container-current" ? "current" : "previous"} note. Skipping output.`);
+                return;
+            }
+        } else {
+            file = activeFile;
         }
         if (!file) return;
 
-        const fieldName = question.outputFieldName;
+        // Sanitize the configured field name — strip any trailing `::` or
+        // `:` that a user may have included by accident (so "notes:" becomes
+        // "notes" instead of creating a literal key called "notes:").
+        const fieldName = (question.outputFieldName || "").replace(/::?$/, "").trim();
+        if (!fieldName) return;
         const fieldType = question.outputFieldType || "inline";
+
         try {
+            // Update-in-place regardless of the configured type: if the
+            // field already exists as frontmatter OR as an inline field,
+            // write back to wherever it lives. Only fall through to
+            // creating a new field (at the configured type) if neither
+            // location has it.
+            let content = await this.app.vault.read(file);
+            const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?/);
+            const fmBlock = fmMatch ? fmMatch[1] : "";
+            const body = fmMatch ? content.slice(fmMatch[0].length) : content;
+
+            // Frontmatter key detection: `^key:` inside the block (not `::`).
+            const fmKeyRe = new RegExp(`^${escapeRegex(fieldName)}\\s*:(?!:)`, "m");
+            const hasFm = fmKeyRe.test(fmBlock);
+
+            // Inline key detection: `^key::` in the body.
+            const inlineRe = new RegExp(`^(${escapeRegex(fieldName)}::)[ \\t]*(.*)$`, "m");
+            const hasInline = inlineRe.test(body);
+
+            if (hasFm) {
+                await this.app.fileManager.processFrontMatter(file, fm => {
+                    fm[fieldName] = ans;
+                });
+                return;
+            }
+            if (hasInline) {
+                const newBody = body.replace(inlineRe, `$1 ${ans}`);
+                const rebuilt = fmMatch ? content.slice(0, fmMatch[0].length) + newBody : newBody;
+                await this.app.vault.modify(file, rebuilt);
+                return;
+            }
+
+            // Neither exists — create at the configured location.
             if (fieldType === "frontmatter") {
                 await this.app.fileManager.processFrontMatter(file, fm => {
                     fm[fieldName] = ans;
                 });
                 return;
             }
-            // Inline: replace existing `key:: ...` if present, else append
-            let content = await this.app.vault.read(file);
-            const re = new RegExp(`^(${escapeRegex(fieldName)}::).*$`, "m");
-            if (re.test(content)) {
-                content = content.replace(re, `$1 ${ans}`);
-            } else {
-                content = content.trimEnd() + `\n${fieldName}:: ${ans}\n`;
-            }
-            await this.app.vault.modify(file, content);
+            const rebuilt = (fmMatch ? content.slice(0, fmMatch[0].length) : "")
+                + body.trimEnd() + `\n${fieldName}:: ${ans}\n`;
+            await this.app.vault.modify(file, rebuilt);
         } catch (e) {
             console.error(`Periodic Ritual: failed to write answer for question "${question.text}":`, e);
         }
@@ -4203,7 +4344,7 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
             // field. Persists raw answers regardless of LLM success or
             // whether the LLM is used at all.
             for (let i = 0; i < reflection.questions.length; i++) {
-                await this.writePRAnswerToField(file, reflection.questions[i], answers[i]);
+                await this.writePRAnswerToField(file, container, reflection.questions[i], answers[i]);
             }
 
             // Step 2 — alignments fire EARLY when includeAlignmentContext
@@ -5221,16 +5362,38 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 const prevDate = addDays(currentRange.start, -1);
                 const prevRange = await this.getPRBoundaryData(container.boundaryDetector, prevDate);
                 if (prevRange && prevRange.end < now) {
+                    const prevEndStr = formatDate(prevRange.end);
                     const prevFileName = this.resolveTokens(container.naming, prevRange.tokens);
                     const prevFolder = container.saveDir || "";
                     const prevPath = prevFolder ? `${prevFolder}/${prevFileName}.md` : `${prevFileName}.md`;
                     const prevFile = this.app.vault.getAbstractFileByPath(prevPath);
+
                     if (prevFile && prevFile instanceof TFile) {
-                        // Only write back if the period end matches the writeBackAt timing
-                        const shouldWriteBack = (writeBackAt === "end" && prevRange.end < now)
-                            || (writeBackAt === "start" && prevRange.start <= now);
-                        if (shouldWriteBack) {
-                            await this.writeBackToPRContainerNote(container, prevFile, prevRange, { silent: false });
+                        // Two-source guard: local lastWriteBackEnd (in data.json)
+                        // AND the note's own writeback=true marker (in the vault).
+                        // Either is sufficient to treat the period as done. This
+                        // matters on multi-device setups — data.json doesn't
+                        // sync across devices reliably, so without the note-side
+                        // marker a second device would re-fire write-back and
+                        // overwrite whatever the first device produced.
+                        const noteMeta = await this.readPRMetadataFromFile(prevFile, container);
+                        const noteSaysDone = noteMeta?.writeback === "true";
+                        const localSaysDone = container.lastWriteBackEnd === prevEndStr;
+
+                        if (localSaysDone || noteSaysDone) {
+                            // If the note says done but our local state is
+                            // stale (another device ran it), catch local up so
+                            // we don't re-enter this branch on every reload.
+                            if (noteSaysDone && !localSaysDone) {
+                                container.lastWriteBackEnd = prevEndStr;
+                                await this.saveSettings();
+                            }
+                        } else {
+                            const shouldWriteBack = (writeBackAt === "end" && prevRange.end < now)
+                                || (writeBackAt === "start" && prevRange.start <= now);
+                            if (shouldWriteBack) {
+                                await this.writeBackToPRContainerNote(container, prevFile, prevRange, { silent: false });
+                            }
                         }
                     }
                 }
@@ -5629,48 +5792,42 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         });
 
         // ─── Periodic Ritual commands (Phase 1+) ───
+        // Command names omit the "Periodic Ritual:" prefix — Obsidian auto-
+        // prefixes palette entries with the plugin's display name, so
+        // including it here would render "Periodic Ritual: Periodic Ritual: …".
         this.addCommand({
             id: "pr-generate-container",
-            name: "Periodic Ritual: Generate container note",
+            name: "Generate container note",
             callback: () => this.pickAndGeneratePRContainer(),
         });
 
-        // Phase 3: manual catch-up trigger. Useful for testing and for
-        // running catch-up after toggling auto-generate on without restarting.
         this.addCommand({
             id: "pr-catch-up",
-            name: "Periodic Ritual: Catch up missed notes",
+            name: "Catch up missed notes",
             callback: () => this.runPRAutoGenerate(),
         });
 
-        // Phase 6: reflect on a container. Opens a fuzzy picker over
-        // containers that have reflection enabled (mode != auto), then
-        // opens the modal for the picked one.
         this.addCommand({
             id: "pr-reflect",
-            name: "Periodic Ritual: Reflect",
+            name: "Reflect",
             callback: () => this.pickAndReflectPRContainer(),
         });
 
-        // Phase 9: debug — show the last LLM call's full payload.
         this.addCommand({
             id: "pr-debug-last-llm",
-            name: "Periodic Ritual: Show last LLM call",
+            name: "Show last LLM call",
             callback: () => new PRDebugModal(this.app, this.lastPRLLMCall).open(),
         });
 
-        // Phase 9: hierarchy diagram — show how containers / reflections /
-        // alignments / LLM services connect, as a Mermaid flowchart.
         this.addCommand({
             id: "pr-hierarchy",
-            name: "Periodic Ritual: Show hierarchy diagram",
+            name: "Show hierarchy diagram",
             callback: () => new PRHierarchyModal(this.app, this).open(),
         });
 
-        // Phase 10: open the node-based graph view.
         this.addCommand({
             id: "pr-graph",
-            name: "Periodic Ritual: Open graph view",
+            name: "Open graph view",
             callback: () => this.activatePRGraphView(),
         });
     }
@@ -7338,15 +7495,42 @@ class PRGraphView extends ItemView {
         addToggleRow("Write answer to a field", () => q.outputToField, (v) => { q.outputToField = v; });
 
         if (q.outputToField) {
+            const allContainersOut = s.prContainers || [];
             addLabeledDropdown("Target",
                 [
-                    { value: "",            label: "Active container (default)" },
-                    { value: "daily-today", label: "Today's daily note" },
-                    ...((s.prContainers || []).map(c => ({ value: c.id, label: c.name || "(unnamed)" }))),
+                    { value: "current",            label: "Current note (active container)" },
+                    { value: "previous-period",    label: "Previous period (this container)" },
+                    { value: "note",               label: "Specific note" },
+                    { value: "container-current",  label: "Current note of another container" },
+                    { value: "container-previous", label: "Previous note of another container" },
                 ],
-                () => q.outputTargetContainer || "",
-                (v) => { q.outputTargetContainer = v; }
+                () => q.outputTarget || "current",
+                (v) => { q.outputTarget = v; }
             );
+
+            const tgt = q.outputTarget || "current";
+            if (tgt === "note") {
+                const row = detail.createEl("div", { cls: "pr-graph-q-field" });
+                row.createEl("div", { cls: "pr-graph-q-flabel", text: "Target note" });
+                row.createEl("div", { cls: "pr-graph-form-picker-value", text: q.outputNotePath || "(none)" });
+                const btn = row.createEl("button", { text: q.outputNotePath ? "Change" : "Choose", cls: "pr-graph-form-button" });
+                stop(btn);
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                        q.outputNotePath = file.path;
+                        await save();
+                        reRender();
+                    }).open();
+                });
+            } else if (tgt === "container-current" || tgt === "container-previous") {
+                addLabeledDropdown("Target container",
+                    [{ value: "", label: "— Pick one —" }, ...allContainersOut.map(c => ({ value: c.id, label: c.name || "(unnamed)" }))],
+                    () => q.outputTargetContainerId || "",
+                    (v) => { q.outputTargetContainerId = v; }
+                );
+            }
+
             addLabeledText("Field name", "non_negotiable", () => q.outputFieldName, (v) => { q.outputFieldName = v; });
             addLabeledDropdown("Field type",
                 [
@@ -11494,19 +11678,51 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         }));
 
                 if (q.outputToField) {
+                    const allContainersOut = s.prContainers || [];
                     new Setting(panel)
                         .setName("Target")
-                        .setDesc("Where to write the answer. Default is the active container's note. Picking another container pushes the answer to that container's current corresponding note. Picking 'Today's daily note' pushes to today's daily note (uses the Daily notes folder from General settings).")
                         .addDropdown(dd => {
-                            dd.addOption("", "Active container (default)");
-                            dd.addOption("daily-today", "Today's daily note");
-                            for (const c of (s.prContainers || [])) dd.addOption(c.id, c.name || "(unnamed)");
-                            dd.setValue(q.outputTargetContainer || "");
+                            dd.addOption("current", "Current note (active container)");
+                            dd.addOption("previous-period", "Previous period of THIS container");
+                            dd.addOption("note", "A specific note");
+                            dd.addOption("container-current", "Current note of ANOTHER container");
+                            dd.addOption("container-previous", "Previous note of ANOTHER container");
+                            dd.setValue(q.outputTarget || "current");
                             dd.onChange(async v => {
-                                q.outputTargetContainer = v;
+                                q.outputTarget = v;
                                 await this.plugin.saveSettings();
+                                this.display();
                             });
                         });
+
+                    const tgt = q.outputTarget || "current";
+                    if (tgt === "note") {
+                        new Setting(panel)
+                            .setName("Target note")
+                            .setDesc(q.outputNotePath || "None selected")
+                            .addButton(btn => {
+                                btn.setButtonText(q.outputNotePath ? "Change" : "Choose").onClick(() => {
+                                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                                        q.outputNotePath = file.path;
+                                        await this.plugin.saveSettings();
+                                        this.display();
+                                    }).open();
+                                });
+                            });
+                    } else if (tgt === "container-current" || tgt === "container-previous") {
+                        new Setting(panel)
+                            .setName("Target container")
+                            .setDesc(allContainersOut.length === 0 ? "No containers defined yet" : "Which container to write to")
+                            .addDropdown(dd => {
+                                dd.addOption("", "— Pick one —");
+                                for (const c of allContainersOut) dd.addOption(c.id, c.name || "(unnamed)");
+                                dd.setValue(q.outputTargetContainerId || "");
+                                dd.onChange(async v => {
+                                    q.outputTargetContainerId = v;
+                                    await this.plugin.saveSettings();
+                                });
+                            });
+                    }
 
                     new Setting(panel)
                         .setName("Field name")
