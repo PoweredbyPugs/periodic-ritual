@@ -5830,6 +5830,17 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             name: "Open graph view",
             callback: () => this.activatePRGraphView(),
         });
+
+        // Force-run write-back on a container's most recent note, bypassing
+        // the catch-up guard. Useful when a multi-device overwrite or a
+        // manual edit means you want the pipeline to re-run on an already-
+        // marked-done period. Clears the `writeback=true` marker before
+        // running so the normal flow can stamp it fresh.
+        this.addCommand({
+            id: "pr-writeback-now",
+            name: "Re-run write-back for a container (force)",
+            callback: () => this.pickAndWriteBackPRContainer(),
+        });
     }
 
     // Phase 9: try to detect which container the active file belongs to
@@ -5922,6 +5933,45 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         }
         const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
             await this.generatePRContainerNote(container);
+        });
+        modal.open();
+    }
+
+    // Force-run write-back for a container, bypassing the catch-up guard.
+    // Unlike the auto path this does not check lastWriteBackEnd or the note's
+    // writeback marker — the user explicitly asked for it. Clears the marker
+    // first so the pipeline doesn't short-circuit anywhere downstream, then
+    // lets writeBackToPRContainerNote re-stamp it on completion.
+    async pickAndWriteBackPRContainer() {
+        const containers = this.settings.prContainers || [];
+        if (containers.length === 0) {
+            new Notice("No Periodic Ritual containers configured.");
+            return;
+        }
+        const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
+            const file = await this.findMostRecentPRContainerNote(container);
+            if (!file) {
+                new Notice(`${container.name}: no existing note to write back to.`);
+                return;
+            }
+            // Derive the period range from the note's own metadata blob so
+            // we run against the period that note actually represents, not
+            // whatever today's boundary detector says.
+            const meta = await this.readPRMetadataFromFile(file, container);
+            if (!meta || !meta.start || !meta.end) {
+                new Notice(`${container.name}: couldn't read periodic-ritual metadata from ${file.path}.`);
+                return;
+            }
+            const range = {
+                start: new Date(meta.start),
+                end: new Date(meta.end),
+                tokens: meta,
+            };
+            // Clear both guards so downstream logic doesn't short-circuit.
+            container.lastWriteBackEnd = "";
+            await this.saveSettings();
+            await this.updatePRMetadataOnFile(file, container, { writeback: "false" });
+            await this.writeBackToPRContainerNote(container, file, range, { silent: false });
         });
         modal.open();
     }
