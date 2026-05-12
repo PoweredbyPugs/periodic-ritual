@@ -1,7 +1,7 @@
 {
-    "id": "monthly-ritual",
+    "id": "periodic-ritual",
     "name": "Periodic Ritual",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "minAppVersion": "1.0.0",
     "description": "Periodic review notes: independent container types (calendar, lunar, solar) with auto-LLM aggregation, optional reflection modals, and an alignment module. Companion to Daily Ritual.",
     "author": "poweredbypugs",

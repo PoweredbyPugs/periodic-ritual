@@ -196,7 +196,7 @@ const PROVIDERS = {
             return {
                 Authorization: `Bearer ${s.apiKey}`,
                 // OpenRouter likes these for attribution but they're optional.
-                "HTTP-Referer": "https://github.com/poweredbypugs/monthly-ritual",
+                "HTTP-Referer": "https://github.com/poweredbypugs/periodic-ritual",
                 "X-Title": "Periodic Ritual (Obsidian)",
             };
         },
@@ -2264,12 +2264,1504 @@ class DebugModal extends Modal {
 //  MAIN PLUGIN
 // ═══════════════════════════════════════════════════════════════
 
+// ====================================================================
+// Daily Ritual (folded in)
+// ====================================================================
+// Originally a separate plugin (`daily-ritual`). Folded into Periodic
+// Ritual so settings and commands live in one place. Settings live at
+// `plugin.settings.dailyRitual` to keep the namespaces independent.
+
+function dr_makeQuestion(text) {
+    return {
+        text: text || "",
+        responseMode: "input",
+        injectVar: false,
+        varField: "",
+        varSource: "previous-daily",
+        varNotePath: "",
+        varPRContainerId: "",
+        varDataSourceId: "",
+        varBoundaryDetector: "",
+        varBoundaryToken: "",
+        varAlignmentGroupId: "",
+        varAlignmentOutputKey: "",
+        skipIfNoInjectValue: false,
+        skipUnlessBoundaryFreshToday: false,
+        outputToField: false,
+        outputFieldName: "",
+        outputFieldType: "inline",
+        omitFromLLM: false,
+        omitFromCollected: false,
+    };
+}
+
+function dr_parseDateFromFilename(name) {
+    const cleaned = name
+        .replace(/\.md$/, "")
+        .replace(/^\w+,\s*/, "")
+        .replace(/(\d+)(st|nd|rd|th)/, "$1");
+    const d = new Date(cleaned);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+function dr_formatDateForFilename(date) {
+    const day = date.getDate();
+    const suffix = (day >= 11 && day <= 13) ? "th" : ["st", "nd", "rd"][day % 10 - 1] || "th";
+    const weekday = date.toLocaleDateString("en-US", { weekday: "long" });
+    const month = date.toLocaleDateString("en-US", { month: "long" });
+    return `${weekday}, ${month} ${day}${suffix} ${date.getFullYear()}`;
+}
+
+function dr_escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// "YYYY-MM-DD" for date-key comparisons (matches PR's `lastGeneratedEnd` shape).
+// Display formatting goes through dr_formatDateForFilename instead.
+function dr_todayDateString(d) {
+    const date = d || new Date();
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}
+
+const DR_DEFAULT_SETTINGS = {
+    alignmentQuestions: [],
+    questions: [
+        dr_makeQuestion("Did I face the Work →"),
+        dr_makeQuestion("What story came up today →"),
+        dr_makeQuestion("What's tomorrow's non-negotiable →"),
+    ],
+    reflectionField: "today",
+    summaryEnabled: true,
+    summaryField: "next",
+    provider: "gemini",
+    model: "gemini-3.1-pro-preview",
+    apiKey: "",
+    baseUrl: "",
+    apiKeys: {},
+    baseUrls: {},
+    systemPromptFile: "",
+    additionalInstructions: "",
+    dailyDraft: null,
+    alignmentDraft: null,
+    openAlignmentOnStartup: false,
+    lastAlignmentRunDate: "",
+};
+
+const DR_PROVIDERS = {
+    gemini: {
+        name: "Google Gemini",
+        buildUrl(s) {
+            return `https://generativelanguage.googleapis.com/v1beta/models/${s.model}:generateContent?key=${s.apiKey}`;
+        },
+        buildBody(userPrompt, s, systemPrompt) {
+            return {
+                system_instruction: { parts: [{ text: systemPrompt }] },
+                contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+            };
+        },
+        extractText(data) {
+            return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+        },
+        async listModels(apiKey) {
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+            if (!res.ok) throw new Error(`${res.status}`);
+            const data = await res.json();
+            return (data.models || [])
+                .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+                .map((m) => m.name.replace("models/", ""))
+                .sort();
+        },
+    },
+    openai: {
+        name: "OpenAI",
+        buildUrl() { return "https://api.openai.com/v1/chat/completions"; },
+        buildBody(prompt, s, systemPrompt) {
+            return {
+                model: s.model,
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: prompt },
+                ],
+            };
+        },
+        extractText(data) { return data.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) { return { Authorization: `Bearer ${s.apiKey}` }; },
+        async listModels(apiKey) {
+            const res = await fetch("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${apiKey}` } });
+            if (!res.ok) throw new Error(`${res.status}`);
+            const data = await res.json();
+            return (data.data || [])
+                .filter((m) => m.id.startsWith("gpt") || m.id.startsWith("o"))
+                .map((m) => m.id)
+                .sort();
+        },
+    },
+    anthropic: {
+        name: "Anthropic Claude",
+        buildUrl() { return "https://api.anthropic.com/v1/messages"; },
+        buildBody(prompt, s, systemPrompt) {
+            return {
+                model: s.model,
+                max_tokens: 256,
+                system: systemPrompt,
+                messages: [{ role: "user", content: prompt }],
+            };
+        },
+        extractText(data) { return data.content?.[0]?.text?.trim() || ""; },
+        headers(s) {
+            return { "x-api-key": s.apiKey, "anthropic-version": "2023-06-01" };
+        },
+        async listModels(apiKey) {
+            const res = await fetch("https://api.anthropic.com/v1/models", {
+                headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+            });
+            if (!res.ok) throw new Error(`${res.status}`);
+            const data = await res.json();
+            return (data.data || []).map((m) => m.id).sort();
+        },
+    },
+    openrouter: {
+        name: "OpenRouter",
+        buildUrl() { return "https://openrouter.ai/api/v1/chat/completions"; },
+        buildBody(prompt, s, systemPrompt) {
+            return {
+                model: s.model,
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: prompt },
+                ],
+            };
+        },
+        extractText(data) { return data.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) {
+            return {
+                Authorization: `Bearer ${s.apiKey}`,
+                "HTTP-Referer": "https://github.com/poweredbypugs/periodic-ritual",
+                "X-Title": "Periodic Ritual (Obsidian)",
+            };
+        },
+        async listModels(apiKey) {
+            const d = await prHttpJson({
+                url: "https://openrouter.ai/api/v1/models",
+                method: "GET",
+                headers: { Authorization: `Bearer ${apiKey}` },
+            });
+            return (d.data || []).map((m) => m.id).sort();
+        },
+    },
+    openclaw: {
+        name: "OpenClaw (local agent)",
+        needsBaseUrl: true,
+        defaultBaseUrl: "http://127.0.0.1:18789",
+        buildUrl(s) {
+            const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            return `${base}/v1/chat/completions`;
+        },
+        buildBody(prompt, s, systemPrompt) {
+            return {
+                model: s.model || "openclaw/default",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: prompt },
+                ],
+            };
+        },
+        extractText(data) { return data.choices?.[0]?.message?.content?.trim() || ""; },
+        headers(s) { return s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {}; },
+        async listModels(s) {
+            const cfg = typeof s === "string" ? { apiKey: s } : s;
+            const base = (cfg.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            const headers = cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {};
+            const d = await prHttpJson({ url: `${base}/v1/models`, method: "GET", headers });
+            return (d.data || []).map((m) => m.id).sort();
+        },
+    },
+};
+
+class DRReflectionModal extends Modal {
+    // `injectedResolved` is the [{value, hidden}] shape returned by
+    // DailyRitualModule.loadInjectedVarsFor — parallel to `questions`.
+    // Hidden questions are dropped from the modal's step sequence entirely.
+    // `responseMode === "prompt"` questions render text-only with no input.
+    constructor(app, questions, injectedResolved, onSubmit, options = {}) {
+        super(app);
+        this.questions = questions;
+        this.injectedResolved = injectedResolved || questions.map(() => ({ value: "", hidden: false }));
+        // visibleSteps = original-question-indices that should be rendered.
+        this.visibleSteps = this.injectedResolved
+            .map((r, i) => (r && r.hidden) ? -1 : i)
+            .filter(i => i >= 0);
+        this.onSubmit = onSubmit;
+        this.onDraftChange = options.onDraftChange || null;
+        this.answers = Array.isArray(options.initialAnswers) && options.initialAnswers.length === questions.length
+            ? [...options.initialAnswers]
+            : questions.map(() => "");
+        // Restored draft `step` is a question index; map it to a cursor
+        // position in visibleSteps. Falls back to 0 if that index is hidden.
+        const startQIdx = typeof options.initialStep === "number" ? options.initialStep : -1;
+        let startCursor = this.visibleSteps.indexOf(startQIdx);
+        if (startCursor === -1) startCursor = 0;
+        this.cursor = Math.max(0, Math.min(startCursor, this.visibleSteps.length - 1));
+        this._draftTimer = null;
+    }
+    onOpen() {
+        if (this.visibleSteps.length === 0) {
+            // Nothing to ask today (every question hidden by skip rules).
+            // Submit empty answers so the writer can still record the run.
+            this.close();
+            this.onSubmit(this.answers);
+            return;
+        }
+        this.renderStep();
+    }
+    notifyDraft() {
+        if (!this.onDraftChange) return;
+        if (this._draftTimer) clearTimeout(this._draftTimer);
+        this._draftTimer = setTimeout(() => {
+            this._draftTimer = null;
+            const qIdx = this.visibleSteps[this.cursor];
+            this.onDraftChange({ answers: this.answers, step: qIdx });
+        }, 300);
+    }
+    renderStep() {
+        const { contentEl } = this;
+        contentEl.empty();
+        const qIdx = this.visibleSteps[this.cursor];
+        const q = this.questions[qIdx];
+        const injected = (this.injectedResolved[qIdx] || {}).value || "";
+        if (injected) {
+            const varEl = contentEl.createEl("p");
+            varEl.createEl("strong", { text: injected });
+            varEl.style.cssText = "margin-bottom:8px;font-size:1.1em;";
+        }
+        contentEl.createEl("h5", { text: q.text }).style.cssText = "margin-bottom:12px;";
+        const isPrompt = (q.responseMode || "input") === "prompt";
+        const isLast = this.cursor === this.visibleSteps.length - 1;
+        if (!isPrompt) {
+            const input = contentEl.createEl("input", { type: "text" });
+            input.style.cssText = "width:100%;margin-bottom:16px;";
+            input.value = this.answers[qIdx] || "";
+            input.addEventListener("input", () => {
+                this.answers[qIdx] = input.value;
+                this.notifyDraft();
+            });
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") { e.preventDefault(); this.tryAdvance(); }
+            });
+            setTimeout(() => input.focus(), 50);
+        } else {
+            // Prompt-only: ensure no stale answer recorded for this index.
+            this.answers[qIdx] = "";
+        }
+        const btnContainer = contentEl.createDiv({ cls: "modal-button-container" });
+        if (this.cursor > 0) {
+            const backBtn = btnContainer.createEl("button", { text: "Back" });
+            backBtn.addEventListener("click", () => {
+                this.cursor--; this.renderStep(); this.notifyDraft();
+            });
+        }
+        const nextBtn = btnContainer.createEl("button", { text: isLast ? "Submit" : "Next", cls: "mod-cta" });
+        nextBtn.addEventListener("click", () => this.tryAdvance());
+    }
+    tryAdvance() {
+        const isLast = this.cursor === this.visibleSteps.length - 1;
+        // Empty answers are allowed — writers skip them, no validation here.
+        if (isLast) {
+            this.close();
+            this.onSubmit(this.answers);
+        } else {
+            this.cursor++;
+            this.renderStep();
+            this.notifyDraft();
+        }
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+class DRHealthCheckModal extends Modal {
+    constructor(app, results) { super(app); this.results = results; }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h2", { text: "Health Check" });
+        this.results.forEach((r) => {
+            const row = contentEl.createDiv();
+            row.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin-bottom:6px;";
+            const icon = r.passed === true ? "✅" : r.passed === "warn" ? "⚠️" : "❌";
+            row.createEl("span").textContent = icon;
+            const l = row.createEl("span", { text: r.name }); l.style.fontWeight = "600";
+            row.createEl("span", { text: ` — ${r.desc}` }).style.opacity = "0.7";
+        });
+        const failed = this.results.filter((r) => r.passed === false).length;
+        const warns = this.results.filter((r) => r.passed === "warn").length;
+        const s = contentEl.createEl("p");
+        s.style.cssText = "margin-top:16px;font-weight:600;";
+        if (failed === 0 && warns === 0) { s.textContent = "All checks passed."; s.style.color = "var(--text-success)"; }
+        else if (failed === 0) { s.textContent = `All checks passed (${warns} warning${warns === 1 ? "" : "s"}).`; s.style.color = "var(--text-warning, var(--text-accent))"; }
+        else { s.textContent = `${failed} check(s) failed${warns ? `, ${warns} warning${warns === 1 ? "" : "s"}` : ""}.`; s.style.color = "var(--text-error)"; }
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+class DRLoadingModal extends Modal {
+    constructor(app, pluginDir) { super(app); this.pluginDir = pluginDir; }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.style.cssText = "text-align:center;padding:24px;";
+        const gifPath = this.app.vault.adapter.getResourcePath(`${this.pluginDir}/bulbasaur.gif`);
+        const img = contentEl.createEl("img", { attr: { src: gifPath } });
+        img.style.cssText = "width:120px;margin-bottom:16px;";
+        contentEl.createEl("p", { text: "Loading..." }).style.opacity = "0.7";
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+class DRDebugModal extends Modal {
+    constructor(app, debugData) { super(app); this.debugData = debugData; }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h2", { text: "Test Daily Reflect" });
+        const sections = [
+            { label: "Provider", value: this.debugData.provider },
+            { label: "Model", value: this.debugData.model },
+            { label: "Additional Instructions", value: this.debugData.additional || "(empty)" },
+            { label: "System Prompt (from file)", value: this.debugData.systemPrompt },
+            { label: "Combined Reflection", value: this.debugData.paragraph },
+            { label: "Full Prompt Sent to LLM", value: this.debugData.fullPrompt, mono: true },
+        ];
+        if (this.debugData.response) sections.push({ label: "LLM Response", value: this.debugData.response });
+        if (this.debugData.error) sections.push({ label: "Error", value: this.debugData.error });
+        for (const section of sections) {
+            const g = contentEl.createDiv(); g.style.marginBottom = "16px";
+            g.createEl("h4", { text: section.label });
+            g.style.cssText = "margin-bottom:16px;border-bottom:1px solid var(--background-modifier-border);padding-bottom:8px;";
+            const c = g.createEl(section.mono ? "pre" : "p", { text: section.value });
+            c.style.cssText = "white-space:pre-wrap;word-break:break-word;";
+            if (section.mono) c.style.cssText += "font-size:0.85em;background:var(--background-secondary);padding:8px;border-radius:4px;";
+        }
+        const btn = contentEl.createDiv({ cls: "modal-button-container" }).createEl("button", { text: "Copy All", cls: "mod-cta" });
+        btn.addEventListener("click", () => {
+            navigator.clipboard.writeText(sections.map((s) => `## ${s.label}\n${s.value}`).join("\n\n---\n\n")).then(() => new Notice("Copied to clipboard"));
+        });
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
+class DailyRitualModule {
+    constructor(plugin) {
+        this.plugin = plugin;
+        this.app = plugin.app;
+        this.expandedInput = {};
+        this.expandedOutput = {};
+    }
+
+    get settings() { return this.plugin.settings.dailyRitual; }
+    async saveSettings() { await this.plugin.saveSettings(); }
+
+    registerCommands() {
+        this.plugin.addCommand({
+            id: "daily-ritual-align",
+            name: "Daily Align",
+            callback: () => this.openAlignment(),
+        });
+        this.plugin.addCommand({
+            id: "daily-ritual-reflect",
+            name: "Daily Reflect",
+            callback: () => this.openReflection(),
+        });
+        this.plugin.addCommand({
+            id: "daily-ritual-test",
+            name: "Test Daily Reflect",
+            callback: () => this.openTestReflection(),
+        });
+    }
+
+    async getSystemPrompt() {
+        if (this.settings.systemPromptFile) {
+            const file = this.app.vault.getAbstractFileByPath(this.settings.systemPromptFile);
+            if (file && file instanceof TFile) return await this.app.vault.read(file);
+            new Notice(`System prompt file not found: ${this.settings.systemPromptFile}`);
+        }
+        return this.settings._legacySystemPrompt || "Summarize this daily reflection into one concise sentence that captures the core insight.";
+    }
+
+    findPreviousDailyNote() {
+        const active = this.app.workspace.getActiveFile();
+        if (!active) return null;
+        const activeDate = dr_parseDateFromFilename(active.name);
+        if (!activeDate) return null;
+        const prevDate = new Date(activeDate);
+        prevDate.setDate(prevDate.getDate() - 1);
+        const prevName = dr_formatDateForFilename(prevDate) + ".md";
+        const parentPath = active.parent ? active.parent.path : "";
+        const prevPath = parentPath ? `${parentPath}/${prevName}` : prevName;
+        return this.app.vault.getAbstractFileByPath(prevPath) || null;
+    }
+
+    async readInlineField(file, fieldName) {
+        if (!file || !(file instanceof TFile)) return "";
+        const content = await this.app.vault.read(file);
+        const regex = new RegExp(`\\b${dr_escapeRegex(fieldName)}::(.*)`, "m");
+        const match = content.match(regex);
+        return match ? match[1].trim() : "";
+    }
+
+    // Resolve every question's inject-var declaration. Returns a parallel
+    // array of {value, hidden}. The modal renders the value (when present)
+    // and skips questions where hidden===true entirely. Both reflection
+    // and alignment banks share this resolver — same schema, same logic.
+    async loadInjectedVarsFor(questions) {
+        const out = [];
+        for (const q of questions) out.push(await this.resolveOneInjectedVar(q));
+        return out;
+    }
+
+    async resolveOneInjectedVar(q) {
+        if (!q || !q.injectVar) return { value: "", hidden: false };
+        const src = q.varSource || "previous-daily";
+        let value = "";
+        // Tracked so skipUnlessBoundaryFreshToday knows which container to
+        // freshness-check. null for sources that aren't container-scoped.
+        let sourceContainer = null;
+        try {
+            if (src === "previous-daily") {
+                const f = this.findPreviousDailyNote();
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "current-daily") {
+                const f = this.app.workspace.getActiveFile();
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "note" && q.varNotePath) {
+                const f = this.app.vault.getAbstractFileByPath(q.varNotePath);
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "data-source" && q.varDataSourceId) {
+                const f = await this.resolveDataSourceFile(q.varDataSourceId);
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "container-current" && q.varPRContainerId) {
+                sourceContainer = this.findContainerById(q.varPRContainerId);
+                const f = sourceContainer ? await this.findPRContainerCurrentNote(q.varPRContainerId) : null;
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "container-previous" && q.varPRContainerId) {
+                sourceContainer = this.findContainerById(q.varPRContainerId);
+                const f = sourceContainer && typeof this.plugin.findPreviousPRContainerNote === "function"
+                    ? await this.plugin.findPreviousPRContainerNote(sourceContainer)
+                    : null;
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "container-recent-crossing") {
+                sourceContainer = this.findRecentlyCrossedContainer();
+                const f = sourceContainer && typeof this.plugin.findMostRecentPRContainerNote === "function"
+                    ? await this.plugin.findMostRecentPRContainerNote(sourceContainer)
+                    : null;
+                value = await this.readFieldFromFileOrEmpty(f, q.varField);
+            } else if (src === "boundary-tokens" && q.varBoundaryDetector && q.varBoundaryToken) {
+                const data = await this.plugin.getPRBoundaryData(q.varBoundaryDetector, new Date());
+                const v = data?.tokens?.[q.varBoundaryToken];
+                value = (v === null || v === undefined) ? "" : String(v);
+            } else if (src === "alignment-output" && q.varAlignmentGroupId && q.varAlignmentOutputKey) {
+                const groups = this.plugin.settings?.prAlignmentGroups || [];
+                const group = groups.find(g => g.id === q.varAlignmentGroupId);
+                if (group && group.containerId) {
+                    sourceContainer = this.findContainerById(group.containerId);
+                    const f = sourceContainer
+                        ? await this.findPRContainerCurrentNote(group.containerId)
+                        : null;
+                    value = await this.readFieldFromFileOrEmpty(f, q.varAlignmentOutputKey);
+                }
+            }
+        } catch (e) {
+            console.error("Daily Ritual: resolveOneInjectedVar failed", e);
+            value = "";
+        }
+        let hidden = false;
+        if (q.skipUnlessBoundaryFreshToday) {
+            if (!sourceContainer || !this.containerCrossedToday(sourceContainer)) hidden = true;
+        }
+        if (q.skipIfNoInjectValue && !value) hidden = true;
+        return { value, hidden };
+    }
+
+    async readFieldFromFileOrEmpty(file, fieldName) {
+        if (!file || !(file instanceof TFile) || !fieldName) return "";
+        const inline = await this.readInlineField(file, fieldName);
+        if (inline) return inline;
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fmVal = cache?.frontmatter?.[fieldName];
+        return (fmVal === null || fmVal === undefined) ? "" : String(fmVal);
+    }
+
+    findContainerById(id) {
+        return (this.plugin.settings?.prContainers || []).find(c => c.id === id) || null;
+    }
+
+    // Walks every PR container; returns whichever has lastGeneratedEnd === today.
+    // Most recent wins on tie (lex sort works because all values share the
+    // YYYY-MM-DD prefix). Returns null when nothing crossed today.
+    findRecentlyCrossedContainer() {
+        const containers = this.plugin.settings?.prContainers || [];
+        const today = dr_todayDateString();
+        const todays = containers.filter(c =>
+            c && c.enabled !== false &&
+            String(c.lastGeneratedEnd || "").slice(0, 10) === today
+        );
+        if (!todays.length) return null;
+        todays.sort((a, b) => String(b.lastGeneratedEnd).localeCompare(String(a.lastGeneratedEnd)));
+        return todays[0];
+    }
+
+    containerCrossedToday(container) {
+        if (!container || !container.lastGeneratedEnd) return false;
+        return String(container.lastGeneratedEnd).slice(0, 10) === dr_todayDateString();
+    }
+
+    // PR Data Source resolution. Static = the configured note. Dynamic =
+    // newest .md in the configured folder by mtime. Mirrors the consumer
+    // semantics PROJECT.md describes for the alignment-group consumer.
+    async resolveDataSourceFile(dataSourceId) {
+        const ds = (this.plugin.settings?.prDataSources || []).find(x => x.id === dataSourceId);
+        if (!ds) return null;
+        if (ds.mode === "static" && ds.notePath) {
+            const f = this.app.vault.getAbstractFileByPath(ds.notePath);
+            return (f && f instanceof TFile) ? f : null;
+        }
+        if (ds.mode === "dynamic" && ds.folderPath) {
+            const folder = this.app.vault.getAbstractFileByPath(ds.folderPath);
+            if (!folder || !folder.children) return null;
+            const candidates = folder.children
+                .filter(c => c instanceof TFile && c.extension === "md")
+                .sort((a, b) => (b.stat?.mtime || 0) - (a.stat?.mtime || 0));
+            return candidates[0] || null;
+        }
+        return null;
+    }
+
+    // Internal: resolve a PR container's current note by id. Used to be a
+    // cross-plugin lookup; now PR is the host so we go straight to it.
+    async findPRContainerCurrentNote(containerId) {
+        const containers = this.plugin.settings?.prContainers || [];
+        const container = containers.find(c => c.id === containerId);
+        if (!container) return null;
+        if (typeof this.plugin.findMostRecentPRContainerNote === "function") {
+            try { return await this.plugin.findMostRecentPRContainerNote(container); }
+            catch (_) { return null; }
+        }
+        return null;
+    }
+
+    listPRContainers() {
+        return this.plugin.settings?.prContainers || [];
+    }
+
+    buildStructuredReflection(answers) {
+        const parts = [];
+        let n = 0;
+        this.settings.questions.forEach((q, i) => {
+            if (q.omitFromLLM) return;
+            const a = (answers[i] || "").trim();
+            if (!a) return;
+            n++;
+            parts.push(`**Q${n}: ${q.text}**\n${a}`);
+        });
+        return parts.join("\n\n");
+    }
+
+    async buildPromptParts(structuredReflection) {
+        const provider = DR_PROVIDERS[this.settings.provider];
+        if (!provider) throw new Error(`Unknown provider: ${this.settings.provider}`);
+        const modelContext = await this.getSystemPrompt();
+        const additional = this.settings.additionalInstructions?.trim() || "";
+        const systemInstructions = additional || "Summarize this daily reflection into one concise sentence that captures the core insight.";
+        const userPrompt = [
+            "## Mental Model (apply this lens to the reflection below)",
+            modelContext,
+            "---",
+            "## My Reflection",
+            structuredReflection,
+            "---",
+            "Now follow the system instructions above precisely. Produce only the final output, nothing else.",
+        ].join("\n\n");
+        const url = provider.buildUrl(this.settings);
+        const body = provider.buildBody(userPrompt, this.settings, systemInstructions);
+        const headers = {
+            "Content-Type": "application/json",
+            ...(provider.headers ? provider.headers(this.settings) : {}),
+        };
+        return { provider, url, body, headers, systemPrompt: modelContext, additional, fullSystemPrompt: systemInstructions, userPrompt };
+    }
+
+    async openReflection() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice("No active file open!"); return; }
+        const resolved = await this.loadInjectedVarsFor(this.settings.questions);
+        let initialAnswers = null;
+        let initialStep = 0;
+        const draft = this.settings.dailyDraft;
+        if (draft && draft.filePath === file.path && Array.isArray(draft.answers) && draft.answers.length === this.settings.questions.length) {
+            initialAnswers = draft.answers;
+            initialStep = typeof draft.step === "number" ? draft.step : 0;
+        } else if (draft) {
+            this.settings.dailyDraft = null;
+            await this.saveSettings();
+        }
+        const onDraftChange = async ({ answers, step }) => {
+            this.settings.dailyDraft = { filePath: file.path, answers: [...answers], step };
+            await this.saveSettings();
+        };
+        new DRReflectionModal(this.app, this.settings.questions, resolved, async (answers) => {
+            await this.processReflection(file, answers);
+            this.settings.dailyDraft = null;
+            await this.saveSettings();
+        }, { initialAnswers, initialStep, onDraftChange }).open();
+    }
+
+    async openTestReflection() {
+        if (!this.settings.summaryEnabled) {
+            new Notice("Summary is disabled. Enable it in settings to test.");
+            return;
+        }
+        const resolved = await this.loadInjectedVarsFor(this.settings.questions);
+        new DRReflectionModal(this.app, this.settings.questions, resolved, async (answers) => {
+            await this.runTest(answers);
+        }).open();
+    }
+
+    async openAlignment() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice("No active file open!"); return; }
+        const questions = this.settings.alignmentQuestions || [];
+        if (!questions.length) { new Notice("No alignment questions configured (Settings → Daily Ritual → Alignment Questions)."); return; }
+        const resolved = await this.loadInjectedVarsFor(questions);
+        let initialAnswers = null;
+        let initialStep = 0;
+        const draft = this.settings.alignmentDraft;
+        if (draft && draft.filePath === file.path && Array.isArray(draft.answers) && draft.answers.length === questions.length) {
+            initialAnswers = draft.answers;
+            initialStep = typeof draft.step === "number" ? draft.step : 0;
+        } else if (draft) {
+            this.settings.alignmentDraft = null;
+            await this.saveSettings();
+        }
+        const onDraftChange = async ({ answers, step }) => {
+            this.settings.alignmentDraft = { filePath: file.path, answers: [...answers], step };
+            await this.saveSettings();
+        };
+        new DRReflectionModal(this.app, questions, resolved, async (answers) => {
+            await this.processAlignment(file, answers, questions);
+            this.settings.alignmentDraft = null;
+            this.settings.lastAlignmentRunDate = dr_todayDateString();
+            await this.saveSettings();
+        }, { initialAnswers, initialStep, onDraftChange }).open();
+    }
+
+    // Alignment writer. Per-question output-to-field only — no combined
+    // paragraph, no LLM summary. Prompt-mode and unanswered questions are
+    // skipped silently.
+    async processAlignment(file, answers, questions) {
+        let content = await this.app.vault.read(file);
+        const frontmatterUpdates = {};
+        let touchedBody = false;
+        for (let i = 0; i < questions.length; i++) {
+            const q = questions[i];
+            if ((q.responseMode || "input") === "prompt") continue;
+            if (!q.outputToField || !q.outputFieldName) continue;
+            const answer = (answers[i] || "").trim();
+            if (!answer) continue;
+            if (q.outputFieldType === "frontmatter") {
+                frontmatterUpdates[q.outputFieldName] = answer.replace(/\n+/g, " ").trim();
+            } else {
+                const fieldRegex = new RegExp(`(\\b${dr_escapeRegex(q.outputFieldName)}::)(.*)`);
+                if (fieldRegex.test(content)) {
+                    content = content.replace(fieldRegex, `$1 ${answer}`);
+                } else {
+                    content = content.trimEnd() + `\n${q.outputFieldName}:: ${answer}\n`;
+                }
+                touchedBody = true;
+            }
+        }
+        if (touchedBody) await this.app.vault.modify(file, content);
+        const fmKeys = Object.keys(frontmatterUpdates);
+        if (fmKeys.length > 0) {
+            try {
+                await this.app.fileManager.processFrontMatter(file, (fm) => {
+                    for (const k of fmKeys) fm[k] = frontmatterUpdates[k];
+                });
+            } catch (e) {
+                new Notice("Failed to write alignment frontmatter: " + e.message);
+            }
+        }
+        new Notice("Alignment recorded.");
+    }
+
+    // Called once on Obsidian start (after layout is ready). No-ops if the
+    // toggle is off or the modal already ran today (gate uses YYYY-MM-DD
+    // string compare against settings.lastAlignmentRunDate). Marks the
+    // gate satisfied BEFORE opening so dismissing without submitting still
+    // counts — otherwise a closed modal would re-pester on next reload
+    // that day. Manual command invocation ignores the gate.
+    async maybeOpenAlignmentOnStartup() {
+        if (!this.settings.openAlignmentOnStartup) return;
+        if (this.settings.lastAlignmentRunDate === dr_todayDateString()) return;
+        if (!(this.settings.alignmentQuestions || []).length) return;
+        this.settings.lastAlignmentRunDate = dr_todayDateString();
+        await this.saveSettings();
+        await this.openAlignment();
+    }
+
+    async processReflection(file, answers) {
+        // Empty answers are allowed — drop them from the combined paragraph,
+        // skip per-question writes for them, and skip the LLM call entirely
+        // when nothing was answered.
+        const kept = this.settings.questions
+            .map((q, i) => ({ q, a: (answers[i] || "").trim() }))
+            .filter(({ q, a }) => !q.omitFromCollected && a.length > 0)
+            .map(({ a }) => a);
+        const paragraph = kept.length
+            ? kept.map((a) => a.replace(/\.+$/, "")).join(". ").concat(".")
+            : "";
+        let content = await this.app.vault.read(file);
+        if (paragraph) {
+            const reflectionField = this.settings.reflectionField;
+            const todayRegex = new RegExp(`(\\b${dr_escapeRegex(reflectionField)}::)(.*)`);
+            if (todayRegex.test(content)) {
+                content = content.replace(todayRegex, `$1$2 ${paragraph}`);
+            } else {
+                new Notice(`Could not find '${reflectionField}::' in the active file!`);
+                return;
+            }
+        }
+        const frontmatterUpdates = {};
+        for (let i = 0; i < this.settings.questions.length; i++) {
+            const q = this.settings.questions[i];
+            if (!q.outputToField || !q.outputFieldName) continue;
+            const answer = (answers[i] || "").trim();
+            if (!answer) continue;
+            if (q.outputFieldType === "frontmatter") {
+                frontmatterUpdates[q.outputFieldName] = answer.replace(/\n+/g, " ").trim();
+            } else {
+                const fieldRegex = new RegExp(`(\\b${dr_escapeRegex(q.outputFieldName)}::)(.*)`);
+                if (fieldRegex.test(content)) {
+                    content = content.replace(fieldRegex, `$1 ${answer}`);
+                } else {
+                    content = content.trimEnd() + `\n${q.outputFieldName}:: ${answer}\n`;
+                }
+            }
+        }
+        const hasAnyAnswer = this.settings.questions.some((q, i) => !q.omitFromLLM && (answers[i] || "").trim().length > 0);
+        if (this.settings.summaryEnabled && hasAnyAnswer) {
+            const structured = this.buildStructuredReflection(answers);
+            let summary = "";
+            try { summary = await this.callLLM(structured); }
+            catch (e) { new Notice("LLM API call failed: " + e.message); return; }
+            if (!summary) { new Notice("LLM returned an empty summary."); return; }
+            const summaryField = this.settings.summaryField;
+            const nextRegex = new RegExp(`(\\b${dr_escapeRegex(summaryField)}::)(.*)`);
+            if (nextRegex.test(content)) {
+                content = content.replace(nextRegex, `$1$2 ${summary}`);
+            } else {
+                new Notice(`Could not find '${summaryField}::' in the active file!`);
+                return;
+            }
+        }
+        await this.app.vault.modify(file, content);
+        const fmKeys = Object.keys(frontmatterUpdates);
+        if (fmKeys.length > 0) {
+            try {
+                await this.app.fileManager.processFrontMatter(file, (fm) => {
+                    for (const k of fmKeys) fm[k] = frontmatterUpdates[k];
+                });
+            } catch (e) {
+                console.error("processFrontMatter failed:", e);
+                new Notice("Failed to write frontmatter: " + (e && e.message ? e.message : e));
+                return;
+            }
+            const norm = (v) => {
+                if (v === null || v === undefined) return "";
+                if (v instanceof Date) return v.toISOString().slice(0, 10);
+                if (typeof v === "boolean") return v ? "true" : "false";
+                return String(v).trim().toLowerCase();
+            };
+            const yamlEquivalent = (expected, actual) => {
+                const ne = norm(expected); const na = norm(actual);
+                if (ne === na) return true;
+                const boolMap = { yes: "true", no: "false", on: "true", off: "false", y: "true", n: "false" };
+                if ((boolMap[ne] || ne) === (boolMap[na] || na)) return true;
+                return false;
+            };
+            let fm = {};
+            let mismatches = [];
+            for (let attempt = 0; attempt < 10; attempt++) {
+                await new Promise((r) => setTimeout(r, 100));
+                const cache = this.app.metadataCache.getFileCache(file);
+                fm = (cache && cache.frontmatter) || {};
+                mismatches = [];
+                for (const k of fmKeys) {
+                    if (!yamlEquivalent(frontmatterUpdates[k], fm[k])) {
+                        mismatches.push(`${k}: expected="${frontmatterUpdates[k]}" got="${fm[k]}"`);
+                    }
+                }
+                if (mismatches.length === 0) break;
+            }
+            if (mismatches.length > 0) {
+                const raw = await this.app.vault.read(file);
+                const fmBlockMatch = raw.match(/^---\n([\s\S]*?)\n---/);
+                const fmBlock = fmBlockMatch ? fmBlockMatch[1] : "";
+                const stillMissing = [];
+                for (const m of mismatches) {
+                    const key = m.split(":")[0];
+                    const expected = String(frontmatterUpdates[key] ?? "").trim();
+                    const lineRegex = new RegExp(`^${dr_escapeRegex(key)}:\\s*(.*)$`, "m");
+                    const lineMatch = fmBlock.match(lineRegex);
+                    const rawValue = lineMatch ? lineMatch[1].trim().replace(/^["']|["']$/g, "") : "";
+                    if (rawValue !== expected) {
+                        stillMissing.push(`${key}: file has "${rawValue}", expected "${expected}"`);
+                    }
+                }
+                if (stillMissing.length > 0) {
+                    for (const msg of stillMissing) console.error("Frontmatter verification:", msg);
+                    new Notice("Frontmatter verification failed: " + stillMissing.join("; "));
+                    return;
+                }
+            }
+        }
+        new Notice("Reflection logged ✓");
+    }
+
+    async callLLM(structured) {
+        const parts = await this.buildPromptParts(structured);
+        const data = await prHttpJson({
+            url: parts.url,
+            method: "POST",
+            headers: parts.headers,
+            body: JSON.stringify(parts.body),
+        });
+        return parts.provider.extractText(data);
+    }
+
+    async runTest(answers) {
+        const paragraph = answers.map((a) => a.trim().replace(/\.+$/, "")).join(". ").concat(".");
+        const structured = this.buildStructuredReflection(answers);
+        const loadingModal = new DRLoadingModal(this.app, this.plugin.manifest.dir);
+        loadingModal.open();
+        const debugData = {
+            provider: `${DR_PROVIDERS[this.settings.provider].name} (${this.settings.provider})`,
+            model: this.settings.model,
+            additional: this.settings.additionalInstructions?.trim() || "",
+            paragraph: `--- Sent to inline field ---\n${paragraph}\n\n--- Sent to LLM (structured) ---\n${structured}`,
+        };
+        try {
+            const parts = await this.buildPromptParts(structured);
+            debugData.systemPrompt = parts.systemPrompt;
+            debugData.fullPrompt = JSON.stringify(parts.body, null, 2);
+            try {
+                const data = await prHttpJson({
+                    url: parts.url, method: "POST", headers: parts.headers, body: JSON.stringify(parts.body),
+                });
+                debugData.response = parts.provider.extractText(data) || "(empty response)";
+            } catch (err) { debugData.error = err.message; }
+        } catch (e) { debugData.error = e.message; }
+        loadingModal.close();
+        new DRDebugModal(this.app, debugData).open();
+    }
+
+    async runHealthCheck() {
+        const results = [];
+        const s = this.settings;
+        const loading = new DRLoadingModal(this.app, this.plugin.manifest.dir);
+        loading.open();
+        try {
+            const file = this.app.workspace.getActiveFile();
+            if (!file) {
+                results.push({ name: "Active file", passed: false, desc: "No file is open — open a daily note and rerun" });
+                return;
+            }
+            results.push({ name: "Active file", passed: true, desc: file.path });
+            const content = await this.app.vault.read(file);
+            const reflHas = new RegExp(`\\b${dr_escapeRegex(s.reflectionField)}::`).test(content);
+            results.push({
+                name: `Reflection field '${s.reflectionField}::'`,
+                passed: reflHas,
+                desc: reflHas ? "Found in active file" : `Missing — the combined paragraph won't be written`,
+            });
+            if (s.summaryEnabled) {
+                const sumHas = new RegExp(`\\b${dr_escapeRegex(s.summaryField)}::`).test(content);
+                results.push({
+                    name: `Summary field '${s.summaryField}::'`,
+                    passed: sumHas,
+                    desc: sumHas ? "Found in active file" : `Missing — the AI summary won't be written`,
+                });
+            }
+            for (let i = 0; i < s.questions.length; i++) {
+                const q = s.questions[i];
+                if (!q.outputToField || !q.outputFieldName) continue;
+                if (q.outputFieldType === "inline") {
+                    const has = new RegExp(`\\b${dr_escapeRegex(q.outputFieldName)}::`).test(content);
+                    results.push({
+                        name: `Q${i + 1} output → '${q.outputFieldName}::'`,
+                        passed: has ? true : "warn",
+                        desc: has ? "Found (existing value will be overwritten)" : "Not found — will be appended on save",
+                    });
+                } else {
+                    results.push({
+                        name: `Q${i + 1} output → frontmatter '${q.outputFieldName}'`,
+                        passed: true,
+                        desc: "Frontmatter writes go through processFrontMatter and create the key if missing",
+                    });
+                }
+            }
+            for (let i = 0; i < s.questions.length; i++) {
+                const q = s.questions[i];
+                if (!q.injectVar) continue;
+                if (!q.varField) {
+                    results.push({ name: `Q${i + 1} inject`, passed: false, desc: "Injection enabled but no field name set" });
+                    continue;
+                }
+                let sourceFile = null; let label = "";
+                if (q.varSource === "previous") { sourceFile = this.findPreviousDailyNote(); label = "previous daily note"; }
+                else if (q.varSource === "note") { sourceFile = q.varNotePath ? this.app.vault.getAbstractFileByPath(q.varNotePath) : null; label = q.varNotePath || "(no path set)"; }
+                else if (q.varSource === "pr-container") { sourceFile = q.varPRContainerId ? await this.findPRContainerCurrentNote(q.varPRContainerId) : null; label = "PR container current note"; }
+                if (!sourceFile) {
+                    results.push({ name: `Q${i + 1} inject source`, passed: false, desc: `Source not resolved (${label})` });
+                    continue;
+                }
+                let value = await this.readInlineField(sourceFile, q.varField);
+                if (!value) {
+                    const cache = this.app.metadataCache.getFileCache(sourceFile);
+                    const fmVal = cache?.frontmatter?.[q.varField];
+                    value = (fmVal === null || fmVal === undefined) ? "" : String(fmVal);
+                }
+                const preview = value ? `"${String(value).slice(0, 60)}${String(value).length > 60 ? "…" : ""}"` : "(empty)";
+                results.push({
+                    name: `Q${i + 1} inject ${q.varField} ← ${sourceFile.path}`,
+                    passed: value ? true : "warn",
+                    desc: value ? preview : "Field is empty or missing in the source",
+                });
+            }
+            if (s.summaryEnabled) {
+                const provider = DR_PROVIDERS[s.provider];
+                if (!provider) {
+                    results.push({ name: "Provider", passed: false, desc: `Unknown provider id: ${s.provider}` });
+                } else {
+                    results.push({ name: "Provider", passed: true, desc: provider.name });
+                    const keyRequired = !provider.needsBaseUrl;
+                    if (s.apiKey) results.push({ name: "API key", passed: true, desc: "Set" });
+                    else results.push({
+                        name: "API key",
+                        passed: keyRequired ? false : "warn",
+                        desc: keyRequired ? "Missing — LLM calls will fail" : "Empty (OK for local gateway in open mode)",
+                    });
+                    results.push({ name: "Model", passed: !!s.model, desc: s.model || "Not set" });
+                    if (provider.needsBaseUrl) {
+                        results.push({
+                            name: "Base URL",
+                            passed: !!s.baseUrl,
+                            desc: s.baseUrl || `Will fall back to default ${provider.defaultBaseUrl}`,
+                        });
+                    }
+                    if (s.systemPromptFile) {
+                        const f = this.app.vault.getAbstractFileByPath(s.systemPromptFile);
+                        results.push({
+                            name: "System prompt file",
+                            passed: !!(f && f instanceof TFile),
+                            desc: f ? s.systemPromptFile : `Not found: ${s.systemPromptFile}`,
+                        });
+                    }
+                    try {
+                        const parts = await this.buildPromptParts("**Q1: Health check**\nReply with the single word OK.");
+                        const data = await prHttpJson({
+                            url: parts.url, method: "POST", headers: parts.headers, body: JSON.stringify(parts.body),
+                        });
+                        const text = parts.provider.extractText(data);
+                        results.push({
+                            name: "LLM call",
+                            passed: !!text,
+                            desc: text ? `Response: "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}"` : "Empty response",
+                        });
+                    } catch (e) {
+                        results.push({ name: "LLM call", passed: false, desc: `Failed: ${e.message}` });
+                    }
+                }
+            } else {
+                results.push({ name: "LLM call", passed: "warn", desc: "Summary disabled — skipped" });
+            }
+        } finally {
+            loading.close();
+            new DRHealthCheckModal(this.app, results).open();
+        }
+    }
+
+    renderSettingsTab(containerEl) {
+        containerEl.createEl("h2", { text: "Daily Ritual" });
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); max-width: 60ch;";
+        intro.setText("Two daily Q&A modals — Alignment and Reflection — that write answers into the active note. Reflection can also generate an AI summary.");
+
+        // ─── Alignment Questions (morning intent / contextual prompts) ───
+        // Sits ABOVE Reflection deliberately — it's the morning bookend.
+        // No LLM summary, no combined paragraph. Each question can be Input
+        // (user types) or Prompt-only (read & meditate). Boundary-driven
+        // questions hide on days they don't apply via the Skip toggles.
+        containerEl.createEl("h3", { text: "Alignment Questions" });
+        const alignQList = containerEl.createDiv({ cls: "daily-log-questions-list" });
+        this.renderQuestions(alignQList, this.settings.alignmentQuestions, "alignmentQuestions", "alignment");
+        new Setting(containerEl)
+            .setName("Add alignment question")
+            .addButton((btn) => {
+                btn.setButtonText("+ Add Question").setCta().onClick(async () => {
+                    this.settings.alignmentQuestions.push(dr_makeQuestion(""));
+                    await this.saveSettings();
+                    this.renderQuestions(alignQList, this.settings.alignmentQuestions, "alignmentQuestions", "alignment");
+                });
+            });
+        new Setting(containerEl)
+            .setName("Open Daily Alignment on Obsidian start")
+            .setDesc("Auto-opens the alignment modal once per day shortly after Obsidian load. Skipped if already run today.")
+            .addToggle((t) => {
+                t.setValue(!!this.settings.openAlignmentOnStartup).onChange(async (v) => {
+                    this.settings.openAlignmentOnStartup = v; await this.saveSettings();
+                });
+            });
+
+        containerEl.createEl("h3", { text: "Reflection Questions" });
+        const questionsContainer = containerEl.createDiv({ cls: "daily-log-questions-list" });
+        this.renderQuestions(questionsContainer, this.settings.questions, "questions", "reflection");
+        new Setting(containerEl)
+            .setName("Add question")
+            .addButton((btn) => {
+                btn.setButtonText("+ Add Question").setCta().onClick(async () => {
+                    this.settings.questions.push(dr_makeQuestion(""));
+                    await this.saveSettings();
+                    this.renderQuestions(questionsContainer, this.settings.questions, "questions", "reflection");
+                });
+            });
+
+        containerEl.createEl("h3", { text: "Inline Fields" });
+        new Setting(containerEl)
+            .setName("Reflection field")
+            .setDesc("The inline field where the combined reflection is written")
+            .addText((text) => {
+                text.setPlaceholder("today").setValue(this.settings.reflectionField)
+                    .onChange(async (v) => { this.settings.reflectionField = v; await this.saveSettings(); });
+            });
+
+        containerEl.createEl("h3", { text: "AI Summary" });
+        new Setting(containerEl)
+            .setName("Enable summary")
+            .setDesc("Generate an AI summary and write it to a second inline field")
+            .addToggle((toggle) => {
+                toggle.setValue(this.settings.summaryEnabled).onChange(async (v) => {
+                    this.settings.summaryEnabled = v;
+                    await this.saveSettings();
+                    this.plugin.settingTab.display();
+                });
+            });
+
+        if (this.settings.summaryEnabled) {
+            new Setting(containerEl)
+                .setName("Summary field")
+                .setDesc("The inline field where the AI summary is written")
+                .addText((text) => {
+                    text.setPlaceholder("next").setValue(this.settings.summaryField)
+                        .onChange(async (v) => { this.settings.summaryField = v; await this.saveSettings(); });
+                });
+
+            containerEl.createEl("h4", { text: "LLM Provider" });
+            new Setting(containerEl)
+                .setName("Provider")
+                .addDropdown((dd) => {
+                    Object.entries(DR_PROVIDERS).forEach(([k, v]) => dd.addOption(k, v.name));
+                    dd.setValue(this.settings.provider).onChange(async (v) => {
+                        const s = this.settings;
+                        const prev = s.provider;
+                        if (prev && prev !== v) {
+                            s.apiKeys[prev] = s.apiKey || "";
+                            s.baseUrls[prev] = s.baseUrl || "";
+                        }
+                        s.provider = v;
+                        s.apiKey = s.apiKeys[v] || "";
+                        s.baseUrl = s.baseUrls[v] || (DR_PROVIDERS[v].defaultBaseUrl || "");
+                        await this.saveSettings();
+                        this.plugin.settingTab.display();
+                    });
+                });
+            new Setting(containerEl)
+                .setName("API Key")
+                .addText((text) => {
+                    text.setPlaceholder("Enter API key").setValue(this.settings.apiKey)
+                        .onChange(async (v) => {
+                            this.settings.apiKey = v;
+                            this.settings.apiKeys[this.settings.provider] = v;
+                            await this.saveSettings();
+                        });
+                    text.inputEl.type = "password";
+                });
+            const currentProvider = DR_PROVIDERS[this.settings.provider];
+            if (currentProvider && currentProvider.needsBaseUrl) {
+                new Setting(containerEl)
+                    .setName("Base URL")
+                    .setDesc(`Local gateway endpoint (default: ${currentProvider.defaultBaseUrl})`)
+                    .addText((text) => {
+                        text.setPlaceholder(currentProvider.defaultBaseUrl).setValue(this.settings.baseUrl)
+                            .onChange(async (v) => {
+                                this.settings.baseUrl = v;
+                                this.settings.baseUrls[this.settings.provider] = v;
+                                await this.saveSettings();
+                            });
+                        text.inputEl.style.width = "100%";
+                    });
+            }
+            const modelSetting = new Setting(containerEl).setName("Model").setDesc("Fetch models or select current");
+            this.modelDropdownEl = null;
+            const modelControlEl = modelSetting.controlEl;
+            const buildModelDropdown = (models) => {
+                if (this.modelDropdownEl) this.modelDropdownEl.remove();
+                const select = document.createElement("select"); select.className = "dropdown";
+                if (models.length === 0) {
+                    const opt = document.createElement("option");
+                    opt.value = this.settings.model; opt.textContent = this.settings.model || "Click Fetch Models";
+                    select.appendChild(opt);
+                } else {
+                    const cur = this.settings.model;
+                    if (cur && !models.includes(cur)) { const o = document.createElement("option"); o.value = cur; o.textContent = `${cur} (current)`; select.appendChild(o); }
+                    models.forEach((m) => { const o = document.createElement("option"); o.value = m; o.textContent = m; select.appendChild(o); });
+                }
+                select.value = this.settings.model;
+                select.addEventListener("change", async () => { this.settings.model = select.value; await this.saveSettings(); });
+                this.modelDropdownEl = select; modelControlEl.insertBefore(select, modelControlEl.firstChild);
+            };
+            buildModelDropdown([]);
+            const fetchBtn = document.createElement("button"); fetchBtn.textContent = "Fetch Models"; fetchBtn.className = "mod-cta"; fetchBtn.style.marginLeft = "8px";
+            fetchBtn.addEventListener("click", async () => {
+                const prov = DR_PROVIDERS[this.settings.provider];
+                const key = this.settings.apiKey;
+                if (!key && !prov.needsBaseUrl) { new Notice("Enter an API key first."); return; }
+                fetchBtn.textContent = "Fetching..."; fetchBtn.disabled = true;
+                try {
+                    const arg = prov.needsBaseUrl ? this.settings : key;
+                    const m = await prov.listModels(arg);
+                    buildModelDropdown(m);
+                    new Notice(`Found ${m.length} models.`);
+                } catch (e) { new Notice("Failed: " + e.message); }
+                finally { fetchBtn.textContent = "Fetch Models"; fetchBtn.disabled = false; }
+            });
+            modelControlEl.appendChild(fetchBtn);
+
+            containerEl.createEl("h4", { text: "AI Instructions" });
+            new Setting(containerEl)
+                .setName("System prompt file")
+                .setDesc(this.settings.systemPromptFile ? `Current: ${this.settings.systemPromptFile}` : "Select a .md file as the system prompt")
+                .addButton((btn) => {
+                    btn.setButtonText(this.settings.systemPromptFile ? "Change File" : "Choose File").onClick(() => {
+                        new MarkdownFileSuggestModal(this.app, async (file) => {
+                            this.settings.systemPromptFile = file.path; await this.saveSettings(); this.plugin.settingTab.display();
+                        }).open();
+                    });
+                })
+                .addExtraButton((btn) => {
+                    btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                        this.settings.systemPromptFile = ""; await this.saveSettings(); this.plugin.settingTab.display();
+                    });
+                });
+            new Setting(containerEl)
+                .setName("Additional instructions")
+                .setDesc("Behavioral directives sent as the system role")
+                .addTextArea((text) => {
+                    text.setPlaceholder("Optional extra instructions...").setValue(this.settings.additionalInstructions)
+                        .onChange(async (v) => { this.settings.additionalInstructions = v; await this.saveSettings(); });
+                    text.inputEl.rows = 3; text.inputEl.style.width = "100%";
+                });
+        }
+
+        containerEl.createEl("h3", { text: "Health Check" });
+        new Setting(containerEl)
+            .setName("Validate setup")
+            .setDesc("Verifies the active daily note has the required fields, each question's injection source and output target resolve, and (if summary is enabled) the LLM call actually succeeds. Run with a daily note open.")
+            .addButton((btn) => {
+                btn.setButtonText("Run Health Check").setCta().onClick(async () => {
+                    await this.runHealthCheck();
+                });
+            });
+    }
+
+    // Renders a question list. Used for both the reflection bank and the
+    // alignment bank. `expandKey` namespaces the per-row expand state so the
+    // two banks don't share open/closed rows. `bankType` ("reflection" |
+    // "alignment") gates the LLM-specific output toggles that don't apply
+    // to alignment (no summary call, no combined paragraph there).
+    renderQuestions(container, questions, expandKey, bankType) {
+        container.empty();
+        bankType = bankType || "reflection";
+        const expIn = (this.expandedInput[expandKey] = this.expandedInput[expandKey] || {});
+        const expOut = (this.expandedOutput[expandKey] = this.expandedOutput[expandKey] || {});
+        const rerender = () => this.renderQuestions(container, questions, expandKey, bankType);
+        questions.forEach((q, i) => {
+            const setting = new Setting(container).setName(`Q${i + 1}`);
+            setting.addExtraButton((btn) => {
+                btn.setIcon("arrow-left").setTooltip("Load variable into this question").onClick(() => {
+                    expIn[i] = !expIn[i];
+                    rerender();
+                });
+            });
+            setting.addText((text) => {
+                text.setPlaceholder("Enter a question...").setValue(q.text)
+                    .onChange(async (v) => { q.text = v; await this.saveSettings(); });
+                text.inputEl.style.width = "100%";
+            });
+            setting.addExtraButton((btn) => {
+                btn.setIcon("arrow-right").setTooltip("Output this answer to its own field").onClick(() => {
+                    expOut[i] = !expOut[i];
+                    rerender();
+                });
+            });
+            if (i > 0) {
+                setting.addExtraButton((btn) => {
+                    btn.setIcon("up-chevron-glyph").setTooltip("Move up").onClick(async () => {
+                        [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]];
+                        await this.saveSettings(); rerender();
+                    });
+                });
+            }
+            if (i < questions.length - 1) {
+                setting.addExtraButton((btn) => {
+                    btn.setIcon("down-chevron-glyph").setTooltip("Move down").onClick(async () => {
+                        [questions[i], questions[i + 1]] = [questions[i + 1], questions[i]];
+                        await this.saveSettings(); rerender();
+                    });
+                });
+            }
+            // Alignment bank can be empty; reflection bank keeps min 1.
+            const removable = (bankType === "alignment") ? questions.length >= 1 : questions.length > 1;
+            if (removable) {
+                setting.addExtraButton((btn) => {
+                    btn.setIcon("cross").setTooltip("Remove").onClick(async () => {
+                        questions.splice(i, 1); await this.saveSettings(); rerender();
+                    });
+                });
+            }
+            if (expIn[i]) {
+                const inputGroup = container.createDiv({ cls: "daily-log-nested-settings" });
+                inputGroup.style.cssText = "padding-left:24px;border-left:2px solid var(--interactive-accent);margin-bottom:12px;";
+                new Setting(inputGroup)
+                    .setName("Response mode")
+                    .setDesc("Input — user types an answer. Prompt — display only (e.g. for meditation), no input field.")
+                    .addDropdown((dd) => {
+                        dd.addOption("input", "Input (user types answer)");
+                        dd.addOption("prompt", "Prompt only (no input)");
+                        dd.setValue(q.responseMode || "input").onChange(async (v) => {
+                            q.responseMode = v; await this.saveSettings(); rerender();
+                        });
+                    });
+                new Setting(inputGroup)
+                    .setName("Inject variable")
+                    .setDesc("Show a value from another note in bold above this question")
+                    .addToggle((t) => {
+                        t.setValue(q.injectVar).onChange(async (v) => {
+                            q.injectVar = v; await this.saveSettings(); rerender();
+                        });
+                    });
+                if (q.injectVar) {
+                    new Setting(inputGroup)
+                        .setName("Source")
+                        .addDropdown((dd) => {
+                            dd.addOption("previous-daily", "Previous daily note");
+                            dd.addOption("current-daily", "Current daily note (active file)");
+                            dd.addOption("note", "Specific note");
+                            dd.addOption("data-source", "Data Source (PR)");
+                            dd.addOption("container-current", "PR container — current note");
+                            dd.addOption("container-previous", "PR container — previous note");
+                            dd.addOption("container-recent-crossing", "PR container — any that crossed today");
+                            dd.addOption("boundary-tokens", "Boundary tokens (live, now)");
+                            dd.addOption("alignment-output", "PR Alignment Group output");
+                            dd.setValue(q.varSource || "previous-daily").onChange(async (v) => {
+                                q.varSource = v; await this.saveSettings(); rerender();
+                            });
+                        });
+                    const src = q.varSource || "previous-daily";
+                    const usesField = (src !== "boundary-tokens" && src !== "alignment-output");
+                    if (usesField) {
+                        new Setting(inputGroup)
+                            .setName("Field name")
+                            .setDesc("Inline field (tries this first), then frontmatter as fallback")
+                            .addText((t) => {
+                                t.setPlaceholder("e.g. next").setValue(q.varField)
+                                    .onChange(async (v) => { q.varField = v; await this.saveSettings(); });
+                            });
+                    }
+                    if (src === "note") {
+                        new Setting(inputGroup)
+                            .setName("Note")
+                            .setDesc(q.varNotePath || "No note selected")
+                            .addButton((btn) => {
+                                btn.setButtonText(q.varNotePath ? "Change Note" : "Choose Note").onClick(() => {
+                                    new MarkdownFileSuggestModal(this.app, async (file) => {
+                                        q.varNotePath = file.path; await this.saveSettings(); rerender();
+                                    }).open();
+                                });
+                            });
+                    } else if (src === "data-source") {
+                        const dataSources = this.plugin.settings?.prDataSources || [];
+                        new Setting(inputGroup)
+                            .setName("Data source")
+                            .setDesc(dataSources.length === 0
+                                ? "No PR data sources configured yet (Settings → General → Data sources)"
+                                : "Static = the chosen note. Dynamic = newest .md in the chosen folder by mtime.")
+                            .addDropdown((dd) => {
+                                dd.addOption("", "— Pick one —");
+                                for (const ds of dataSources) dd.addOption(ds.id, `${ds.name || "(unnamed)"} (${ds.mode || "?"})`);
+                                dd.setValue(q.varDataSourceId || "").onChange(async (v) => {
+                                    q.varDataSourceId = v; await this.saveSettings();
+                                });
+                            });
+                    } else if (src === "container-current" || src === "container-previous") {
+                        const containers = this.listPRContainers();
+                        new Setting(inputGroup)
+                            .setName("PR container")
+                            .setDesc(containers.length === 0
+                                ? "Periodic Ritual has no containers configured yet"
+                                : (src === "container-current"
+                                    ? "Reads the most recent note of the chosen container."
+                                    : "Reads the previous-period note of the chosen container."))
+                            .addDropdown((dd) => {
+                                dd.addOption("", "— Pick one —");
+                                for (const c of containers) dd.addOption(c.id, c.name || "(unnamed)");
+                                dd.setValue(q.varPRContainerId || "").onChange(async (v) => {
+                                    q.varPRContainerId = v; await this.saveSettings();
+                                });
+                            });
+                    } else if (src === "container-recent-crossing") {
+                        const note = inputGroup.createEl("p");
+                        note.style.cssText = "color: var(--text-muted); padding-left: 16px; margin: 4px 0; font-size: 0.9em;";
+                        note.setText("Walks every PR container; picks whichever has lastGeneratedEnd === today. No picker — auto-detected. Combine with 'Skip if no inject value' so this question only appears on days something actually crossed.");
+                    } else if (src === "boundary-tokens") {
+                        const detectors = (typeof this.plugin.getPRAvailableBoundaryDetectors === "function")
+                            ? this.plugin.getPRAvailableBoundaryDetectors() : [];
+                        new Setting(inputGroup)
+                            .setName("Boundary detector")
+                            .addDropdown((dd) => {
+                                dd.addOption("", "— Pick one —");
+                                for (const d of detectors) dd.addOption(d.id, d.label);
+                                dd.setValue(q.varBoundaryDetector || "").onChange(async (v) => {
+                                    q.varBoundaryDetector = v; await this.saveSettings();
+                                });
+                            });
+                        new Setting(inputGroup)
+                            .setName("Token key")
+                            .setDesc("Which key to read from the detector's tokens object (e.g. phase_name, sign, week, year)")
+                            .addText((t) => {
+                                t.setPlaceholder("e.g. phase_name").setValue(q.varBoundaryToken || "")
+                                    .onChange(async (v) => { q.varBoundaryToken = v; await this.saveSettings(); });
+                            });
+                    } else if (src === "alignment-output") {
+                        const groups = this.plugin.settings?.prAlignmentGroups || [];
+                        new Setting(inputGroup)
+                            .setName("Alignment group")
+                            .setDesc(groups.length === 0
+                                ? "No PR alignment groups configured yet"
+                                : "Reads from the container that group is wired to.")
+                            .addDropdown((dd) => {
+                                dd.addOption("", "— Pick one —");
+                                for (const g of groups) dd.addOption(g.id, g.name || "(unnamed)");
+                                dd.setValue(q.varAlignmentGroupId || "").onChange(async (v) => {
+                                    q.varAlignmentGroupId = v; await this.saveSettings();
+                                });
+                            });
+                        new Setting(inputGroup)
+                            .setName("Output key")
+                            .setDesc("Field key the group writes to on the container (e.g. alignment_health, alignment_combined)")
+                            .addText((t) => {
+                                t.setPlaceholder("e.g. alignment_combined").setValue(q.varAlignmentOutputKey || "")
+                                    .onChange(async (v) => { q.varAlignmentOutputKey = v; await this.saveSettings(); });
+                            });
+                    }
+                    new Setting(inputGroup)
+                        .setName("Skip if no inject value")
+                        .setDesc("Hide this question from the modal entirely when the source resolves to empty")
+                        .addToggle((t) => {
+                            t.setValue(!!q.skipIfNoInjectValue).onChange(async (v) => {
+                                q.skipIfNoInjectValue = v; await this.saveSettings();
+                            });
+                        });
+                    if (src === "container-current" || src === "container-previous" || src === "container-recent-crossing" || src === "alignment-output") {
+                        new Setting(inputGroup)
+                            .setName("Skip unless source container crossed today")
+                            .setDesc("Hide unless the source PR container's last boundary crossing happened today")
+                            .addToggle((t) => {
+                                t.setValue(!!q.skipUnlessBoundaryFreshToday).onChange(async (v) => {
+                                    q.skipUnlessBoundaryFreshToday = v; await this.saveSettings();
+                                });
+                            });
+                    }
+                }
+            }
+            if (expOut[i]) {
+                const outputGroup = container.createDiv({ cls: "daily-log-nested-settings" });
+                outputGroup.style.cssText = "padding-left:24px;border-left:2px solid var(--interactive-accent);margin-bottom:12px;";
+                if ((q.responseMode || "input") === "prompt") {
+                    const note = outputGroup.createEl("p");
+                    note.style.cssText = "color: var(--text-muted); padding: 4px 8px; font-size: 0.9em;";
+                    note.setText("Prompt-only questions don't capture an answer. Output options don't apply.");
+                } else {
+                    new Setting(outputGroup)
+                        .setName("Output to own field")
+                        .setDesc("Write this answer to a separate field" + (bankType === "reflection" ? " in addition to the combined reflection" : ""))
+                        .addToggle((t) => {
+                            t.setValue(q.outputToField).onChange(async (v) => {
+                                q.outputToField = v; await this.saveSettings(); rerender();
+                            });
+                        });
+                    if (q.outputToField) {
+                        new Setting(outputGroup)
+                            .setName("Field name")
+                            .addText((t) => {
+                                t.setPlaceholder("e.g. commitment").setValue(q.outputFieldName)
+                                    .onChange(async (v) => { q.outputFieldName = v; await this.saveSettings(); });
+                            });
+                        new Setting(outputGroup)
+                            .setName("Field type")
+                            .addDropdown((dd) => {
+                                dd.addOption("inline", "Inline field (field::)");
+                                dd.addOption("frontmatter", "Frontmatter (field:)");
+                                dd.setValue(q.outputFieldType).onChange(async (v) => {
+                                    q.outputFieldType = v; await this.saveSettings();
+                                });
+                            });
+                    }
+                    if (bankType === "reflection") {
+                        new Setting(outputGroup)
+                            .setName("Omit from AI summary")
+                            .setDesc("Don't include this question/answer in the prompt sent to the LLM")
+                            .addToggle((t) => {
+                                t.setValue(!!q.omitFromLLM).onChange(async (v) => {
+                                    q.omitFromLLM = v; await this.saveSettings();
+                                });
+                            });
+                        new Setting(outputGroup)
+                            .setName("Omit from combined reflection")
+                            .setDesc("Don't include this answer in the combined paragraph written to the reflection field")
+                            .addToggle((t) => {
+                                t.setValue(!!q.omitFromCollected).onChange(async (v) => {
+                                    q.omitFromCollected = v; await this.saveSettings();
+                                });
+                            });
+                    }
+                }
+            }
+        });
+    }
+}
+
 class MonthlyRitualPlugin extends Plugin {
 
     // ─── Lifecycle ───
 
     async onload() {
         await this.loadSettings();
+        // Daily Ritual module: folded-in former plugin. Owns its own
+        // settings slice (settings.dailyRitual), commands, and tab content.
+        this.dailyRitual = new DailyRitualModule(this);
+        this.dailyRitual.registerCommands();
         // Capture the settings tab instance so the graph view can talk to it
         // directly (set outerTab + scroll to a card on double-click).
         this.settingTab = new MonthlyRitualSettingTab(this.app, this);
@@ -2302,6 +3794,20 @@ class MonthlyRitualPlugin extends Plugin {
                 });
             }, 10 * 60 * 1000));
         }
+
+        // Daily Ritual: optional auto-open of the morning Alignment modal.
+        // Deferred behind onLayoutReady so an active file (the daily note)
+        // is available, and behind a small extra delay so PR auto-generate
+        // (above) can finish stamping `lastGeneratedEnd` on any container
+        // that crossed today — otherwise `container-recent-crossing` and
+        // freshness-skip predicates wouldn't see today's transits yet.
+        this.app.workspace.onLayoutReady(() => {
+            setTimeout(() => {
+                this.dailyRitual.maybeOpenAlignmentOnStartup().catch(e => {
+                    console.error("Daily Ritual: alignment auto-open failed", e);
+                });
+            }, 3000);
+        });
     }
 
     async activateCalendarView() {
@@ -2336,6 +3842,38 @@ class MonthlyRitualPlugin extends Plugin {
         if (!this.settings.subdivisionReflection || typeof this.settings.subdivisionReflection !== "object") {
             this.settings.subdivisionReflection = makeReflectionConfig();
         }
+        // Daily Ritual settings slice. Folded-in plugin keeps its own
+        // namespace at settings.dailyRitual so the two never collide.
+        if (!this.settings.dailyRitual || typeof this.settings.dailyRitual !== "object") {
+            this.settings.dailyRitual = {};
+        }
+        const dr = this.settings.dailyRitual;
+        for (const k of Object.keys(DR_DEFAULT_SETTINGS)) {
+            if (dr[k] === undefined) dr[k] = JSON.parse(JSON.stringify(DR_DEFAULT_SETTINGS[k]));
+        }
+        if (!dr.apiKeys || typeof dr.apiKeys !== "object") dr.apiKeys = {};
+        if (!dr.baseUrls || typeof dr.baseUrls !== "object") dr.baseUrls = {};
+        const drCur = dr.provider;
+        if (dr.apiKey && drCur && !dr.apiKeys[drCur]) dr.apiKeys[drCur] = dr.apiKey;
+        if (dr.baseUrl && drCur && !dr.baseUrls[drCur]) dr.baseUrls[drCur] = dr.baseUrl;
+        // One-time migration: rename DR varSource values to match PR's
+        // vocabulary, and backfill new question fields added in the
+        // Alignment Questions expansion. Idempotent — runs every load,
+        // only changes anything when it finds old shapes.
+        const dr_migrateQuestion = (q) => {
+            if (q.varSource === "previous") q.varSource = "previous-daily";
+            else if (q.varSource === "pr-container") q.varSource = "container-current";
+            if (q.responseMode === undefined) q.responseMode = "input";
+            if (q.varDataSourceId === undefined) q.varDataSourceId = "";
+            if (q.varBoundaryDetector === undefined) q.varBoundaryDetector = "";
+            if (q.varBoundaryToken === undefined) q.varBoundaryToken = "";
+            if (q.varAlignmentGroupId === undefined) q.varAlignmentGroupId = "";
+            if (q.varAlignmentOutputKey === undefined) q.varAlignmentOutputKey = "";
+            if (q.skipIfNoInjectValue === undefined) q.skipIfNoInjectValue = false;
+            if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
+        };
+        for (const q of (dr.questions || [])) dr_migrateQuestion(q);
+        for (const q of (dr.alignmentQuestions || [])) dr_migrateQuestion(q);
         // One-time migration: old reflection questions used a single
         // `outputTargetContainer` dropdown that mixed ""/"daily-today"/<id>.
         // New shape mirrors the inject source options via `outputTarget`
@@ -10161,7 +11699,7 @@ class PRGraphView extends ItemView {
 
         try {
             setting.open();
-            setting.openTabById("monthly-ritual");
+            setting.openTabById("periodic-ritual");
         } catch (e) {
             console.error("Periodic Ritual: failed to open settings", e);
             return;
@@ -10889,12 +12427,13 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         const tabs = [
-            { id: "general",    label: "General" },
-            { id: "containers", label: "Containers" },
-            { id: "boundaries", label: "Boundaries" },
-            { id: "reflection", label: "Reflection" },
-            { id: "alignments", label: "Alignment" },
-            { id: "llm",        label: "LLM" },
+            { id: "general",       label: "General" },
+            { id: "daily-ritual",  label: "Daily Ritual" },
+            { id: "containers",    label: "Containers" },
+            { id: "boundaries",    label: "Boundaries" },
+            { id: "reflection",    label: "Reflection" },
+            { id: "alignments",    label: "Alignment" },
+            { id: "llm",           label: "LLM" },
         ];
 
         const bar = containerEl.createDiv({ cls: "mr-tab-bar mr-outer-tab-bar" });
@@ -10911,13 +12450,14 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         const body = containerEl.createDiv({ cls: "mr-tab-content" });
         switch (this.outerTab) {
-            case "general":     this.displayGeneral(body); break;
-            case "containers":  this.displayContainersStub(body); break;
-            case "boundaries":  this.displayBoundaries(body); break;
-            case "reflection":  this.displayReflections(body); break;
-            case "alignments":  this.displayAlignmentsStub(body); break;
-            case "llm":         this.displayLLMStub(body); break;
-            default:            this.displayGeneral(body); break;
+            case "general":      this.displayGeneral(body); break;
+            case "containers":   this.displayContainersStub(body); break;
+            case "boundaries":   this.displayBoundaries(body); break;
+            case "reflection":   this.displayReflections(body); break;
+            case "alignments":   this.displayAlignmentsStub(body); break;
+            case "llm":          this.displayLLMStub(body); break;
+            case "daily-ritual": this.plugin.dailyRitual.renderSettingsTab(body); break;
+            default:             this.displayGeneral(body); break;
         }
     }
 
@@ -12906,7 +14446,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const helpBtn = helpBox.createEl("button", { text: "📖 Open README" });
         helpBtn.style.cssText = "flex-shrink: 0; background: var(--interactive-accent); color: var(--text-on-accent, #fff); border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-weight: 500;";
         helpBtn.addEventListener("click", () => {
-            window.open("https://github.com/PoweredbyPugs/monthly-ritual/blob/main/README.md", "_blank");
+            window.open("https://github.com/PoweredbyPugs/periodic-ritual/blob/main/README.md", "_blank");
         });
 
         // ── Periodic Ritual behavior ──
@@ -13126,6 +14666,95 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     }));
         }
+
+        this.displayBackupRestore(containerEl);
+    }
+
+    displayBackupRestore(containerEl) {
+        containerEl.createEl("h3", { text: "Backup & Restore" }).style.marginTop = "24px";
+        const intro = containerEl.createEl("p");
+        intro.style.cssText = "color: var(--text-muted); font-size: 0.9em; max-width: 60ch;";
+        intro.setText("Export the entire plugin configuration (including Daily Ritual) to a JSON file, or replace it from a previous export. Use this for backups, sharing setups, or migrating to a new install.");
+
+        new Setting(containerEl)
+            .setName("Export settings")
+            .setDesc("Download a JSON file containing all current settings")
+            .addButton(btn => {
+                btn.setButtonText("Export").setCta().onClick(() => {
+                    try {
+                        const data = JSON.stringify(this.plugin.settings, null, 2);
+                        const blob = new Blob([data], { type: "application/json" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+                        a.download = `periodic-ritual-settings-${ts}.json`;
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        URL.revokeObjectURL(url);
+                        new Notice("Settings exported");
+                    } catch (e) {
+                        console.error("Export failed:", e);
+                        new Notice("Export failed: " + e.message);
+                    }
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Import settings")
+            .setDesc("Replace all current settings with those from a JSON file")
+            .addButton(btn => {
+                btn.setButtonText("Import").onClick(() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = "application/json,.json";
+                    input.style.display = "none";
+                    document.body.appendChild(input);
+                    input.addEventListener("change", async () => {
+                        const file = input.files?.[0];
+                        input.remove();
+                        if (!file) return;
+                        let parsed;
+                        try {
+                            const text = await file.text();
+                            parsed = JSON.parse(text);
+                            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                                throw new Error("File is not a settings object");
+                            }
+                        } catch (e) {
+                            console.error("Import parse failed:", e);
+                            new Notice("Import failed: " + e.message);
+                            return;
+                        }
+                        const ok = await new Promise((resolve) => {
+                            const modal = new Modal(this.app);
+                            modal.titleEl.setText("Import settings");
+                            modal.contentEl.createEl("p", { text: `This will replace all current Periodic Ritual settings with those from "${file.name}". Your current settings will be lost unless you've already exported them.` });
+                            const sub = modal.contentEl.createEl("p", { text: "After importing, disable and re-enable the plugin to fully refresh views." });
+                            sub.style.cssText = "color: var(--text-muted); font-size: 0.9em;";
+                            const btnRow = modal.contentEl.createDiv({ cls: "modal-button-container" });
+                            const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+                            const confirmBtn = btnRow.createEl("button", { text: "Replace settings", cls: "mod-warning" });
+                            cancelBtn.addEventListener("click", () => { modal.close(); resolve(false); });
+                            confirmBtn.addEventListener("click", () => { modal.close(); resolve(true); });
+                            modal.open();
+                        });
+                        if (!ok) { new Notice("Import cancelled"); return; }
+                        try {
+                            this.plugin.settings = parsed;
+                            await this.plugin.saveSettings();
+                            await this.plugin.loadSettings();
+                            this.display();
+                            new Notice("Settings imported. Disable/re-enable the plugin to fully refresh.");
+                        } catch (e) {
+                            console.error("Import save failed:", e);
+                            new Notice("Import failed: " + e.message);
+                        }
+                    });
+                    input.click();
+                });
+            });
     }
 
     // ─── Legacy settings UI (existing functionality, untouched) ───

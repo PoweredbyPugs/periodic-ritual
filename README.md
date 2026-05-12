@@ -2,9 +2,7 @@
 
 An Obsidian plugin for **periodic review notes**. It watches your calendar (or any period rule you define), generates weekly / monthly / chapter / lunar / custom notes from a template when a period begins or ends, summarizes what happened through an LLM, and writes the result into the note's frontmatter. It can also measure your activity against named "guidelines" and produce gap analysis, drive Q&A reflections, and compose rich pipelines in a visual graph editor.
 
-Companion to **Daily Ritual**, which handles the per-day journaling side.
-
-> The plugin id is still `monthly-ritual` for migration safety. The user-facing name is **Periodic Ritual** everywhere.
+Daily Ritual is now folded in as a sub-tab inside Periodic Ritual's settings.
 
 ---
 
@@ -22,11 +20,12 @@ Companion to **Daily Ritual**, which handles the per-day journaling side.
 10. [Reflection flows](#reflection-flows)
 11. [Hierarchical containers](#hierarchical-containers)
 12. [Custom boundaries](#custom-boundaries)
-13. [Commands](#commands)
-14. [Settings reference](#settings-reference)
-15. [Tips and troubleshooting](#tips-and-troubleshooting)
-16. [Files in this repo](#files-in-this-repo)
-17. [License](#license)
+13. [Daily Ritual (folded in)](#daily-ritual-folded-in)
+14. [Commands](#commands)
+15. [Settings reference](#settings-reference)
+16. [Tips and troubleshooting](#tips-and-troubleshooting)
+17. [Files in this repo](#files-in-this-repo)
+18. [License](#license)
 
 ---
 
@@ -46,7 +45,7 @@ Now imagine doing the same thing for *months*, *quarters*, *lunar phases*, *cust
 
 ## Install
 
-1. Drop the plugin folder into `<your vault>/.obsidian/plugins/monthly-ritual/`.
+1. Drop the plugin folder into `<your vault>/.obsidian/plugins/periodic-ritual/`.
 2. Enable **Periodic Ritual** in Settings → Community plugins.
 3. Open Settings → Periodic Ritual. You'll see tabs: **Containers · Boundaries · Reflection · Alignment · LLM · General**.
 
@@ -388,6 +387,54 @@ Each custom boundary gets an optional **description** field. The description is 
 
 ---
 
+## Daily Ritual (folded in)
+
+Daily Ritual was a separate plugin; it now lives as a sub-tab inside Periodic Ritual's settings (Settings → Daily Ritual). It runs **two Q&A modals** against the active daily note:
+
+- **Daily Align** — morning bookend. No LLM, no combined paragraph. Each question's answer can be written to its own field.
+- **Daily Reflect** — evening bookend. Same engine, plus an optional combined paragraph and an optional LLM summary.
+
+Both modals share the same question schema. You configure them in two parallel lists in the Daily Ritual tab — Alignment Questions on top, Reflection Questions below.
+
+### Per-question controls
+
+- **Response mode** — *Input* (user types an answer) or *Prompt only* (display-only — useful for affirmations, meditation cues, or just showing context without prompting an answer).
+- **Inject variable** — optionally show a value pulled from somewhere else, in bold above the question. Nine source kinds:
+
+  | Source | What it reads |
+  |---|---|
+  | Previous daily note | Yesterday's daily by filename |
+  | Current daily note | The active file |
+  | Specific note | Any `.md` by path |
+  | Data Source (PR) | A PR data source — static = the note, dynamic = newest .md in the folder |
+  | PR container — current note | Current note of a chosen PR container |
+  | PR container — previous note | Previous-period note of a chosen PR container |
+  | PR container — any that crossed today | Whichever PR container last stamped `lastGeneratedEnd === today` (no picker — auto-detected) |
+  | Boundary tokens (live, now) | Any token from a boundary detector evaluated at the current moment (e.g., `phase_name` from `lunar-phase`, `sign` from `sun-ingress`) |
+  | PR Alignment Group output | A specific output key the alignment group writes onto its container |
+
+- **Skip if no inject value** — hide this question from the modal entirely when the source resolves to empty. Combine with boundary-driven sources to make a question only appear when it's actually relevant.
+- **Skip unless source container crossed today** — hide unless the source PR container's last boundary crossing was today. Lets you wire questions that ONLY surface on transit / cycle / phase-shift days.
+- **Output to own field** — write the answer to a per-question inline field or frontmatter key. Independent of the combined paragraph.
+
+### Why the "skip" toggles matter
+
+The skip predicates are how you keep the modal short. You can configure 30 alignment questions covering every transit, cycle, and phase you care about, and on most mornings only the 3-4 actually relevant ones appear. A "what does this Mars transit ask of me?" question can sit dormant for months and surface only when a Mars-transit PR container crosses its boundary today.
+
+### Empty answers are OK
+
+Both modals let you submit blank — press Next / Submit without typing. Empty answers are silently skipped: no empty fields written, no LLM call burned on a fully-blank reflection.
+
+### Auto-open Daily Align on Obsidian start
+
+Optional toggle in the Daily Ritual tab. When on, the Alignment modal auto-opens once per day shortly after Obsidian load. Dismissing without submitting still counts as "ran today" — won't re-pester on next reload. The manual **Daily Align** command always opens it, regardless of the gate.
+
+### Settings storage
+
+Everything lives at `data.json` under `dailyRitual: { ... }`. Including the LLM provider config for the Reflection summary (each provider's API key is cached separately, so you can swap providers without re-typing keys).
+
+---
+
 ## Commands
 
 | Command | What it does |
@@ -399,6 +446,9 @@ Each custom boundary gets an optional **description** field. The description is 
 | **Show last LLM call** | Debug modal with the full system prompt, user message, request body, status, and raw response from the most recent LLM call. Invaluable when something looks wrong. |
 | **Show hierarchy diagram** | Mermaid flowchart of all containers, their data sources, reflections, alignments, and LLM references |
 | **Open Ritual Calendar** | Sidebar zodiac + lunar phase calendar view |
+| **Daily Align** | Open the morning Daily Ritual alignment modal on the active note |
+| **Daily Reflect** | Open the evening Daily Ritual reflection modal on the active note |
+| **Test Daily Reflect** | Run the reflection modal but instead of writing anything, show the LLM's full request + response in a debug modal. Useful for tuning the summary prompt. |
 
 ---
 
@@ -422,6 +472,9 @@ Legacy section: old per-container single alignments (only shown if any exist).
 
 ### LLM
 Provider configurations. One card per service: name, provider dropdown, API key, base URL (for LM Studio / OpenClaw / OpenRouter custom endpoints), model picker (with a refresh button that fetches the provider's model list dynamically).
+
+### Daily Ritual
+Folded-in former plugin. Two question banks (Alignment Questions and Reflection Questions) plus inline-field config, optional LLM summary for reflection, and an "Open Daily Alignment on Obsidian start" toggle. See the [Daily Ritual section](#daily-ritual-folded-in) above.
 
 ### General
 Plugin-wide settings:
@@ -464,14 +517,14 @@ They won't. Template token substitution (`{{week}}`, `{{month-name}}`, `{{year}}
 Your container's system prompt runs AFTER alignment groups, and it auto-includes previous frontmatter. So you can say "You'll see `alignment_*` keys in the previous frontmatter block; reference them in your summary." The main call now has that context.
 
 **Where do my plugin settings live?**
-`.obsidian/plugins/monthly-ritual/data.json` inside your vault. Copy this file to back up or migrate all your containers, groups, data sources, etc.
+`.obsidian/plugins/periodic-ritual/data.json` inside your vault. Copy this file to back up or migrate all your containers, groups, data sources, etc.
 
 ---
 
 ## Files in this repo
 
 ```
-monthly-ritual/
+periodic-ritual/
 ├── main.js          — all plugin code (single file, no build step)
 ├── manifest.json    — plugin metadata
 ├── styles.css       — UI styling
@@ -483,19 +536,6 @@ monthly-ritual/
 ```
 
 No build step. `main.js` is hand-written JavaScript. Edit, reload Obsidian, done.
-
----
-
-## Companion: Daily Ritual
-
-Periodic Ritual is the periodic-aggregation power tool. **Daily Ritual** is the daily Q&A entry point. They coexist:
-
-- Daily Ritual handles per-day reflection on the active daily note
-- Periodic Ritual aggregates those daily notes into weekly / monthly / chapter summaries
-- Reflection inject/output in Periodic Ritual can read from and write to daily notes by path
-- Daily Ritual can optionally inject context from the current corresponding Periodic Ritual container note
-
-Install both for the full loop.
 
 ---
 

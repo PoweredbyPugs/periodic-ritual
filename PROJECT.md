@@ -1,7 +1,6 @@
 # Periodic Ritual — Project Document
 
-> Obsidian plugin for periodic review notes. Companion to **Daily Ritual**.
-> Plugin id stays `monthly-ritual` for zero migration friction. User-facing name is **Periodic Ritual**.
+> Obsidian plugin for periodic review notes. Daily Ritual was folded in as a sub-tab.
 
 ---
 
@@ -34,18 +33,18 @@ Templater scripts in the user's vault render note bodies via Dataview. The plugi
 
 ## Repo and build
 
-- GitHub: `poweredbypugs/monthly-ritual`
-- Plugin id: `monthly-ritual` (unchanged for migration safety)
+- GitHub: `poweredbypugs/periodic-ritual`
+- Plugin id: `periodic-ritual`
 - User-facing name: **Periodic Ritual** (in `manifest.json`)
-- Version: 1.1.0
-- Plugin install path: `KAI/.obsidian/plugins/monthly-ritual/`
-- Working clone: `~/Documents/Plugin Project/monthly-ritual/`
+- Version: 1.2.0
+- Plugin install path: `KAI/.obsidian/plugins/periodic-ritual/`
+- Working clone: `~/Documents/Plugin Project/periodic-ritual/`
 - **Plain JS, no build step, no TypeScript.** `main.js` is the source of truth — same convention as Daily Ritual. Edit, reload, done.
 
 ```
-monthly-ritual/
+periodic-ritual/
 ├── main.js          — all plugin code (~13500 lines)
-├── manifest.json    — name: "Periodic Ritual", id: "monthly-ritual"
+├── manifest.json    — name: "Periodic Ritual", id: "periodic-ritual"
 ├── styles.css       — graph view + settings styling
 ├── data.json        — user settings (gitignored)
 ├── PROJECT.md       — this file
