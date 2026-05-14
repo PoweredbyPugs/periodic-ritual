@@ -429,6 +429,29 @@ Both modals let you submit blank — press Next / Submit without typing. Empty a
 
 Optional toggle in the Daily Ritual tab. When on, the Alignment modal auto-opens once per day shortly after Obsidian load. Dismissing without submitting still counts as "ran today" — won't re-pester on next reload. The manual **Daily Align** command always opens it, regardless of the gate.
 
+### Auto-generate today's daily note at midnight
+
+Optional toggle near the bottom of the Daily Ritual tab. When on, the plugin checks every 10 minutes whether today's daily note exists and, if not, creates it in the background using your Daily Notes core plugin's configured folder, date format, and template. Your current focus is never disturbed — the note is written via `vault.create` rather than opening the file.
+
+- **Core template tokens are resolved** before write: `{{title}}`, `{{date[:FORMAT]}}`, `{{time[:FORMAT]}}`, `{{yesterday[:FORMAT]}}`, `{{tomorrow[:FORMAT]}}`. So if your template has `# {{title}}` or `[[{{yesterday:YYYY-MM-DD}}]]`, those land already expanded.
+- **Templater runs too**, via its "Trigger Templater on new file creation" option (Templater's settings). Templater's `<% %>` tags expand after the file is written. If you don't see Templater output, that toggle is the first thing to check.
+- **Idempotent** — if the file already exists, the function does nothing. So the 10-minute polling is safe.
+- **Requires the Daily Notes core plugin to be enabled.** It only reads the configured folder / format / template from it; the file is created directly. Toggling this setting on/off takes effect after reloading the plugin.
+
+### Image attachments on questions
+
+Both Alignment and Reflection questions can carry an image. In each question row, the new image-icon button expands a panel where you pick an image mode:
+
+| Mode | What it shows in the modal |
+|---|---|
+| **Static image file** | The exact image you picked. |
+| **From note** | The first embedded image (`![[file.png]]` or `![](path)`) in the chosen `.md` note. |
+| **From folder** | The most recently modified image in the chosen folder. Drop a new image into the folder and the question shows it next time the modal opens. |
+
+You can leave the question's text empty — the modal step then shows just the image and a Next button. Otherwise the image renders between the injected variable (if any) and the question text. The modal card widens up to ~720px to fit the image; the image itself is capped at 620px wide / 60vh tall.
+
+For the picker, configure the **Image gallery folder** in the new "Images" section of the Daily Ritual tab. The gallery picker recursively browses that folder (or the whole vault if blank). The **Upload** button on each question opens an OS file dialog and copies the chosen file into the gallery folder, with automatic `-1`, `-2` collision suffixes.
+
 ### Settings storage
 
 Everything lives at `data.json` under `dailyRitual: { ... }`. Including the LLM provider config for the Reflection summary (each provider's API key is cached separately, so you can swap providers without re-typing keys).

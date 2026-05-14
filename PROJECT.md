@@ -36,7 +36,7 @@ Templater scripts in the user's vault render note bodies via Dataview. The plugi
 - GitHub: `poweredbypugs/periodic-ritual`
 - Plugin id: `periodic-ritual`
 - User-facing name: **Periodic Ritual** (in `manifest.json`)
-- Version: 1.2.0
+- Version: 1.3.0
 - Plugin install path: `KAI/.obsidian/plugins/periodic-ritual/`
 - Working clone: `~/Documents/Plugin Project/periodic-ritual/`
 - **Plain JS, no build step, no TypeScript.** `main.js` is the source of truth — same convention as Daily Ritual. Edit, reload, done.
@@ -347,6 +347,7 @@ Six outer tabs, General first:
 | 9 | README + starter prompts rewrite |
 | 10 | Graph view: custom node editor with pan/zoom, wire drag, snap, multi-select, marquee, filter, inspect, copy/paste, inline editors |
 | 11 | Show Output nodes (dry-run probes with live LLM calls), Data Sources (static/dynamic note/folder references), Alignment Groups (auto-discovered gap analysis with prepend/rewrite/separate/combined modes, per-alignment config, one LLM call per group, framework reinforcement), Framework feature (file-based injection at highest-attention slot), global system-prompt/framework masters, node resize with per-state sizing, YAML safety (sanitizer + LLM instructions), inline field regex fix (cross-line bleed), colored kind pipes in menus, write-back lifecycle (two-pass generation with phase filtering), phase-aware runAt/runLLMAt controls, writeTo (frontmatter/inline/body) output routing, propagatePRFrontmatterToBody sync, combined alignment mode |
+| 12 | Daily Ritual: midnight auto-create of today's daily note (`vault.create` with core template tokens resolved manually so the Daily Notes plugin's createDailyNote can be bypassed without focus stealing); image attachments on Alignment + Reflection questions (static / from-note / from-folder modes, gallery picker, upload-from-disk into a configured gallery folder, image-only modal steps when question text is empty). Zodiac Calendar self-rescheduling midnight refresh (one-shot timer re-armed each render, cleared in onClose). |
 
 ---
 
