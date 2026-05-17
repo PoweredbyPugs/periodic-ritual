@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, parseYaml, requestUrl, ToggleComponent } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, FuzzySuggestModal, TFile, TFolder, ItemView, MarkdownRenderer, parseYaml, requestUrl, ToggleComponent } = require("obsidian");
 
 // ═══════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -2299,6 +2299,12 @@ function dr_makeQuestion(text) {
         //   folder -> path to a folder; the most-recently-modified image is used
         imageMode: "",
         imagePath: "",
+        // Modal text rendering. q.text is rendered as markdown (so bold,
+        // italics, admonitions etc. all work); textSize picks the base
+        // size of that rendered block. "h5" matches the legacy <h5>
+        // appearance. Markdown headings inside q.text still get their
+        // own h1-h6 sizing on top.
+        textSize: "h5",
     };
 }
 
@@ -2559,9 +2565,12 @@ class DRReflectionModal extends Modal {
         const q = this.questions[qIdx];
         const injected = (this.injectedResolved[qIdx] || {}).value || "";
         if (injected) {
-            const varEl = contentEl.createEl("p");
-            varEl.createEl("strong", { text: injected });
-            varEl.style.cssText = "margin-bottom:8px;font-size:1.1em;";
+            // Render the injected value as markdown so admonitions / bold /
+            // links etc. carry through from the source field. The bold +
+            // 1.1em treatment that used to come from <strong> now lives on
+            // the .pr-dr-injected wrapper class.
+            const varEl = contentEl.createDiv({ cls: "pr-dr-injected" });
+            MarkdownRenderer.renderMarkdown(injected, varEl, "", this);
         }
         const imageSrc = this.imagePaths[qIdx] || "";
         if (imageSrc) {
@@ -2571,7 +2580,15 @@ class DRReflectionModal extends Modal {
             img.addEventListener("error", () => { img.remove(); });
         }
         if (q.text) {
-            contentEl.createEl("h5", { text: q.text }).style.cssText = "margin-bottom:12px;";
+            // Markdown rendering so bold/italic/headers/admonitions all work.
+            // The wrapper class scales the base text size to match a chosen
+            // heading level (default h5 — same visual weight as the prior
+            // <h5> render). Modal extends Component, so passing `this`
+            // hands lifecycle for any embeds to the modal.
+            const size = q.textSize || "h5";
+            const qEl = contentEl.createDiv({ cls: `pr-dr-question pr-dr-question-${size}` });
+            qEl.style.marginBottom = "12px";
+            MarkdownRenderer.renderMarkdown(q.text, qEl, "", this);
         }
         const isPrompt = (q.responseMode || "input") === "prompt";
         const isLast = this.cursor === this.visibleSteps.length - 1;
@@ -3754,10 +3771,17 @@ class DailyRitualModule {
                     rerender();
                 });
             });
-            setting.addText((text) => {
-                text.setPlaceholder("Enter a question...").setValue(q.text)
+            // Multi-line textarea so users can enter markdown that needs
+            // line breaks — code-fence admonitions (```ad-note\n...\n```),
+            // native callouts (> [!note] ...), lists, etc. Rendered as
+            // markdown in the modal via MarkdownRenderer.
+            setting.addTextArea((text) => {
+                text.setPlaceholder("Enter a question... (markdown supported — admonitions, callouts, **bold**, lists)").setValue(q.text)
                     .onChange(async (v) => { q.text = v; await this.saveSettings(); });
                 text.inputEl.style.width = "100%";
+                text.inputEl.style.minHeight = "3.5em";
+                text.inputEl.style.fontFamily = "var(--font-monospace)";
+                text.inputEl.rows = 3;
             });
             setting.addExtraButton((btn) => {
                 btn.setIcon("arrow-right").setTooltip("Output this answer to its own field").onClick(() => {
@@ -3807,6 +3831,20 @@ class DailyRitualModule {
                         dd.addOption("prompt", "Prompt only (no input)");
                         dd.setValue(q.responseMode || "input").onChange(async (v) => {
                             q.responseMode = v; await this.saveSettings(); rerender();
+                        });
+                    });
+                new Setting(inputGroup)
+                    .setName("Text size")
+                    .setDesc("Base size of the rendered question (markdown is parsed either way — bold, headings, admonitions all work).")
+                    .addDropdown((dd) => {
+                        dd.addOption("h1", "H1 (largest)");
+                        dd.addOption("h2", "H2");
+                        dd.addOption("h3", "H3");
+                        dd.addOption("h4", "H4");
+                        dd.addOption("h5", "H5 (default)");
+                        dd.addOption("h6", "H6 (smallest)");
+                        dd.setValue(q.textSize || "h5").onChange(async (v) => {
+                            q.textSize = v; await this.saveSettings();
                         });
                     });
                 new Setting(inputGroup)
@@ -4284,6 +4322,7 @@ class MonthlyRitualPlugin extends Plugin {
             if (q.varAlignmentOutputKey === undefined) q.varAlignmentOutputKey = "";
             if (q.skipIfNoInjectValue === undefined) q.skipIfNoInjectValue = false;
             if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
+            if (q.textSize === undefined) q.textSize = "h5";
         };
         for (const q of (dr.questions || [])) dr_migrateQuestion(q);
         for (const q of (dr.alignmentQuestions || [])) dr_migrateQuestion(q);

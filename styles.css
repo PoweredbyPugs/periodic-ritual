@@ -1244,3 +1244,62 @@
 .mr-cal-minor-term {
     color: #66ab9e;
 }
+
+/* ──────────────────────────────────────────────────────────────
+   Daily Ritual question modal — markdown-rendered question text.
+   The wrapper scales the base font-size/weight/color of the
+   rendered content to match a chosen heading level. Markdown
+   headings inside the question still use their native sizes
+   (relative to this base, since CSS variables are em-based).
+   ────────────────────────────────────────────────────────────── */
+.pr-dr-question > :first-child { margin-top: 0; }
+.pr-dr-question > :last-child { margin-bottom: 0; }
+.pr-dr-question > p { margin: 0 0 4px; }
+
+/* Injected-variable header — markdown-rendered. No auto-bold so the
+   user's own markdown (or its absence) drives the weight. Slightly
+   larger than body text for visual hierarchy above the question. */
+.pr-dr-injected {
+    font-size: 1.1em;
+    margin-bottom: 8px;
+}
+.pr-dr-injected > :first-child { margin-top: 0; }
+.pr-dr-injected > :last-child { margin-bottom: 0; }
+.pr-dr-injected > p { margin: 0 0 4px; }
+
+.pr-dr-question-h1 {
+    font-size: var(--h1-size);
+    font-weight: var(--h1-weight);
+    color: var(--h1-color);
+    line-height: var(--h1-line-height, 1.2);
+}
+.pr-dr-question-h2 {
+    font-size: var(--h2-size);
+    font-weight: var(--h2-weight);
+    color: var(--h2-color);
+    line-height: var(--h2-line-height, 1.2);
+}
+.pr-dr-question-h3 {
+    font-size: var(--h3-size);
+    font-weight: var(--h3-weight);
+    color: var(--h3-color);
+    line-height: var(--h3-line-height, 1.3);
+}
+.pr-dr-question-h4 {
+    font-size: var(--h4-size);
+    font-weight: var(--h4-weight);
+    color: var(--h4-color);
+    line-height: var(--h4-line-height, 1.3);
+}
+.pr-dr-question-h5 {
+    font-size: var(--h5-size);
+    font-weight: var(--h5-weight);
+    color: var(--h5-color);
+    line-height: var(--h5-line-height, 1.4);
+}
+.pr-dr-question-h6 {
+    font-size: var(--h6-size);
+    font-weight: var(--h6-weight);
+    color: var(--h6-color);
+    line-height: var(--h6-line-height, 1.4);
+}
