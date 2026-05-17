@@ -3539,10 +3539,26 @@ class DailyRitualModule {
         new Setting(containerEl)
             .setName("Add alignment question")
             .addButton((btn) => {
-                btn.setButtonText("+ Add Question").setCta().onClick(async () => {
-                    this.settings.alignmentQuestions.push(dr_makeQuestion(""));
-                    await this.saveSettings();
-                    this.renderQuestions(alignQList, this.settings.alignmentQuestions, "alignmentQuestions", "alignment");
+                btn.setButtonText("+ Add Question").setCta();
+                // Guard against keyboard auto-repeat (Enter held while the
+                // button has focus would otherwise push a new question on
+                // every repeat — bug observed 2026-05-16, 114 empties added
+                // in one burst). The handler disables + blurs the button
+                // for the duration of save+rerender so queued events drop.
+                this._addAlignmentInFlight = false;
+                btn.onClick(async () => {
+                    if (this._addAlignmentInFlight) return;
+                    this._addAlignmentInFlight = true;
+                    btn.setDisabled(true);
+                    try { btn.buttonEl.blur(); } catch (_) {}
+                    try {
+                        this.settings.alignmentQuestions.push(dr_makeQuestion(""));
+                        await this.saveSettings();
+                        this.renderQuestions(alignQList, this.settings.alignmentQuestions, "alignmentQuestions", "alignment");
+                    } finally {
+                        this._addAlignmentInFlight = false;
+                        btn.setDisabled(false);
+                    }
                 });
             });
         new Setting(containerEl)
@@ -3560,10 +3576,21 @@ class DailyRitualModule {
         new Setting(containerEl)
             .setName("Add question")
             .addButton((btn) => {
-                btn.setButtonText("+ Add Question").setCta().onClick(async () => {
-                    this.settings.questions.push(dr_makeQuestion(""));
-                    await this.saveSettings();
-                    this.renderQuestions(questionsContainer, this.settings.questions, "questions", "reflection");
+                btn.setButtonText("+ Add Question").setCta();
+                this._addReflectionInFlight = false;
+                btn.onClick(async () => {
+                    if (this._addReflectionInFlight) return;
+                    this._addReflectionInFlight = true;
+                    btn.setDisabled(true);
+                    try { btn.buttonEl.blur(); } catch (_) {}
+                    try {
+                        this.settings.questions.push(dr_makeQuestion(""));
+                        await this.saveSettings();
+                        this.renderQuestions(questionsContainer, this.settings.questions, "questions", "reflection");
+                    } finally {
+                        this._addReflectionInFlight = false;
+                        btn.setDisabled(false);
+                    }
                 });
             });
 
@@ -4326,6 +4353,34 @@ class MonthlyRitualPlugin extends Plugin {
         };
         for (const q of (dr.questions || [])) dr_migrateQuestion(q);
         for (const q of (dr.alignmentQuestions || [])) dr_migrateQuestion(q);
+        // Trim trailing empty default-shape alignment questions. Defensive
+        // cleanup for the 2026-05-16 keyboard-auto-repeat bug that piled up
+        // 114 empties via the "+ Add Question" button. Only trims at the
+        // tail and only entries that match dr_makeQuestion("") exactly, so
+        // we never touch a question the user actually configured.
+        const dr_isEmptyDefaultQuestion = (q) => (
+            (q.text || "") === ""
+            && (q.responseMode || "input") === "input"
+            && q.injectVar === false
+            && !q.varField
+            && (q.varSource || "previous-daily") === "previous-daily"
+            && !q.varNotePath && !q.varPRContainerId && !q.varDataSourceId
+            && !q.varBoundaryDetector && !q.varBoundaryToken
+            && !q.varAlignmentGroupId && !q.varAlignmentOutputKey
+            && q.skipIfNoInjectValue === false
+            && q.skipUnlessBoundaryFreshToday === false
+            && q.outputToField === false
+            && !q.outputFieldName
+            && (q.outputFieldType || "inline") === "inline"
+            && !q.omitFromLLM && !q.omitFromCollected
+            && !q.imageMode && !q.imagePath
+        );
+        if (Array.isArray(dr.alignmentQuestions)) {
+            while (dr.alignmentQuestions.length > 0 &&
+                dr_isEmptyDefaultQuestion(dr.alignmentQuestions[dr.alignmentQuestions.length - 1])) {
+                dr.alignmentQuestions.pop();
+            }
+        }
         // One-time migration: old reflection questions used a single
         // `outputTargetContainer` dropdown that mixed ""/"daily-today"/<id>.
         // New shape mirrors the inject source options via `outputTarget`
