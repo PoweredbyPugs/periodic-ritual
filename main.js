@@ -2574,9 +2574,14 @@ class DRReflectionModal extends Modal {
         }
         const imageSrc = this.imagePaths[qIdx] || "";
         if (imageSrc) {
+            // Bound the image by the modal's own content width (max-width:100%)
+            // instead of viewport units — vw caps don't account for the modal's
+            // padding, so wider images were spilling and pushing the contentEl
+            // into horizontal-scroll. width:auto + object-fit:contain keeps the
+            // aspect ratio while letting tall images cap at 60vh.
             const img = contentEl.createEl("img");
             img.src = imageSrc;
-            img.style.cssText = "max-width:min(620px,88vw);max-height:60vh;height:auto;display:block;margin:8px auto 12px;border-radius:4px;";
+            img.style.cssText = "max-width:100%;max-height:60vh;width:auto;height:auto;object-fit:contain;display:block;margin:8px auto 12px;border-radius:4px;";
             img.addEventListener("error", () => { img.remove(); });
         }
         if (q.text) {
