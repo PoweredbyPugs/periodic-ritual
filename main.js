@@ -295,6 +295,14 @@ function makeReflectionConfig() {
 
 // ─── Periodic Ritual: Starter system prompts (Phase 2 polish) ───
 // Embedded copies of prompts/*.md from the source repo. Shipped with main.js
+// Multi-device sync lock: when a write-back run starts, the note's
+// `writebackStartedAt` field is stamped with the start time. Other devices
+// that see this timestamp within the lock window will skip their own
+// write-back so they don't overwrite the in-flight result. Orphaned starts
+// older than the window (crashes, network drops) are ignored — the next
+// device takes over. 10 minutes is generous for a slow LLM aggregation.
+const PR_WRITEBACK_LOCK_MS = 10 * 60 * 1000;
+
 // so users can drop a starter prompt into their vault with one click without
 // needing to download anything separately. Edit the source files in
 // prompts/ when these need updating, and re-paste here.
@@ -4223,6 +4231,12 @@ class MonthlyRitualPlugin extends Plugin {
     // ─── Lifecycle ───
 
     async onload() {
+        // Per-load random id used to detect when settings on disk were
+        // written by a different device/session (Obsidian Sync race).
+        // See saveSettings for the conflict-detection logic.
+        this._settingsSession = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        this._lastBackupAt = 0;
+
         await this.loadSettings();
         // Daily Ritual module: folded-in former plugin. Owns its own
         // settings slice (settings.dailyRitual), commands, and tab content.
@@ -4410,7 +4424,68 @@ class MonthlyRitualPlugin extends Plugin {
         }
     }
 
-    async saveSettings() { await this.saveData(this.settings); }
+    /**
+     * Save settings to disk with multi-device sync protection.
+     *
+     * Two safeguards:
+     *
+     * 1. Stale-write detection. Every save stamps `_settingsSavedAt` (ms)
+     *    and `_settingsSession` (this load's random id) into data.json.
+     *    Before writing, we re-read disk; if the disk version is newer
+     *    AND from a different session, that means Obsidian Sync wrote a
+     *    newer copy from another device while we held stale state. We
+     *    refuse to overwrite, re-load from disk, and notify the user.
+     *    They lose the in-flight edit but keep the synced settings.
+     *
+     * 2. Rolling backup. We write a `data.json.bak-prev` snapshot on
+     *    save (throttled to once per 10s) so manual recovery is always
+     *    possible if sync still manages to corrupt something.
+     */
+    async saveSettings() {
+        try {
+            const onDisk = await this.loadData();
+            const diskAt = Number(onDisk?._settingsSavedAt ?? 0);
+            const memAt = Number(this.settings?._settingsSavedAt ?? 0);
+            const diskSession = String(onDisk?._settingsSession ?? "");
+            if (diskAt > memAt && diskSession && diskSession !== this._settingsSession) {
+                new Notice(
+                    `Periodic Ritual: settings on disk are newer than your edits ` +
+                    `(probably synced in from another device). Refreshing — retry your change.`,
+                    8000,
+                );
+                await this.loadSettings();
+                return;
+            }
+        } catch (e) {
+            // If we can't read disk for any reason, fall through and try to save.
+            console.warn("Periodic Ritual: stale-write check failed, saving anyway", e);
+        }
+
+        this.settings._settingsSavedAt = Date.now();
+        this.settings._settingsSession = this._settingsSession;
+
+        try {
+            await this._rollSettingsBackup();
+        } catch (e) {
+            console.warn("Periodic Ritual: rolling settings backup failed", e);
+        }
+
+        await this.saveData(this.settings);
+    }
+
+    /** Write data.json.bak-prev once per 10s (avoids slider-spam churn). */
+    async _rollSettingsBackup() {
+        const now = Date.now();
+        if (now - (this._lastBackupAt || 0) < 10_000) return;
+        const adapter = this.app.vault.adapter;
+        const pluginPath = `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+        const dataPath = `${pluginPath}/data.json`;
+        const exists = await adapter.exists(dataPath);
+        if (!exists) return;
+        const current = await adapter.read(dataPath);
+        await adapter.write(`${pluginPath}/data.json.bak-prev`, current);
+        this._lastBackupAt = now;
+    }
 
     // ─── Mode helpers ───
 
@@ -5318,6 +5393,19 @@ class MonthlyRitualPlugin extends Plugin {
     //   - Body markers (`{{pr:key}}`) → replaced with the value
     async writeBackToPRContainerNote(container, file, data, opts = {}) {
         if (!opts.silent) new Notice(`${container.name}: writing back to ${file.path}…`);
+
+        // Stamp the start time on the note immediately so concurrent devices
+        // see the in-flight signal before any LLM call runs. This is the
+        // multi-device race fix: without it, two devices could both pass the
+        // "note marker says not done" check, both run LLM aggregation, and
+        // the later-finishing device would overwrite the earlier's result.
+        try {
+            await this.updatePRMetadataOnFile(file, container, {
+                writebackStartedAt: new Date().toISOString(),
+            });
+        } catch (e) {
+            console.error(`Periodic Ritual: failed to stamp writebackStartedAt on ${file.path}`, e);
+        }
 
         const reflection = this.getPRReflectionForContainer(container);
         const skipAutoLLM = !!(reflection && reflection.replaceAutoLLM);
@@ -7419,16 +7507,30 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                     const prevFile = this.app.vault.getAbstractFileByPath(prevPath);
 
                     if (prevFile && prevFile instanceof TFile) {
-                        // Two-source guard: local lastWriteBackEnd (in data.json)
-                        // AND the note's own writeback=true marker (in the vault).
-                        // Either is sufficient to treat the period as done. This
-                        // matters on multi-device setups — data.json doesn't
-                        // sync across devices reliably, so without the note-side
-                        // marker a second device would re-fire write-back and
-                        // overwrite whatever the first device produced.
+                        // Three-source guard: local lastWriteBackEnd (in data.json),
+                        // the note's writeback="true" marker (set at the end of
+                        // a successful run), AND the note's writebackStartedAt
+                        // timestamp (set at the start of any run). The last one
+                        // is what handles the multi-device race: if device A is
+                        // mid-run, device B sees the started-at timestamp and
+                        // bails so it doesn't fire its own concurrent write-back
+                        // that would overwrite A's result on completion.
                         const noteMeta = await this.readPRMetadataFromFile(prevFile, container);
                         const noteSaysDone = noteMeta?.writeback === "true";
                         const localSaysDone = container.lastWriteBackEnd === prevEndStr;
+
+                        // Skip if another device started write-back recently
+                        // (within PR_WRITEBACK_LOCK_MS). Orphaned starts older
+                        // than the lock window are ignored so the next device
+                        // can take over after a crash / disconnect.
+                        const startedAtStr = noteMeta?.writebackStartedAt;
+                        let anotherDeviceInProgress = false;
+                        if (startedAtStr) {
+                            const startedAtMs = Date.parse(startedAtStr);
+                            if (Number.isFinite(startedAtMs) && (Date.now() - startedAtMs) < PR_WRITEBACK_LOCK_MS) {
+                                anotherDeviceInProgress = true;
+                            }
+                        }
 
                         if (localSaysDone || noteSaysDone) {
                             // If the note says done but our local state is
@@ -7438,6 +7540,8 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                                 container.lastWriteBackEnd = prevEndStr;
                                 await this.saveSettings();
                             }
+                        } else if (anotherDeviceInProgress) {
+                            console.log(`Periodic Ritual: skipping write-back for ${prevFile.path} — another device started at ${startedAtStr}`);
                         } else {
                             const shouldWriteBack = (writeBackAt === "end" && prevRange.end < now)
                                 || (writeBackAt === "start" && prevRange.start <= now);
