@@ -59,7 +59,7 @@ This creates a working weekly container with LLM summarization but no alignments
 
 1. **Add an LLM service.**
    - Settings → LLM → **+ Add LLM service**
-   - Name it (e.g. "Claude"), pick a provider (OpenAI / Anthropic / Gemini / OpenRouter / LM Studio / OpenClaw), paste your API key, click the refresh icon next to Model to fetch available models, pick one.
+   - Name it (e.g. "Claude"), pick a provider (OpenAI / Anthropic / Gemini / OpenRouter / LM Studio / Custom Harness), paste your API key, click the refresh icon next to Model to fetch available models, pick one.
 
 2. **Prepare two markdown files in your vault:**
    - A **template** for the weekly note — anything you want. Example:
@@ -494,7 +494,9 @@ Primary section: **Alignment Groups** — cards for each group with prefix, targ
 Legacy section: old per-container single alignments (only shown if any exist).
 
 ### LLM
-Provider configurations. One card per service: name, provider dropdown, API key, base URL (for LM Studio / OpenClaw / OpenRouter custom endpoints), model picker (with a refresh button that fetches the provider's model list dynamically).
+Provider configurations. One card per service: name, provider dropdown, API key, base URL (for LM Studio / Custom Harness / OpenRouter custom endpoints), model picker (with a refresh button that fetches the provider's model list dynamically).
+
+**Custom Harness** is the catch-all for any **OpenAI-compatible** local agent gateway — anything that exposes `POST {base}/v1/chat/completions` (with `{model, messages[]}` and a `choices[0].message.content` response) and `GET {base}/v1/models`. OpenClaw, Hermes, and similar harnesses all use it. You don't make a separate provider per harness: pick **Custom Harness** once, then create one LLM service per agent, distinguishing them by **name + base URL + model** (and a Bearer token if the gateway requires one). Anything that doesn't speak the OpenAI chat-completions shape needs its own provider entry in code.
 
 ### Daily Ritual
 Folded-in former plugin. Two question banks (Alignment Questions and Reflection Questions) plus inline-field config, optional LLM summary for reflection, and an "Open Daily Alignment on Obsidian start" toggle. See the [Daily Ritual section](#daily-ritual-folded-in) above.
