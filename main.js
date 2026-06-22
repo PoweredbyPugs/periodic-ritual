@@ -864,8 +864,26 @@ function makePRDataSource(overrides = {}) {
         name: "New data source",
         mode: "static",        // "static" | "dynamic"
         notePath: "",          // used when mode === "static"
-        folderPath: "",        // used when mode === "dynamic"
+        dynamicKind: "folder", // when dynamic: "folder" | "container" | "daily"
+        folderPath: "",        // used when dynamicKind === "folder"
+        containerId: "",       // used when dynamicKind === "container"
+        fields: [],            // metadata-key whitelist; [] = pass every field through
     }, overrides);
+}
+
+// Effective dynamic target kind for a DataSource. Legacy dynamic sources
+// (saved before container/daily targets existed) carry only folderPath and
+// no dynamicKind — default them to "folder" so they keep resolving as before.
+function dataSourceDynamicKind(ds) {
+    if (ds && ds.dynamicKind) return ds.dynamicKind;
+    return "folder";
+}
+
+// The source's metadata whitelist as an array, or null when it reads every
+// field. Used by the container payload builder to isolate specific keys.
+function dataSourceFields(ds) {
+    const f = ds && ds.fields;
+    return Array.isArray(f) && f.length ? f.map(x => String(x).trim()).filter(Boolean) : null;
 }
 
 // Periodic Ritual: Show-output node.
@@ -1750,6 +1768,10 @@ class PRNodeInspectModal extends Modal {
                 const target = (this.plugin.settings.prContainers || []).find(x => x.id === src.containerId);
                 row.setText(`• ${target?.name || "(missing)"} (container)`);
             }
+            else if (src.type === "dataSource") {
+                const target = (this.plugin.settings.prDataSources || []).find(x => x.id === src.dataSourceId);
+                row.setText(`• ${target?.name || "(missing)"} (data source)`);
+            }
         }
 
         // Current period
@@ -2625,10 +2647,13 @@ class DRReflectionModal extends Modal {
         const injected = (this.injectedResolved[qIdx] || {}).value || "";
         if (injected) {
             // Render the injected value as markdown so admonitions / bold /
-            // links etc. carry through from the source field. The bold +
-            // 1.1em treatment that used to come from <strong> now lives on
-            // the .pr-dr-injected wrapper class.
-            const varEl = contentEl.createDiv({ cls: "pr-dr-injected" });
+            // links etc. carry through from the source field. The injected
+            // block shares the question's heading-level class (q.textSize) so
+            // the "Text size" setting governs the injected prompt too, not
+            // just the question text below it. .pr-dr-injected only adds the
+            // spacing that separates it from the question.
+            const size = q.textSize || "h5";
+            const varEl = contentEl.createDiv({ cls: `pr-dr-injected pr-dr-question-${size}` });
             MarkdownRenderer.renderMarkdown(injected, varEl, "", this);
         }
         const imageSrc = this.imagePaths[qIdx] || "";
@@ -3073,25 +3098,15 @@ class DailyRitualModule {
         return String(container.lastGeneratedEnd).slice(0, 10) === dr_todayDateString();
     }
 
-    // PR Data Source resolution. Static = the configured note. Dynamic =
-    // newest .md in the configured folder by mtime. Mirrors the consumer
-    // semantics PROJECT.md describes for the alignment-group consumer.
+    // PR Data Source resolution for a DR question's "data-source" inject.
+    // Delegates to the plugin's latest-note resolver so static, and all three
+    // dynamic kinds (daily / container / folder), behave exactly as they do
+    // for the alignment-group consumer PROJECT.md describes — instead of the
+    // old folder-only path that returned nothing for daily/container sources.
     async resolveDataSourceFile(dataSourceId) {
         const ds = (this.plugin.settings?.prDataSources || []).find(x => x.id === dataSourceId);
         if (!ds) return null;
-        if (ds.mode === "static" && ds.notePath) {
-            const f = this.app.vault.getAbstractFileByPath(ds.notePath);
-            return (f && f instanceof TFile) ? f : null;
-        }
-        if (ds.mode === "dynamic" && ds.folderPath) {
-            const folder = this.app.vault.getAbstractFileByPath(ds.folderPath);
-            if (!folder || !folder.children) return null;
-            const candidates = folder.children
-                .filter(c => c instanceof TFile && c.extension === "md")
-                .sort((a, b) => (b.stat?.mtime || 0) - (a.stat?.mtime || 0));
-            return candidates[0] || null;
-        }
-        return null;
+        return await this.plugin.resolveDataSourceLatest(ds);
     }
 
     // Internal: resolve a PR container's current note by id. Used to be a
@@ -4716,6 +4731,17 @@ class MonthlyRitualPlugin extends Plugin {
                 delete q.outputTargetContainer;
             }
         }
+        // Backfill DataSource fields added when dynamic sources gained
+        // daily/container targets and a metadata whitelist. Legacy sources
+        // carry only mode + notePath/folderPath; the dataSourceDynamicKind /
+        // dataSourceFields helpers already default missing keys at read time,
+        // but normalizing here keeps data.json self-describing and the
+        // settings UI in sync. Idempotent.
+        for (const ds of (this.settings.prDataSources || [])) {
+            if (ds.mode === "dynamic" && !ds.dynamicKind) ds.dynamicKind = "folder";
+            if (ds.containerId === undefined) ds.containerId = "";
+            if (!Array.isArray(ds.fields)) ds.fields = [];
+        }
     }
 
     /**
@@ -5116,13 +5142,14 @@ class MonthlyRitualPlugin extends Plugin {
     // the next Aries ingress.
     async getCurrentSolarCycleData(date) {
         const d = date || new Date();
+        const tz = this.settings.calendarTimezone || "America/New_York";
         const searchStart = addDays(d, -400);
         const searchEnd = addDays(d, 400);
         const raw = await this.fetchSunIngresses(searchStart, searchEnd);
 
         const ariesIngresses = (Array.isArray(raw) ? raw : raw.ingresses || [])
             .map(ing => Object.assign({}, ing, {
-                dateObj: new Date(ing.date || ing.exactDate || ing.timestamp),
+                dateObj: heliosInstantFromString(ing.date || ing.exactDate || ing.timestamp),
                 sign: ing.sign || ing.toSign || "",
             }))
             .filter(ing => ing.sign === "Aries")
@@ -5135,8 +5162,10 @@ class MonthlyRitualPlugin extends Plugin {
         }
         if (!prev) throw new Error("No prior Aries ingress found in 400-day window");
 
-        const start = startOfDay(prev.dateObj);
-        const end = next ? startOfDay(addDays(next.dateObj, -1)) : addDays(start, 364);
+        // Bucket the ingress instant to a day in the chosen calendar timezone,
+        // not the machine locale — see getPhasePeriodsFromHelios.
+        const start = calendarDayInTimeZone(prev.dateObj, tz);
+        const end = next ? addDays(calendarDayInTimeZone(next.dateObj, tz), -1) : addDays(start, 364);
         const year = start.getFullYear();
 
         return {
@@ -5156,6 +5185,7 @@ class MonthlyRitualPlugin extends Plugin {
 
     async getSolarContainerData(date) {
         const d = date || new Date();
+        const tz = this.settings.calendarTimezone || "America/New_York";
         // Fetch Sun ingresses for a wide window around today
         const searchStart = addDays(d, -45);
         const searchEnd = addDays(d, 45);
@@ -5163,7 +5193,7 @@ class MonthlyRitualPlugin extends Plugin {
 
         // Find the ingress before today and the one after
         const sorted = (Array.isArray(ingresses) ? ingresses : ingresses.ingresses || [])
-            .map(ing => ({ ...ing, dateObj: new Date(ing.date || ing.exactDate || ing.timestamp) }))
+            .map(ing => ({ ...ing, dateObj: heliosInstantFromString(ing.date || ing.exactDate || ing.timestamp) }))
             .sort((a, b) => a.dateObj - b.dateObj);
 
         let prevIng = null, nextIng = null;
@@ -5175,8 +5205,9 @@ class MonthlyRitualPlugin extends Plugin {
         if (!prevIng) throw new Error("Could not determine current solar term from Helios data");
         const sign = prevIng.sign || prevIng.toSign || "";
         const term = SOLAR_TERMS[sign];
-        const start = startOfDay(prevIng.dateObj);
-        const end = nextIng ? startOfDay(addDays(nextIng.dateObj, -1)) : addDays(start, 29);
+        // Bucket ingress instants to days in the chosen calendar timezone.
+        const start = calendarDayInTimeZone(prevIng.dateObj, tz);
+        const end = nextIng ? addDays(calendarDayInTimeZone(nextIng.dateObj, tz), -1) : addDays(start, 29);
 
         return {
             start, end, sign,
@@ -5556,7 +5587,17 @@ class MonthlyRitualPlugin extends Plugin {
             //     and write results to frontmatter, inline fields, and
             //     body markers.
             //   - Otherwise, treat it as already generated and skip.
-            const existing = this.app.vault.getAbstractFileByPath(filePath);
+            let existing = this.app.vault.getAbstractFileByPath(filePath);
+            // Idempotency guard. The exact filename can drift — an Obsidian
+            // Sync rename adding " 1", or naming tokens resolving differently
+            // on another device — and lastGeneratedEnd lives in the synced
+            // data.json, so a Sync revert can re-arm a boundary that was
+            // already generated. Before creating, scan saveDir for any note
+            // already stamped with this container id + period end.
+            if (!(existing instanceof TFile)) {
+                const already = await this.findPRContainerNoteForBoundaryEnd(container, formatDate(data.end));
+                if (already) existing = already;
+            }
             if (existing) {
                 if (opts.writeBack && existing instanceof TFile) {
                     return await this.writeBackToPRContainerNote(container, existing, data, opts);
@@ -5908,11 +5949,12 @@ class MonthlyRitualPlugin extends Plugin {
 
         // Walk every configured source. Files are deduped by path so two
         // sources that happen to overlap don't duplicate sections.
-        const sourceFiles = [];
+        const sourceFiles = [];   // { file, fields } — fields is the whitelist or null
         const seenPaths = new Set();
         const labelParts = [];
         for (const source of sources) {
             let theseFiles = [];
+            let fields = null;   // per-source metadata whitelist (DataSource only)
             if (source.type === "container" && source.containerId) {
                 const sourceContainer = (this.settings.prContainers || []).find(c => c.id === source.containerId);
                 if (sourceContainer) {
@@ -5922,10 +5964,12 @@ class MonthlyRitualPlugin extends Plugin {
             } else if (source.type === "dataSource" && source.dataSourceId) {
                 // DataSource primitive — resolve by id, then delegate to the
                 // shared resolver which applies period filtering for dynamic
-                // folder sources and reads the single file for static ones.
+                // sources and reads the single file for static ones. A custom
+                // DataSource may also carry a metadata whitelist (fields).
                 const ds = (this.settings.prDataSources || []).find(x => x.id === source.dataSourceId);
                 if (ds) {
                     theseFiles = await this.resolveDataSourceForContainer(ds, start, end);
+                    fields = dataSourceFields(ds);
                     labelParts.push(ds.name || "data source");
                 }
             } else {
@@ -5937,7 +5981,7 @@ class MonthlyRitualPlugin extends Plugin {
             for (const f of theseFiles) {
                 if (seenPaths.has(f.path)) continue;
                 seenPaths.add(f.path);
-                sourceFiles.push(f);
+                sourceFiles.push({ file: f, fields });
             }
         }
         const sourceLabel = labelParts.length > 0 ? labelParts.join(" + ") : "daily notes";
@@ -5947,7 +5991,11 @@ class MonthlyRitualPlugin extends Plugin {
         }
 
         const sections = [];
-        for (const file of sourceFiles) {
+        for (const entry of sourceFiles) {
+            const file = entry.file;
+            // When the source carries a whitelist, only these metadata keys
+            // reach the LLM; null means pass everything through (default).
+            const allow = entry.fields;
             const cache = this.app.metadataCache.getFileCache(file);
             const fm = cache?.frontmatter || {};
             const content = await this.app.vault.read(file);
@@ -5972,11 +6020,13 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             for (const [k, v] of Object.entries(fm)) {
                 // Skip plugin-internal and Obsidian-internal frontmatter keys
                 if (k === "periodic-ritual" || k === "position") continue;
+                if (allow && !allow.includes(k)) continue;
                 if (v === null || v === undefined) continue;
                 if (typeof v === "object") continue;
                 lines.push(`${k}: ${v}`);
             }
             for (const [k, v] of Object.entries(inlineFields)) {
+                if (allow && !allow.includes(k)) continue;
                 lines.push(`${k}:: ${v}`);
             }
             sections.push(lines.join("\n"));
@@ -6047,6 +6097,21 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         }
 
         if (dataSource.mode === "dynamic") {
+            const kind = dataSourceDynamicKind(dataSource);
+            // Predefined "Daily notes" target — filter by real journal date
+            // (not mtime), the same correct logic the built-in daily source uses.
+            if (kind === "daily") {
+                const endInclusive = new Date(end);
+                endInclusive.setHours(23, 59, 59, 999);
+                return this.findDailyNotesInRange(start, endInclusive);
+            }
+            // Another container's notes whose pr-start falls in this period.
+            if (kind === "container") {
+                const c = (this.settings.prContainers || []).find(x => x.id === dataSource.containerId);
+                if (!c) return [];
+                return await this.findPRContainerNotesInRange(c, start, end);
+            }
+            // kind === "folder" (default / legacy) — folder scan, period-filtered.
             const folder = dataSource.folderPath || "";
             if (!folder) return [];
             const files = this.app.vault.getMarkdownFiles().filter(f =>
@@ -6083,7 +6148,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     // Alignment-group consumer: static → that one file; dynamic → single
     // latest note in the folder (by mtime). Period is irrelevant here —
     // alignments read the current milestone, whatever that is.
-    resolveDataSourceLatest(dataSource) {
+    async resolveDataSourceLatest(dataSource) {
         if (!dataSource) return null;
 
         if (dataSource.mode === "static") {
@@ -6092,6 +6157,17 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         }
 
         if (dataSource.mode === "dynamic") {
+            const kind = dataSourceDynamicKind(dataSource);
+            if (kind === "daily") {
+                const now = new Date();
+                const old = new Date(now.getTime() - 366 * 24 * 60 * 60 * 1000);
+                const dailies = this.findDailyNotesInRange(old, now);
+                return dailies.length ? dailies[dailies.length - 1] : null;
+            }
+            if (kind === "container") {
+                const c = (this.settings.prContainers || []).find(x => x.id === dataSource.containerId);
+                return c ? await this.findMostRecentPRContainerNote(c) : null;
+            }
             const folder = dataSource.folderPath || "";
             if (!folder) return null;
             const files = this.app.vault.getMarkdownFiles().filter(f =>
@@ -6127,6 +6203,24 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         }
         matches.sort((a, b) => a.sortKey - b.sortKey);
         return matches.map(m => m.file);
+    }
+
+    // Idempotency guard for generation. Returns the note already stamped for
+    // this container's period end in saveDir, regardless of filename drift,
+    // so a reverted lastGeneratedEnd (e.g. an Obsidian Sync round-trip)
+    // cannot create a duplicate " 1" note.
+    async findPRContainerNoteForBoundaryEnd(container, endStr) {
+        if (!container || !container.saveDir || !endStr) return null;
+        const dirPath = container.saveDir;
+        const files = this.app.vault.getMarkdownFiles().filter(f =>
+            f.path === dirPath || f.path.startsWith(dirPath + "/") || f.parent?.path === dirPath
+        );
+        for (const file of files) {
+            const meta = await this.readPRMetadataFromFile(file, container);
+            if (!meta || meta.id !== container.id) continue;
+            if (meta.end && String(meta.end) === String(endStr)) return file;
+        }
+        return null;
     }
 
     // Try to extract a YAML object from an LLM response. Strips fenced code
@@ -7076,7 +7170,7 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         if (group.sourceKind === "data-source" && group.sourceId) {
             const ds = (this.settings.prDataSources || []).find(x => x.id === group.sourceId);
             if (ds) {
-                sourceFile = this.resolveDataSourceLatest(ds);
+                sourceFile = await this.resolveDataSourceLatest(ds);
                 sourceLabel = ds.name || "data source";
             }
         } else if (group.sourceKind === "container" && group.sourceId) {
@@ -7674,11 +7768,22 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             }
             visiting.add(c.id);
             // Multi-source: walk every container source. Daily sources have
-            // no dependency to wait for.
+            // no dependency to wait for. A named DataSource of kind
+            // "container" is an *indirect* container→container dependency —
+            // resolve it so the producer still generates before this consumer.
             const sources = getContainerDataSources(c);
             for (const source of sources) {
+                let depId = null;
                 if (source.type === "container" && source.containerId) {
-                    const dep = byId.get(source.containerId);
+                    depId = source.containerId;
+                } else if (source.type === "dataSource" && source.dataSourceId) {
+                    const ds = (this.settings.prDataSources || []).find(x => x.id === source.dataSourceId);
+                    if (ds && ds.mode === "dynamic" && dataSourceDynamicKind(ds) === "container" && ds.containerId) {
+                        depId = ds.containerId;
+                    }
+                }
+                if (depId) {
+                    const dep = byId.get(depId);
                     if (dep) visit(dep);
                 }
             }
@@ -8584,6 +8689,54 @@ async function buildMoonSignLookup(plugin, rangeStart, rangeEnd) {
     }
 }
 
+// Parse a Helios timestamp string into a real instant. Helios reports
+// astronomical event times as UTC clock values but writes them WITHOUT a
+// zone marker (e.g. "2026-06-21" for phases, "2026-05-19 00:00" for
+// ingresses). Left to the JS engine these parse inconsistently — a bare
+// "YYYY-MM-DD" is read as UTC midnight while "YYYY-MM-DD HH:MM" is read as
+// machine-LOCAL time — so we parse the fields explicitly and force UTC.
+// Strings that already carry an explicit zone (Z or ±HH:MM) are trusted.
+function heliosInstantFromString(s) {
+    if (s == null) return new Date(NaN);
+    if (s instanceof Date) return s;
+    const str = String(s).trim();
+    if (/(?:[zZ]|[+\-]\d{2}:?\d{2})$/.test(str)) {
+        const d = new Date(str);
+        if (!isNaN(d.getTime())) return d;
+    }
+    const m = str.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+    if (m) {
+        return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)));
+    }
+    const fallback = new Date(str);
+    return fallback;
+}
+
+// /moon-phases splits the moment into a date-only field plus a separate UTC
+// clock time ("21:56"). Combine them, then parse as UTC via the shared helper.
+function heliosPhaseInstant(p) {
+    const m = typeof p.time === "string" && p.time.match(/^(\d{1,2}):(\d{2})/);
+    const stamp = m ? `${p.date} ${m[1]}:${m[2]}` : p.date;
+    return heliosInstantFromString(stamp);
+}
+
+// The calendar day (as a local-midnight Date, matching this file's day
+// convention) that a given instant falls on when viewed in `timeZone`.
+// This is the lever the Zodiac Calendar's timezone setting pulls: a phase
+// at 21:56 UTC is still the 21st in New York but the 22nd in Tokyo.
+function calendarDayInTimeZone(instant, timeZone) {
+    try {
+        const parts = new Intl.DateTimeFormat("en-CA", {
+            timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+        }).formatToParts(instant);
+        const get = t => parts.find(x => x.type === t).value;
+        return new Date(Number(get("year")), Number(get("month")) - 1, Number(get("day")));
+    } catch (_) {
+        // Invalid IANA zone — degrade to the machine's local day.
+        return startOfDay(instant);
+    }
+}
+
 // Get exact phase periods from Helios /moon-phases endpoint
 async function getPhasePeriodsFromHelios(plugin, rangeStart, rangeEnd) {
     const url = plugin.getHeliosUrl();
@@ -8592,6 +8745,13 @@ async function getPhasePeriodsFromHelios(plugin, rangeStart, rangeEnd) {
     // Extend range to catch phases that start before/after
     const start = formatDate(addDays(rangeStart, -10));
     const end = formatDate(addDays(rangeEnd, 10));
+
+    // The day a phase lands on is determined in the user's chosen calendar
+    // timezone, NOT the machine's locale. Without this, the old
+    // startOfDay(new Date(p.date)) parsed the date-only string as UTC
+    // midnight and then snapped it to the machine's local day, shoving every
+    // evening-UTC phase one day early for anyone west of UTC.
+    const tz = plugin.settings.calendarTimezone || "America/New_York";
 
     try {
         const data = await plugin.fetchJson(`${url}/moon-phases?start=${start}&end=${end}`);
@@ -8602,7 +8762,7 @@ async function getPhasePeriodsFromHelios(plugin, rangeStart, rangeEnd) {
         // Build phase starts with their sign data
         const starts = phaseList.map(p => ({
             phase: p.phase,
-            start: startOfDay(new Date(p.date)),
+            start: calendarDayInTimeZone(heliosPhaseInstant(p), tz),
             moonSign: p.moonSign,
         }));
         starts.sort((a, b) => a.start - b.start);
@@ -9744,6 +9904,9 @@ class PRGraphView extends ItemView {
                 if (other.id === c.id) continue;
                 sel.createEl("option", { value: `container:${other.id}`, text: other.name || "(unnamed)" });
             }
+            for (const ds of (s.prDataSources || [])) {
+                sel.createEl("option", { value: `dataSource:${ds.id}`, text: `${ds.name || "(unnamed)"} (data source)` });
+            }
             sel.value = dataSourceKey(source);
             sel.addEventListener("mousedown", (e) => e.stopPropagation());
             sel.addEventListener("change", async () => {
@@ -9751,6 +9914,7 @@ class PRGraphView extends ItemView {
                 const v = sel.value;
                 if (v === "daily") sources[i] = { type: "daily" };
                 else if (v.startsWith("container:")) sources[i] = { type: "container", containerId: v.slice("container:".length) };
+                else if (v.startsWith("dataSource:")) sources[i] = { type: "dataSource", dataSourceId: v.slice("dataSource:".length) };
                 c.dataSource = { sources };
                 await this.plugin.saveSettings();
                 this.render();
@@ -10358,7 +10522,7 @@ class PRGraphView extends ItemView {
             "Mode",
             [
                 { value: "static",  label: "Static (single note)" },
-                { value: "dynamic", label: "Dynamic (folder of notes)" },
+                { value: "dynamic", label: "Dynamic (daily / container / folder)" },
             ],
             () => ds.mode || "static",
             (v) => { ds.mode = v; }
@@ -10375,18 +10539,41 @@ class PRGraphView extends ItemView {
                 async () => { ds.notePath = ""; await this.plugin.saveSettings(); this.render(); }
             );
         } else {
-            h.addPicker("Folder", ds.folderPath, "(none)",
-                () => new FolderSuggestModal(this.app, async (folder) => {
-                    ds.folderPath = folder.path;
-                    if (!ds.name || ds.name === "New data source") ds.name = folder.name || folder.path;
-                    await this.plugin.saveSettings();
-                    this.render();
-                }).open(),
-                async () => { ds.folderPath = ""; await this.plugin.saveSettings(); this.render(); }
+            const kind = dataSourceDynamicKind(ds);
+            const targetOptions = [{ value: "daily", label: "Daily notes" }];
+            for (const c of (this.plugin.settings.prContainers || [])) {
+                targetOptions.push({ value: `container:${c.id}`, label: `${c.name || "(unnamed)"} (container)` });
+            }
+            targetOptions.push({ value: "folder", label: "Folder (path)" });
+            h.addLabeledDropdown(
+                "Source",
+                targetOptions,
+                () => kind === "container" ? `container:${ds.containerId || ""}` : kind,
+                (v) => {
+                    if (v === "daily") { ds.dynamicKind = "daily"; ds.containerId = ""; ds.folderPath = ""; }
+                    else if (v.startsWith("container:")) { ds.dynamicKind = "container"; ds.containerId = v.slice("container:".length); ds.folderPath = ""; }
+                    else { ds.dynamicKind = "folder"; ds.containerId = ""; }
+                }
             );
+            if (kind === "folder") {
+                h.addPicker("Folder", ds.folderPath, "(none)",
+                    () => new FolderSuggestModal(this.app, async (folder) => {
+                        ds.folderPath = folder.path;
+                        if (!ds.name || ds.name === "New data source") ds.name = folder.name || folder.path;
+                        await this.plugin.saveSettings();
+                        this.render();
+                    }).open(),
+                    async () => { ds.folderPath = ""; await this.plugin.saveSettings(); this.render(); }
+                );
+            }
             const hint = body.createEl("div", { cls: "pr-graph-form-preview" });
-            hint.setText("Container consumers filter this folder by their period (pr-start/end or mtime). Alignment groups read the single latest note.");
+            hint.setText("Daily / Container targets are filtered by the consuming container's period. Folder targets scan by pr-start/end or mtime. Alignment groups read the single latest note.");
         }
+
+        h.addLabeledText("Metadata fields", "training, visual, thoughts",
+            () => Array.isArray(ds.fields) ? ds.fields.join(", ") : "",
+            (v) => { ds.fields = String(v).split(",").map(x => x.trim()).filter(Boolean); }
+        );
     }
 
     // Show-output probe node — dry run panel.
@@ -10725,7 +10912,7 @@ class PRGraphView extends ItemView {
                 const ds = (s.prDataSources || []).find(x => x.id === g.sourceId);
                 if (ds) {
                     line(`${ds.name} (${ds.mode})`);
-                    sourceFile = plugin.resolveDataSourceLatest(ds);
+                    sourceFile = await plugin.resolveDataSourceLatest(ds);
                 } else line("(missing data source)", true);
             } else if (g.sourceKind === "container" && g.sourceId) {
                 const sc = (s.prContainers || []).find(x => x.id === g.sourceId);
@@ -12331,6 +12518,21 @@ class PRGraphView extends ItemView {
                     });
                 }
             }
+            // Named data sources (reusable; may carry a metadata whitelist)
+            const dataSources = (this.plugin.settings.prDataSources || []);
+            if (dataSources.length > 0) {
+                items.push("separator");
+                items.push({ label: "Data sources", onClick: null });
+                for (const ds of dataSources) {
+                    items.push({
+                        label: `${ds.name || "(unnamed)"} (${ds.mode || "static"})`,
+                        onClick: async () => {
+                            addSource({ type: "dataSource", dataSourceId: ds.id });
+                            await wireUp();
+                        },
+                    });
+                }
+            }
         } else if (toSocketId === "in-boundary") {
             for (const det of this.plugin.getPRAvailableBoundaryDetectors()) {
                 items.push({
@@ -13169,7 +13371,10 @@ class RitualCalendarView extends ItemView {
             return;
         }
 
-        const today = new Date();
+        // "Today" is the current day in the chosen calendar timezone, so the
+        // highlight matches the timezone-bucketed phase days above.
+        const calTz = this.plugin.settings.calendarTimezone || "America/New_York";
+        const today = calendarDayInTimeZone(new Date(), calTz);
 
         // ─── Zodiac sign as container ───
         const signPeriod = getZodiacSignPeriod(this.displayDate);
@@ -13605,12 +13810,16 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 if (other.id === container.id) continue;
                 sel.createEl("option", { value: `container:${other.id}`, text: other.name || "(unnamed)" });
             }
+            for (const ds of (s.prDataSources || [])) {
+                sel.createEl("option", { value: `dataSource:${ds.id}`, text: `${ds.name || "(unnamed)"} (data source)` });
+            }
             sel.value = dataSourceKey(source);
             sel.addEventListener("change", async () => {
                 const sources = getContainerDataSources(container);
                 const v = sel.value;
                 if (v === "daily") sources[i] = { type: "daily" };
                 else if (v.startsWith("container:")) sources[i] = { type: "container", containerId: v.slice("container:".length) };
+                else if (v.startsWith("dataSource:")) sources[i] = { type: "dataSource", dataSourceId: v.slice("dataSource:".length) };
                 container.dataSource = { sources };
                 await this.plugin.saveSettings();
                 this.display();
@@ -15333,10 +15542,10 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         new Setting(body)
             .setName("Mode")
-            .setDesc("Static references one specific note. Dynamic scans a folder — container consumers filter by period, alignment groups read the latest note.")
+            .setDesc("Static references one specific note. Dynamic pulls from Daily notes, another container, or a folder — container consumers filter by period, alignment groups read the latest note.")
             .addDropdown(d => d
                 .addOption("static", "Static (single note)")
-                .addOption("dynamic", "Dynamic (folder)")
+                .addOption("dynamic", "Dynamic (daily / container / folder)")
                 .setValue(ds.mode || "static")
                 .onChange(async v => {
                     ds.mode = v;
@@ -15366,27 +15575,63 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                     });
                 });
         } else {
+            // Dynamic target: a predefined producer ("Daily notes"), another
+            // container, or a raw folder. Stored as dynamicKind + containerId.
+            const kind = dataSourceDynamicKind(ds);
             new Setting(body)
-                .setName("Folder")
-                .setDesc(ds.folderPath || "None selected")
-                .addButton(btn => {
-                    btn.setButtonText(ds.folderPath ? "Change" : "Choose").onClick(() => {
-                        new FolderSuggestModal(this.app, async (folder) => {
-                            ds.folderPath = folder.path;
-                            if (!ds.name || ds.name === "New data source") ds.name = folder.name || folder.path;
-                            await this.plugin.saveSettings();
-                            this.display();
-                        }).open();
-                    });
-                })
-                .addExtraButton(btn => {
-                    btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
-                        ds.folderPath = "";
+                .setName("Source")
+                .setDesc("Where this dynamic source pulls notes from. Container and Daily targets are filtered by the consuming container's period.")
+                .addDropdown(d => {
+                    d.addOption("daily", "Daily notes");
+                    for (const c of (s.prContainers || [])) {
+                        d.addOption(`container:${c.id}`, `${c.name || "(unnamed)"} (container)`);
+                    }
+                    d.addOption("folder", "Folder (path)");
+                    d.setValue(kind === "container" ? `container:${ds.containerId || ""}` : kind);
+                    d.onChange(async v => {
+                        if (v === "daily") { ds.dynamicKind = "daily"; ds.containerId = ""; ds.folderPath = ""; }
+                        else if (v.startsWith("container:")) { ds.dynamicKind = "container"; ds.containerId = v.slice("container:".length); ds.folderPath = ""; }
+                        else { ds.dynamicKind = "folder"; ds.containerId = ""; }
                         await this.plugin.saveSettings();
                         this.display();
                     });
                 });
+
+            if (kind === "folder") {
+                new Setting(body)
+                    .setName("Folder")
+                    .setDesc(ds.folderPath || "None selected")
+                    .addButton(btn => {
+                        btn.setButtonText(ds.folderPath ? "Change" : "Choose").onClick(() => {
+                            new FolderSuggestModal(this.app, async (folder) => {
+                                ds.folderPath = folder.path;
+                                if (!ds.name || ds.name === "New data source") ds.name = folder.name || folder.path;
+                                await this.plugin.saveSettings();
+                                this.display();
+                            }).open();
+                        });
+                    })
+                    .addExtraButton(btn => {
+                        btn.setIcon("cross").setTooltip("Clear").onClick(async () => {
+                            ds.folderPath = "";
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                    });
+            }
         }
+
+        // Metadata whitelist — which keys this source exposes to the LLM.
+        new Setting(body)
+            .setName("Metadata fields")
+            .setDesc("Comma-separated frontmatter/inline keys to read from this source. Leave blank to pass every field through.")
+            .addText(t => t
+                .setPlaceholder("training, visual, thoughts")
+                .setValue(Array.isArray(ds.fields) ? ds.fields.join(", ") : "")
+                .onChange(async v => {
+                    ds.fields = v.split(",").map(x => x.trim()).filter(Boolean);
+                    await this.plugin.saveSettings();
+                }));
     }
 
     displayGeneral(containerEl) {

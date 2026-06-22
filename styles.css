@@ -1256,11 +1256,11 @@
 .pr-dr-question > :last-child { margin-bottom: 0; }
 .pr-dr-question > p { margin: 0 0 4px; }
 
-/* Injected-variable header — markdown-rendered. No auto-bold so the
-   user's own markdown (or its absence) drives the weight. Slightly
-   larger than body text for visual hierarchy above the question. */
+/* Injected-variable header — markdown-rendered. Size/weight/color come
+   from the shared .pr-dr-question-h* class (driven by the question's
+   "Text size" setting); this rule only owns the spacing that separates
+   the injected block from the question below it. */
 .pr-dr-injected {
-    font-size: 1.1em;
     margin-bottom: 8px;
 }
 .pr-dr-injected > :first-child { margin-top: 0; }

@@ -132,9 +132,16 @@ Six providers. All HTTP uses `requestUrl` to bypass CORS.
 
 Named, reusable reference to a note or folder. Two modes:
 - **static** — one specific note, always read that file
-- **dynamic** — a folder of notes; consumer determines the query:
-  - Container consumer -> period-filtered (by `pr-start/end` frontmatter, mtime fallback)
-  - Alignment group consumer -> single latest note (by mtime)
+- **dynamic** — a *source of many notes*; the `dynamicKind` field picks which:
+  - `daily` — the vault's daily notes, filtered by real journal date (same logic as the built-in daily source)
+  - `container` — another container's notes (by `containerId`), matched by `pr-start` within the period
+  - `folder` — a folder scan (default / legacy shape), period-filtered by `pr-start/end` frontmatter with mtime fallback
+
+  How a dynamic source is queried depends on the **consumer**, not the kind:
+  - Container consumer -> period-filtered set (all notes whose start falls in the period)
+  - Alignment group / DR inject consumer -> single latest note
+
+**Metadata whitelist (`fields`).** Any source (static or dynamic) may carry a `fields` array — a list of frontmatter/inline keys. When set, *only* those keys reach the LLM payload; empty/absent means pass every field through. Applied in the container payload builder (`dataSourceFields` → per-key filter on both `key: value` frontmatter and `key:: value` inline fields). Lets one note expose different slices to different containers.
 
 ```js
 {
@@ -142,11 +149,16 @@ Named, reusable reference to a note or folder. Two modes:
   name: "Life charter",
   mode: "static" | "dynamic",
   notePath: "Core/Charter.md",     // static only
-  folderPath: "Journal/Months",    // dynamic only
+  dynamicKind: "daily" | "container" | "folder",  // dynamic only (default "folder")
+  containerId: "pr-...",           // dynamicKind === "container"
+  folderPath: "Journal/Months",    // dynamicKind === "folder"
+  fields: ["training", "visual"],  // [] / absent = every field
 }
 ```
 
-Defined in Settings -> General -> Data sources. Rendered as teal nodes in the graph view.
+Defined in Settings -> General -> Data sources, or as a node in the graph view (`renderDataSourceExpanded`). Rendered as teal nodes. Both the settings card and the graph node expose Mode → Source (daily/container/folder) → target picker → Metadata fields, and a Data Source can now be wired/added as a **container source** (graph context menu + the container's data-sources dropdown), not just an alignment-group guidelines source.
+
+**Two resolvers, one semantics.** `resolveDataSourceForContainer(ds, start, end)` returns the period-filtered set; `resolveDataSourceLatest(ds)` returns the single newest note. Both branch on `dataSourceDynamicKind(ds)`. The DR module's `resolveDataSourceFile` (used by a Daily Ritual question's `data-source` inject) delegates to `resolveDataSourceLatest` so all kinds work identically there. Legacy sources (no `dynamicKind`) default to `folder` via the helper; `loadSettings` also backfills `dynamicKind`/`containerId`/`fields` idempotently.
 
 ### Alignment Group
 
@@ -348,6 +360,7 @@ Six outer tabs, General first:
 | 10 | Graph view: custom node editor with pan/zoom, wire drag, snap, multi-select, marquee, filter, inspect, copy/paste, inline editors |
 | 11 | Show Output nodes (dry-run probes with live LLM calls), Data Sources (static/dynamic note/folder references), Alignment Groups (auto-discovered gap analysis with prepend/rewrite/separate/combined modes, per-alignment config, one LLM call per group, framework reinforcement), Framework feature (file-based injection at highest-attention slot), global system-prompt/framework masters, node resize with per-state sizing, YAML safety (sanitizer + LLM instructions), inline field regex fix (cross-line bleed), colored kind pipes in menus, write-back lifecycle (two-pass generation with phase filtering), phase-aware runAt/runLLMAt controls, writeTo (frontmatter/inline/body) output routing, propagatePRFrontmatterToBody sync, combined alignment mode |
 | 12 | Daily Ritual: midnight auto-create of today's daily note (`vault.create` with core template tokens resolved manually so the Daily Notes plugin's createDailyNote can be bypassed without focus stealing); image attachments on Alignment + Reflection questions (static / from-note / from-folder modes, gallery picker, upload-from-disk into a configured gallery folder, image-only modal steps when question text is empty). Zodiac Calendar self-rescheduling midnight refresh (one-shot timer re-armed each render, cleared in onClose). |
+| 13 | Data Source expansion: dynamic sources gained a `dynamicKind` (daily / container / folder) so a named source can pull the vault's daily notes or another container's notes, not just a folder; per-source metadata whitelist (`fields`) that restricts which frontmatter/inline keys reach the LLM; Data Sources wireable as **container** sources (graph context menu + settings dropdown), with the DR `data-source` inject delegating to the shared latest-note resolver. Zodiac Calendar / solar boundary timezone fix (Helios UTC instants bucketed to days in `calendarTimezone` via `calendarDayInTimeZone`/`heliosInstantFromString`, fixing phases/ingresses rendering a day early). Generation idempotency guard (scan saveDir for a note already stamped with this container id + period end before creating, so a synced `lastGeneratedEnd` revert can't make a duplicate). DR injected-prompt respects the per-question Text size (heading) setting. |
 
 ---
 
