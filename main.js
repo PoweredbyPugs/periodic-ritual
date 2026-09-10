@@ -242,16 +242,19 @@ const PROVIDERS = {
         },
     },
     openclaw: {
-        // Generic OpenAI-compatible local-agent gateway: OpenClaw, Hermes, or
-        // any harness that exposes /v1/chat/completions + /v1/models. Each
-        // agent is a separate LLM service distinguished by its base URL +
-        // model; this one provider type serves them all. (Key kept as
-        // "openclaw" for backward-compat with existing services.)
+        // Generic OpenAI-compatible local-agent gateway: Hermes (api_server
+        // platform, default port 8642, API key = API_SERVER_KEY), OpenClaw,
+        // or any harness that exposes /v1/chat/completions + /v1/models.
+        // Each agent is a separate LLM service distinguished by its base URL
+        // + model; this one provider type serves them all. (Key kept as
+        // "openclaw" for backward-compat with existing services.) Hermes
+        // layers the request's system message on top of the agent's core
+        // persona, so per-container / per-group system prompts still apply.
         name: "Custom Harness",
         needsBaseUrl: true,
-        defaultBaseUrl: "http://127.0.0.1:18789",
+        defaultBaseUrl: "http://127.0.0.1:8642",
         buildUrl(s) {
-            const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            const base = (s.baseUrl || "http://127.0.0.1:8642").replace(/\/+$/, "");
             return `${base}/v1/chat/completions`;
         },
         // OpenClaw selects the agent via the `model` field. The user picks
@@ -260,7 +263,7 @@ const PROVIDERS = {
         // it through unchanged.
         buildBody(prompt, s, sys) {
             return {
-                model: s.model || "openclaw/default",
+                model: s.model || "hermes-agent",
                 messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
             };
         },
@@ -274,7 +277,7 @@ const PROVIDERS = {
         },
         async listModels(s) {
             if (typeof s === "string") s = { apiKey: s };
-            const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            const base = (s.baseUrl || "http://127.0.0.1:8642").replace(/\/+$/, "");
             const headers = s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
             const d = await prHttpJson({ url: `${base}/v1/models`, method: "GET", headers });
             return (d.data || []).map(m => m.id).sort();
@@ -2568,21 +2571,24 @@ const DR_PROVIDERS = {
         },
     },
     openclaw: {
-        // Generic OpenAI-compatible local-agent gateway: OpenClaw, Hermes, or
-        // any harness that exposes /v1/chat/completions + /v1/models. Each
-        // agent is a separate LLM service distinguished by its base URL +
-        // model; this one provider type serves them all. (Key kept as
-        // "openclaw" for backward-compat with existing services.)
+        // Generic OpenAI-compatible local-agent gateway: Hermes (api_server
+        // platform, default port 8642, API key = API_SERVER_KEY), OpenClaw,
+        // or any harness that exposes /v1/chat/completions + /v1/models.
+        // Each agent is a separate LLM service distinguished by its base URL
+        // + model; this one provider type serves them all. (Key kept as
+        // "openclaw" for backward-compat with existing services.) Hermes
+        // layers the request's system message on top of the agent's core
+        // persona, so per-container / per-group system prompts still apply.
         name: "Custom Harness",
         needsBaseUrl: true,
-        defaultBaseUrl: "http://127.0.0.1:18789",
+        defaultBaseUrl: "http://127.0.0.1:8642",
         buildUrl(s) {
-            const base = (s.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            const base = (s.baseUrl || "http://127.0.0.1:8642").replace(/\/+$/, "");
             return `${base}/v1/chat/completions`;
         },
         buildBody(prompt, s, systemPrompt) {
             return {
-                model: s.model || "openclaw/default",
+                model: s.model || "hermes-agent",
                 messages: [
                     { role: "system", content: systemPrompt },
                     { role: "user", content: prompt },
@@ -2593,7 +2599,7 @@ const DR_PROVIDERS = {
         headers(s) { return s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {}; },
         async listModels(s) {
             const cfg = typeof s === "string" ? { apiKey: s } : s;
-            const base = (cfg.baseUrl || "http://127.0.0.1:18789").replace(/\/+$/, "");
+            const base = (cfg.baseUrl || "http://127.0.0.1:8642").replace(/\/+$/, "");
             const headers = cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {};
             const d = await prHttpJson({ url: `${base}/v1/models`, method: "GET", headers });
             return (d.data || []).map((m) => m.id).sort();
