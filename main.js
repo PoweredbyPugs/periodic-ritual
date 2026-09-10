@@ -24,6 +24,19 @@ function formatDate(d) {
     return `${y}-${m}-${day}`;
 }
 
+// Parse a bare "YYYY-MM-DD" date key as LOCAL midnight. `new Date("YYYY-MM-DD")`
+// parses as UTC midnight, which in every timezone west of UTC lands on the
+// PREVIOUS local day (e.g. in America/New_York "2026-07-05" becomes Jul 4,
+// 8pm). Any comparison between such a date and a local-midnight boundary
+// range is then off by one day. formatDate() writes local date keys, so
+// everything reading them back must come through here. Non-date-key strings
+// fall through to the native parser.
+function parseDateKeyLocal(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "").trim());
+    if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return new Date(s);
+}
+
 function startOfDay(d) {
     const r = new Date(d);
     r.setHours(0, 0, 0, 0);
@@ -1487,6 +1500,7 @@ const DEFAULT_SETTINGS = {
     prSystemPromptsGlobalEnabled: true,
     prFrameworksGlobalEnabled: true,
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
+    prWaitForSyncBeforeGenerate: false, // hold auto-generate until Obsidian Sync settles (multi-device)
     prGraphLayout: {},         // { [nodeId]: { x, y } } — node positions in the graph view
 };
 
@@ -2376,6 +2390,9 @@ function dr_makeQuestion(text) {
         // appearance. Markdown headings inside q.text still get their
         // own h1-h6 sizing on top.
         textSize: "h5",
+        // Center the injected value/prompt block in the modal. Off = default
+        // left alignment. Applies to both injectVar and phase-gate injected text.
+        centerInjected: false,
     };
 }
 
@@ -2653,7 +2670,8 @@ class DRReflectionModal extends Modal {
             // just the question text below it. .pr-dr-injected only adds the
             // spacing that separates it from the question.
             const size = q.textSize || "h5";
-            const varEl = contentEl.createDiv({ cls: `pr-dr-injected pr-dr-question-${size}` });
+            const centerCls = q.centerInjected ? " pr-dr-injected-center" : "";
+            const varEl = contentEl.createDiv({ cls: `pr-dr-injected pr-dr-question-${size}${centerCls}` });
             MarkdownRenderer.renderMarkdown(injected, varEl, "", this);
         }
         const imageSrc = this.imagePaths[qIdx] || "";
@@ -2822,13 +2840,35 @@ class DRImageGalleryModal extends Modal {
         const grid = contentEl.createDiv();
         grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;max-height:60vh;overflow-y:auto;padding:4px;";
 
+        // Lazy-load thumbnails. Setting img.src up front for every file made the
+        // browser fetch + decode every full-resolution image the instant the
+        // picker opened — the 100px display size doesn't shrink the decode, so
+        // a large gallery folder froze the modal. Instead each cell holds its
+        // resource URL in data-src and only commits it to img.src once the cell
+        // scrolls near the gallery viewport. The observer's root is the
+        // scrollable grid; rootMargin preloads a little ahead of the fold so
+        // thumbnails are ready by the time they're visible. The img keeps its
+        // 100px height with no src, so layout is stable and visibility is
+        // measurable before anything loads. Disconnected in onClose.
+        this._thumbObserver = new IntersectionObserver((entries, obs) => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                const img = entry.target;
+                const src = img.dataset.src;
+                if (src) { img.src = src; delete img.dataset.src; }
+                obs.unobserve(img);
+            }
+        }, { root: grid, rootMargin: "300px" });
+
         for (const file of images) {
             const cell = grid.createDiv();
             cell.style.cssText = "cursor:pointer;border:1px solid var(--background-modifier-border);border-radius:4px;overflow:hidden;background:var(--background-secondary);";
             const img = cell.createEl("img");
-            img.src = this.app.vault.getResourcePath(file);
+            img.dataset.src = this.app.vault.getResourcePath(file);
+            img.decoding = "async";
             img.style.cssText = "width:100%;height:100px;object-fit:cover;display:block;";
             img.addEventListener("error", () => { img.style.display = "none"; });
+            this._thumbObserver.observe(img);
             const label = cell.createDiv();
             label.style.cssText = "padding:4px 6px;font-size:0.75em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
             label.setText(file.name);
@@ -2856,7 +2896,10 @@ class DRImageGalleryModal extends Modal {
         out.sort((a, b) => (b.stat?.mtime || 0) - (a.stat?.mtime || 0));
         return out;
     }
-    onClose() { this.contentEl.empty(); }
+    onClose() {
+        if (this._thumbObserver) { this._thumbObserver.disconnect(); this._thumbObserver = null; }
+        this.contentEl.empty();
+    }
 }
 
 class DailyRitualModule {
@@ -3171,7 +3214,10 @@ class DailyRitualModule {
         let initialAnswers = null;
         let initialStep = 0;
         const draft = this.settings.dailyDraft;
-        if (draft && draft.filePath === file.path && Array.isArray(draft.answers) && draft.answers.length === this.settings.questions.length) {
+        // Same day-scoping as alignment (see openAlignment): a reflection
+        // draft only resumes within the day it was started; older or legacy
+        // date-less drafts are discarded so each day restarts at step 0.
+        if (draft && draft.date === dr_todayDateString() && draft.filePath === file.path && Array.isArray(draft.answers) && draft.answers.length === this.settings.questions.length) {
             initialAnswers = draft.answers;
             initialStep = typeof draft.step === "number" ? draft.step : 0;
         } else if (draft) {
@@ -3179,7 +3225,7 @@ class DailyRitualModule {
             await this.saveSettings();
         }
         const onDraftChange = async ({ answers, step }) => {
-            this.settings.dailyDraft = { filePath: file.path, answers: [...answers], step };
+            this.settings.dailyDraft = { date: dr_todayDateString(), filePath: file.path, answers: [...answers], step };
             await this.saveSettings();
         };
         new DRReflectionModal(this.app, this.settings.questions, resolved, async (answers) => {
@@ -3211,7 +3257,12 @@ class DailyRitualModule {
         let initialAnswers = null;
         let initialStep = 0;
         const draft = this.settings.alignmentDraft;
-        if (draft && draft.filePath === file.path && Array.isArray(draft.answers) && draft.answers.length === questions.length) {
+        // Drafts are scoped to the day they were started. Alignment is a
+        // once-daily ritual, so a draft from a previous day (or a legacy
+        // date-less draft) must be discarded — otherwise a mid-sequence
+        // `step` saved on a dismissed run resumes forever and silently skips
+        // the earlier, ungated questions (e.g. identity) every subsequent day.
+        if (draft && draft.date === dr_todayDateString() && draft.filePath === file.path && Array.isArray(draft.answers) && draft.answers.length === questions.length) {
             initialAnswers = draft.answers;
             initialStep = typeof draft.step === "number" ? draft.step : 0;
         } else if (draft) {
@@ -3219,7 +3270,7 @@ class DailyRitualModule {
             await this.saveSettings();
         }
         const onDraftChange = async ({ answers, step }) => {
-            this.settings.alignmentDraft = { filePath: file.path, answers: [...answers], step };
+            this.settings.alignmentDraft = { date: dr_todayDateString(), filePath: file.path, answers: [...answers], step };
             await this.saveSettings();
         };
         new DRReflectionModal(this.app, questions, resolved, async (answers) => {
@@ -4101,20 +4152,6 @@ class DailyRitualModule {
                         });
                     });
                 new Setting(inputGroup)
-                    .setName("Text size")
-                    .setDesc("Base size of the rendered question (markdown is parsed either way — bold, headings, admonitions all work).")
-                    .addDropdown((dd) => {
-                        dd.addOption("h1", "H1 (largest)");
-                        dd.addOption("h2", "H2");
-                        dd.addOption("h3", "H3");
-                        dd.addOption("h4", "H4");
-                        dd.addOption("h5", "H5 (default)");
-                        dd.addOption("h6", "H6 (smallest)");
-                        dd.setValue(q.textSize || "h5").onChange(async (v) => {
-                            q.textSize = v; await this.saveSettings();
-                        });
-                    });
-                new Setting(inputGroup)
                     .setName("Inject variable")
                     .setDesc("Show a value from another note in bold above this question")
                     .addToggle((t) => {
@@ -4290,6 +4327,31 @@ class DailyRitualModule {
                         .addText((t) => {
                             t.setPlaceholder("e.g. Training").setValue(q.phaseGateField || "")
                                 .onChange(async (v) => { q.phaseGateField = v.trim(); await this.saveSettings(); });
+                        });
+                }
+                new Setting(inputGroup)
+                    .setName("Text size")
+                    .setDesc("Base size of the rendered question (markdown is parsed either way — bold, headings, admonitions all work).")
+                    .addDropdown((dd) => {
+                        dd.addOption("h1", "H1 (largest)");
+                        dd.addOption("h2", "H2");
+                        dd.addOption("h3", "H3");
+                        dd.addOption("h4", "H4");
+                        dd.addOption("h5", "H5 (default)");
+                        dd.addOption("h6", "H6 (smallest)");
+                        dd.addOption("body", "Body (normal text)");
+                        dd.setValue(q.textSize || "h5").onChange(async (v) => {
+                            q.textSize = v; await this.saveSettings();
+                        });
+                    });
+                if (q.injectVar || q.phaseGate) {
+                    new Setting(inputGroup)
+                        .setName("Center injected text")
+                        .setDesc("Horizontally center the injected value/prompt block in the modal (default is left-aligned).")
+                        .addToggle((t) => {
+                            t.setValue(!!q.centerInjected).onChange(async (v) => {
+                                q.centerInjected = v; await this.saveSettings();
+                            });
                         });
                 }
             }
@@ -4668,6 +4730,7 @@ class MonthlyRitualPlugin extends Plugin {
             if (q.skipIfNoInjectValue === undefined) q.skipIfNoInjectValue = false;
             if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
             if (q.textSize === undefined) q.textSize = "h5";
+            if (q.centerInjected === undefined) q.centerInjected = false;
             if (q.outputTargetMode === undefined) q.outputTargetMode = "active";
             if (q.outputTargetNote === undefined) q.outputTargetNote = "";
             if (q.outputTargetContainerId === undefined) q.outputTargetContainerId = "";
@@ -4702,6 +4765,7 @@ class MonthlyRitualPlugin extends Plugin {
             && !q.phaseGate && !q.phaseGateContainerId && !q.phaseGatePhase && !q.phaseGateField
             && !q.omitFromLLM && !q.omitFromCollected
             && !q.imageMode && !q.imagePath
+            && q.centerInjected !== true
         );
         if (Array.isArray(dr.alignmentQuestions)) {
             while (dr.alignmentQuestions.length > 0 &&
@@ -5564,6 +5628,11 @@ class MonthlyRitualPlugin extends Plugin {
     //
     // opts: { silent?: boolean } — if silent, suppress per-note success
     // notices (used during multi-period catch-up to avoid notice spam).
+    //
+    // Returns { file, created } — `created` is true only when a NEW file was
+    // written; an idempotent "already exists" hit returns created: false so
+    // the catch-up counters (and the "generated N notes" notice) only report
+    // real creations. Returns undefined on failure / missing config.
     async generatePRContainerNote(container, dateOverride, opts = {}) {
         if (!container) { new Notice("No container provided"); return; }
         if (!container.template) {
@@ -5600,12 +5669,14 @@ class MonthlyRitualPlugin extends Plugin {
             }
             if (existing) {
                 if (opts.writeBack && existing instanceof TFile) {
-                    return await this.writeBackToPRContainerNote(container, existing, data, opts);
+                    await this.writeBackToPRContainerNote(container, existing, data, opts);
+                    return { file: existing, created: false };
                 }
+                console.log(`Periodic Ritual: ${container.name} — note for period ${formatDate(data.start)} → ${formatDate(data.end)} already exists (${existing.path}), skipping create`);
                 if (!opts.silent) new Notice(`Already exists: ${filePath}`);
                 container.lastGeneratedEnd = formatDate(data.end);
                 await this.saveSettings();
-                return existing;
+                return { file: existing, created: false };
             }
 
             // Ensure save directory exists
@@ -5641,6 +5712,7 @@ class MonthlyRitualPlugin extends Plugin {
             );
 
             const file = await this.app.vault.create(filePath, content);
+            console.log(`Periodic Ritual: ${container.name} — created ${filePath} (period ${formatDate(data.start)} → ${formatDate(data.end)})`);
 
             // Update lastGeneratedEnd before any further work — the file
             // exists, that's the durable state. If the LLM call below fails,
@@ -5711,7 +5783,7 @@ class MonthlyRitualPlugin extends Plugin {
             // not just during write-back.
             await this.propagatePRFrontmatterToBody(file);
 
-            return file;
+            return { file, created: true };
         } catch (e) {
             if (!opts.silent) new Notice(`Error generating ${container.name}: ${e.message}`);
             console.error("Periodic Ritual:", e);
@@ -5727,6 +5799,7 @@ class MonthlyRitualPlugin extends Plugin {
     //   - Inline fields (`key:: old`) → replaced with `key:: new`
     //   - Body markers (`{{pr:key}}`) → replaced with the value
     async writeBackToPRContainerNote(container, file, data, opts = {}) {
+        console.log(`Periodic Ritual: ${container.name} — write-back on ${file.path} (period ${formatDate(data.start)} → ${formatDate(data.end)})`);
         if (!opts.silent) new Notice(`${container.name}: writing back to ${file.path}…`);
 
         // Stamp the start time on the note immediately so concurrent devices
@@ -6195,7 +6268,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             // Filter by container id so we don't grab notes from other
             // containers that happen to live in the same folder.
             if (meta.id !== sourceContainer.id) continue;
-            const noteStart = new Date(meta.start);
+            const noteStart = parseDateKeyLocal(meta.start);
             if (isNaN(noteStart.getTime())) continue;
             if (noteStart >= start && noteStart <= end) {
                 matches.push({ file, sortKey: noteStart });
@@ -6573,7 +6646,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     // against that period's tokens.
     async findMostRecentPRContainerNote(container) {
         if (!container || !container.lastGeneratedEnd || !container.naming) return null;
-        const periodEndDate = new Date(container.lastGeneratedEnd);
+        const periodEndDate = parseDateKeyLocal(container.lastGeneratedEnd);
         if (isNaN(periodEndDate.getTime())) return null;
         try {
             const data = await this.getPRBoundaryData(container.boundaryDetector, periodEndDate);
@@ -6592,7 +6665,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     // Used by question variable injection when varSource = "previous-period".
     async findPreviousPRContainerNote(container) {
         if (!container || !container.lastGeneratedEnd || !container.naming) return null;
-        const recentEndDate = new Date(container.lastGeneratedEnd);
+        const recentEndDate = parseDateKeyLocal(container.lastGeneratedEnd);
         if (isNaN(recentEndDate.getTime())) return null;
         try {
             // Step into the period before lastGeneratedEnd by going one day
@@ -6845,7 +6918,7 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         let range = null;
         if (reflection.useLLM || reflection.replaceAutoLLM) {
             try {
-                range = await this.getPRBoundaryData(container.boundaryDetector, new Date(container.lastGeneratedEnd));
+                range = await this.getPRBoundaryData(container.boundaryDetector, parseDateKeyLocal(container.lastGeneratedEnd));
             } catch (e) {
                 if (reflection.useLLM) {
                     new Notice(`${container.name}: could not resolve period — ${e.message}`);
@@ -7732,21 +7805,96 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     // (A.dataSource = container:B), B must generate its current note
     // BEFORE A so A's auto-LLM can find the fresh source data. The sort
     // walks the dependency graph and processes leaves (sources) first.
+    // Best-effort gate: hold auto-generation until Obsidian Sync has finished
+    // pulling remote changes. Obsidian Sync is an INTERNAL plugin with no
+    // public API, so this reads its status defensively and ALWAYS falls back
+    // to proceeding (on timeout, absence, disable, pause, error, or an
+    // unfamiliar status shape) — auto-generate must never hang waiting on it.
+    //
+    // Why it matters (multi-device): without the gate, a device that wakes
+    // after another already generated a boundary re-runs the whole pipeline
+    // before Sync delivers the existing note + lastGeneratedEnd, producing
+    // duplicate work, a notification burst per device, and "changes on disk
+    // are newer" conflicts. Waiting for Sync lets this device's existing
+    // idempotency guards ("already exists" / "up to date") short-circuit.
+    async waitForVaultSync(maxWaitMs = 90000) {
+        if (!this.settings.prWaitForSyncBeforeGenerate) return;
+        let syncPlugin = null;
+        try {
+            syncPlugin = this.app.internalPlugins?.getPluginById?.("sync")
+                || this.app.internalPlugins?.plugins?.sync
+                || null;
+        } catch (e) { syncPlugin = null; }
+        const instance = syncPlugin?.instance;
+        if (!syncPlugin?.enabled || !instance) return; // Sync off/absent → nothing to wait for.
+
+        const readStatus = () => {
+            try {
+                const raw = instance.syncStatus ?? instance.getStatus?.() ?? instance.status ?? "";
+                return String(raw).toLowerCase();
+            } catch (e) { return ""; }
+        };
+        // Substrings that indicate Sync is still working. Deliberately avoid
+        // the bare word "sync" — the SETTLED status "fully synced" contains
+        // it; match the progressive "synchroniz(ing)" form instead.
+        const BUSY = ["synchroniz", "connect", "download", "upload", "scan", "pull", "queue", "process", "index", "wait"];
+        const isBusy = () => { const s = readStatus(); return BUSY.some(m => s.includes(m)); };
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+            if (!isBusy()) {
+                // Debounce: Sync can read idle briefly between batches, so
+                // confirm it's still idle a beat later before proceeding.
+                await sleep(1500);
+                if (!isBusy()) return;
+            } else {
+                await sleep(1500);
+            }
+        }
+        console.warn(`Periodic Ritual: sync-gate timed out after ${Math.round(maxWaitMs / 1000)}s; proceeding with auto-generate`);
+    }
+
     async runPRAutoGenerate() {
         const all = (this.settings.prContainers || []).filter(c => c.enabled);
         if (all.length === 0) {
-            new Notice("Periodic Ritual: no enabled containers");
+            // Fires on every startup + 10-min tick when no containers are
+            // enabled — log rather than nag with a Notice.
+            console.log("Periodic Ritual: no enabled containers");
             return;
         }
 
+        // Multi-device gate (no-op unless the setting is on and Sync is busy).
+        await this.waitForVaultSync();
+
         const sorted = this.toposortPRContainers(all);
+        let totalCreated = 0;
+        let totalWroteBack = 0;
+        const perContainer = [];
         for (const container of sorted) {
             try {
-                await this.catchUpPRContainer(container);
+                const res = await this.catchUpPRContainer(container);
+                if (res) {
+                    totalCreated += res.created || 0;
+                    totalWroteBack += res.wroteBack || 0;
+                    if ((res.created || 0) > 0 || (res.wroteBack || 0) > 0) {
+                        perContainer.push(`${container.name}: created ${res.created || 0}, wrote back ${res.wroteBack || 0}`);
+                    }
+                }
             } catch (e) {
                 console.error(`Periodic Ritual: catch-up failed for ${container.name}`, e);
                 new Notice(`Catch-up failed for ${container.name}: ${e.message}`);
             }
+        }
+
+        // One consolidated summary for the whole run instead of a per-note /
+        // per-LLM / per-alignment burst (those are silenced in catch-up).
+        if (totalCreated > 0 || totalWroteBack > 0) {
+            const parts = [];
+            if (totalCreated > 0) parts.push(`generated ${totalCreated} note${totalCreated === 1 ? "" : "s"}`);
+            if (totalWroteBack > 0) parts.push(`updated ${totalWroteBack}`);
+            console.log(`Periodic Ritual: auto-generate run — ${parts.join(", ")} [${perContainer.join("; ")}]`);
+            new Notice(`Periodic Ritual: ${parts.join(", ")}`);
         }
     }
 
@@ -7805,14 +7953,22 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     // period. Don't backfill the user's entire history — that's a separate
     // explicit operation, not catch-up.
     async catchUpPRContainer(container) {
+        // Returns { created, wroteBack } so runPRAutoGenerate can show one
+        // consolidated summary instead of a per-note notification burst.
         if (!container.template || !container.naming) {
             // Not yet configured — skip silently.
-            return;
+            return { created: 0, wroteBack: 0 };
         }
+
+        let created = 0;
+        let wroteBack = 0;
+        // All auto-generate note creation runs silent — the run-level summary
+        // in runPRAutoGenerate reports the totals.
+        const genOpts = { silent: true };
 
         const now = new Date();
         const currentRange = await this.getPRBoundaryData(container.boundaryDetector, now);
-        if (!currentRange) return;
+        if (!currentRange) return { created, wroteBack };
 
         const generateAt = container.generateAt || "start";
         // In end mode, the current period only counts as "missed" once it's
@@ -7829,30 +7985,30 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 const previousPeriodDate = addDays(currentRange.start, -1);
                 const previousRange = await this.getPRBoundaryData(container.boundaryDetector, previousPeriodDate);
                 if (previousRange) {
-                    await this.generatePRContainerNote(container, previousPeriodDate);
+                    if ((await this.generatePRContainerNote(container, previousPeriodDate, genOpts))?.created) created++;
                 }
                 // If the current period has also ended (rare — only true if
                 // the user installed mid-boundary), pick it up too.
                 if (currentRange.end < now) {
-                    await this.generatePRContainerNote(container, now);
+                    if ((await this.generatePRContainerNote(container, now, genOpts))?.created) created++;
                 }
-                return;
+                return { created, wroteBack };
             }
             // Start mode first run: generate the current period.
-            await this.generatePRContainerNote(container, now);
-            return;
+            if ((await this.generatePRContainerNote(container, now, genOpts))?.created) created++;
+            return { created, wroteBack };
         }
 
-        const lastEnd = new Date(container.lastGeneratedEnd);
+        const lastEnd = parseDateKeyLocal(container.lastGeneratedEnd);
         if (isNaN(lastEnd.getTime())) {
             console.warn(`Periodic Ritual: ${container.name} has invalid lastGeneratedEnd "${container.lastGeneratedEnd}", falling back to current period`);
-            await this.generatePRContainerNote(container, now);
-            return;
+            if ((await this.generatePRContainerNote(container, now, genOpts))?.created) created++;
+            return { created, wroteBack };
         }
 
         // If lastGeneratedEnd is at or past the current period's end, we're
         // up to date. Nothing to do.
-        if (lastEnd >= currentRange.end) return;
+        if (lastEnd >= currentRange.end) return { created, wroteBack };
 
         // Walk forward one period at a time, collecting period start dates.
         // In end mode, skip any period whose end is in the future.
@@ -7876,21 +8032,12 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             cursor = nextCursor;
         }
 
-        if (periodDates.length === 0) return;
+        if (periodDates.length === 0) return { created, wroteBack };
 
-        const multi = periodDates.length > 1;
-        if (multi) {
-            new Notice(`${container.name}: catching up ${periodDates.length} missed period(s)…`);
-        }
-
-        let created = 0;
+        console.log(`Periodic Ritual: ${container.name} — catch-up walking ${periodDates.length} period(s) from ${formatDate(periodDates[0])} (lastGeneratedEnd ${container.lastGeneratedEnd})`);
         for (const periodDate of periodDates) {
-            const result = await this.generatePRContainerNote(container, periodDate, { silent: multi });
-            if (result) created++;
-        }
-
-        if (multi) {
-            new Notice(`${container.name}: generated ${created} note(s)`);
+            const result = await this.generatePRContainerNote(container, periodDate, genOpts);
+            if (result?.created) created++;
         }
 
         // Write-back pass: if the container has writeBackAt set, check if
@@ -7955,7 +8102,8 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                             const shouldWriteBack = (writeBackAt === "end" && prevRange.end < now)
                                 || (writeBackAt === "start" && prevRange.start <= now);
                             if (shouldWriteBack) {
-                                await this.writeBackToPRContainerNote(container, prevFile, prevRange, { silent: false });
+                                await this.writeBackToPRContainerNote(container, prevFile, prevRange, { silent: true });
+                                wroteBack++;
                             }
                         }
                     }
@@ -7964,6 +8112,8 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 console.error(`Periodic Ritual: write-back check failed for ${container.name}`, e);
             }
         }
+
+        return { created, wroteBack };
     }
 
     // ─── Field pipeline ───
@@ -8535,8 +8685,8 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 return;
             }
             const range = {
-                start: new Date(meta.start),
-                end: new Date(meta.end),
+                start: parseDateKeyLocal(meta.start),
+                end: parseDateKeyLocal(meta.end),
                 tokens: meta,
             };
             // Clear both guards so downstream logic doesn't short-circuit.
@@ -15658,6 +15808,16 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .setValue(!!s.prAutoGenerateOnLoad)
                 .onChange(async v => {
                     s.prAutoGenerateOnLoad = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Wait for sync before generating")
+            .setDesc("For multi-device vaults on Obsidian Sync. When on, auto-generate holds until Sync finishes pulling remote changes, so a device that wakes after another already generated a period sees the synced notes and skips the work — instead of every device redundantly regenerating (which causes duplicate notifications and \"changes on disk are newer\" conflicts). Best enabled on secondary machines; harmless if Sync is off. Falls back to running after a timeout so generation never hangs.")
+            .addToggle(t => t
+                .setValue(!!s.prWaitForSyncBeforeGenerate)
+                .onChange(async v => {
+                    s.prWaitForSyncBeforeGenerate = v;
                     await this.plugin.saveSettings();
                 }));
 

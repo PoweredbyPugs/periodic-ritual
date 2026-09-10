@@ -1263,6 +1263,9 @@
 .pr-dr-injected {
     margin-bottom: 8px;
 }
+.pr-dr-injected-center {
+    text-align: center;
+}
 .pr-dr-injected > :first-child { margin-top: 0; }
 .pr-dr-injected > :last-child { margin-bottom: 0; }
 .pr-dr-injected > p { margin: 0 0 4px; }
@@ -1302,4 +1305,10 @@
     font-weight: var(--h6-weight);
     color: var(--h6-color);
     line-height: var(--h6-line-height, 1.4);
+}
+.pr-dr-question-body {
+    font-size: var(--font-text-size);
+    font-weight: var(--font-weight);
+    color: var(--text-normal);
+    line-height: var(--line-height-normal, 1.5);
 }
