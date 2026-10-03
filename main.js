@@ -918,6 +918,13 @@ function dataSourceDynamicKind(ds) {
     return "folder";
 }
 
+// "name, prefix_*" → matchers for field names that never count as logged
+// data (settings.prNoDataIgnoreFields). `*` is the only wildcard.
+function prFieldIgnoreMatchers(str) {
+    return String(str || "").split(",").map(x => x.trim()).filter(Boolean)
+        .map(pat => new RegExp("^" + pat.split("*").map(escapeRegex).join(".*") + "$"));
+}
+
 // The source's metadata whitelist as an array, or null when it reads every
 // field. Used by the container payload builder to isolate specific keys.
 function dataSourceFields(ds) {
@@ -1527,6 +1534,7 @@ const DEFAULT_SETTINGS = {
     prFrameworksGlobalEnabled: true,
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
     prWaitForSyncBeforeGenerate: true, // hold startup generation until Obsidian Sync settles (multi-device); no-op when Sync is off
+    prNoDataIgnoreFields: "",  // comma-separated field names (`*` wildcard) that never count as logged data, e.g. "hw_*"
     prGraphLayout: {},         // { [nodeId]: { x, y } } — node positions in the graph view
 };
 
@@ -5916,6 +5924,11 @@ class MonthlyRitualPlugin extends Plugin {
                 await this.runPRLLMAggregation(container, file, range, {
                     ...opts,
                     includePreviousFrontmatter: true,
+                    // generateAt=end creates the note for a period that is
+                    // already over, so this call IS its summary — skip it
+                    // when nothing was logged. (At generateAt=start the
+                    // period is empty by definition; leave that alone.)
+                    skipIfNoData: (container.generateAt || "start") === "end",
                 });
             }
 
@@ -5967,17 +5980,31 @@ class MonthlyRitualPlugin extends Plugin {
         const range = { start: data.start, end: data.end };
         const phase = "writeback";
 
+        // Nothing was logged in this period → no alignment passes and no
+        // summary (each would be an LLM call over an empty period). The
+        // note is still closed below so the period isn't retried.
+        let noData = false;
+        try {
+            noData = !(await this.buildPRSourcePayload(container, range.start, range.end)).hasData;
+        } catch (e) {
+            console.error(`Periodic Ritual: ${container.name} — couldn't check source data for ${file.path}`, e);
+        }
+        if (noData) {
+            console.log(`Periodic Ritual: ${container.name} — nothing logged for ${formatDate(range.start)} → ${formatDate(range.end)}; closing ${file.path} without a summary`);
+            if (!opts.silent) new Notice(`${container.name}: nothing logged for this period — no summary written`);
+        }
+
         // Same pipeline order as generatePRContainerNote, but phase =
         // "writeback" so only primitives with runAt matching fire.
         // 1. Alignment groups first
-        if (!skipAutoLLM) {
+        if (!skipAutoLLM && !noData) {
             await this.runPRAlignmentGroupsForContainer(container, file, range, { ...opts, phase });
         }
         // 2. Main LLM aggregation (respects container.runLLMAt)
         const runLLMAt = container.runLLMAt || "both";
         const shouldRunLLM = runLLMAt === "both" || runLLMAt === phase;
-        let llmStatus = "";
-        if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM && shouldRunLLM) {
+        let llmStatus = noData ? "nodata" : "";
+        if (!noData && container.llmServiceId && container.systemPromptFile && !skipAutoLLM && shouldRunLLM) {
             const res = await this.runPRLLMAggregation(container, file, range, {
                 ...opts,
                 includePreviousFrontmatter: true,
@@ -5994,7 +6021,7 @@ class MonthlyRitualPlugin extends Plugin {
             return { file, done: false, status: llmStatus };
         }
         // 3. Legacy single alignments
-        if (!skipAutoLLM) {
+        if (!skipAutoLLM && !noData) {
             await this.runPRAlignmentsForContainer(container, file, range, opts);
         }
 
@@ -6194,26 +6221,83 @@ class MonthlyRitualPlugin extends Plugin {
     //   { type: "daily" } (default) — daily notes folder
     //   { type: "container", containerId: "..." } — another PR container's
     //     notes whose pr-start falls in [start, end]
+    // Template path the Daily Notes core plugin creates daily notes from
+    // ("" when the plugin is off or has no template).
+    getPRDailyTemplatePath() {
+        const daily = this.app.internalPlugins?.getPluginById?.("daily-notes");
+        const opts = (daily && daily.instance && daily.instance.options) || {};
+        return String(opts.template || "").trim();
+    }
+
+    // What a note fresh from `templatePath` already contains, per field, so
+    // the payload builder can tell logged data from template output:
+    //   { fm: Map<key, {kind, value}>, inline: Map<key, {kind, value}> }
+    //   kind "auto"    — the template computes it (Templater <% %> / {{ }})
+    //   kind "blank"   — left empty, or a bare "⋯" placeholder: the user's to fill
+    //   kind "literal" — a fixed default (value = that default, unquoted)
+    // Line-based on purpose: Templater tags make a template's frontmatter
+    // invalid YAML. Returns null when the template can't be read. Cached per
+    // path until the file changes.
+    async getPRTemplateFieldProfile(templatePath) {
+        if (!templatePath) return null;
+        let file = this.app.vault.getAbstractFileByPath(templatePath);
+        if (!(file instanceof TFile) && !/\.md$/i.test(templatePath)) {
+            file = this.app.vault.getAbstractFileByPath(templatePath + ".md");
+        }
+        if (!(file instanceof TFile)) return null;
+        if (!this._prTemplateProfiles) this._prTemplateProfiles = new Map();
+        const mtime = file.stat ? file.stat.mtime : 0;
+        const hit = this._prTemplateProfiles.get(file.path);
+        if (hit && hit.mtime === mtime) return hit.profile;
+
+        const classify = (raw) => {
+            const v = String(raw || "").trim();
+            if (/<%|\{\{/.test(v)) return { kind: "auto", value: "" };
+            if (/^[⋯…|>]*$/.test(v)) return { kind: "blank", value: "" };
+            return { kind: "literal", value: v.replace(/^(["'])(.*)\1$/, "$2").trim() };
+        };
+        const content = await this.app.vault.read(file);
+        const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+        const profile = { fm: new Map(), inline: new Map() };
+        if (fmMatch) {
+            for (const line of fmMatch[1].split(/\r?\n/)) {
+                const m = /^([^\s:#][^:]*):[ \t]*(.*)$/.exec(line);
+                if (m) profile.fm.set(m[1].trim(), classify(m[2]));
+            }
+        }
+        const body = fmMatch ? content.slice(fmMatch[0].length) : content;
+        const inlineRe = /^([a-zA-Z0-9_-]+)::[ \t]*(.*)$/gm;
+        let m;
+        while ((m = inlineRe.exec(body)) !== null) profile.inline.set(m[1], classify(m[2]));
+
+        this._prTemplateProfiles.set(file.path, { mtime, profile });
+        return profile;
+    }
+
     async buildPRSourcePayload(container, start, end) {
         const sources = getContainerDataSources(container);
 
         // Empty data sources is a valid state — the container has no
         // configured sources. Aggregation runs against an empty payload.
         if (sources.length === 0) {
-            return { count: 0, text: "(no data sources configured)", label: "no sources", hasData: false };
+            // hasData stays true: with nothing configured there is nothing
+            // to judge, and such containers run on alignment context alone.
+            return { count: 0, text: "(no data sources configured)", label: "no sources", hasData: true };
         }
 
         // Walk every configured source. Files are deduped by path so two
         // sources that happen to overlap don't duplicate sections.
-        const sourceFiles = [];   // { file, fields } — fields is the whitelist or null
+        const sourceFiles = [];   // { file, fields, profile } — fields is the whitelist or null; profile = the notes' template (see getPRTemplateFieldProfile)
         const seenPaths = new Set();
         const labelParts = [];
         for (const source of sources) {
             let theseFiles = [];
             let fields = null;   // per-source metadata whitelist (DataSource only)
+            let templatePath = "";   // template these notes were created from, when knowable
             if (source.type === "container" && source.containerId) {
                 const sourceContainer = (this.settings.prContainers || []).find(c => c.id === source.containerId);
                 if (sourceContainer) {
+                    templatePath = sourceContainer.template || "";
                     theseFiles = await this.findPRContainerNotesInRange(sourceContainer, start, end);
                     labelParts.push(`${sourceContainer.name || "container"} notes`);
                 }
@@ -6226,18 +6310,27 @@ class MonthlyRitualPlugin extends Plugin {
                 if (ds) {
                     theseFiles = await this.resolveDataSourceForContainer(ds, start, end);
                     fields = dataSourceFields(ds);
+                    if (ds.mode === "dynamic") {
+                        const kind = dataSourceDynamicKind(ds);
+                        if (kind === "daily") templatePath = this.getPRDailyTemplatePath();
+                        else if (kind === "container" && ds.containerId) {
+                            templatePath = ((this.settings.prContainers || []).find(c => c.id === ds.containerId) || {}).template || "";
+                        }
+                    }
                     labelParts.push(ds.name || "data source");
                 }
             } else {
                 const endInclusive = new Date(end);
                 endInclusive.setHours(23, 59, 59, 999);
                 theseFiles = this.findDailyNotesInRange(start, endInclusive);
+                templatePath = this.getPRDailyTemplatePath();
                 labelParts.push("daily notes");
             }
+            const profile = theseFiles.length ? await this.getPRTemplateFieldProfile(templatePath) : null;
             for (const f of theseFiles) {
                 if (seenPaths.has(f.path)) continue;
                 seenPaths.add(f.path);
-                sourceFiles.push({ file: f, fields });
+                sourceFiles.push({ file: f, fields, profile });
             }
         }
         const sourceLabel = labelParts.length > 0 ? labelParts.join(" + ") : "daily notes";
@@ -6246,10 +6339,29 @@ class MonthlyRitualPlugin extends Plugin {
             return { count: 0, text: `(no ${sourceLabel} in range)`, label: sourceLabel, hasData: false };
         }
 
-        // hasData: did any source note contribute a filled-in field? Blank
-        // values and bare template placeholders ("⋯") don't count. Lets
-        // write-back skip the LLM call for a period nothing was logged in.
+        // hasData: did any source note contribute something that was
+        // actually LOGGED — as opposed to what its template put there? A
+        // freshly created note is never empty (computed astro context, a
+        // default image, placeholder glyphs), so "non-blank" alone would
+        // call every period data. Judged against the note's template:
+        //   - a value the template computes (<% %> / {{ }})   → not data
+        //   - a value equal to the template's fixed default    → not data
+        //   - blank, or a bare "⋯" placeholder                 → not data
+        //   - a field named in settings.prNoDataIgnoreFields   → not data
+        //   - anything else (incl. fields the template lacks)  → data
+        // Without a known template only the blank/ignore rules apply.
+        // Lets write-back skip a period nothing was logged in.
         const isBlank = (v) => /^[\s⋯…]*$/.test(String(v));
+        const ignored = prFieldIgnoreMatchers(this.settings.prNoDataIgnoreFields);
+        const isData = (base, k, v) => {
+            if (isBlank(v)) return false;
+            if (ignored.some(re => re.test(k))) return false;
+            const t = base && base.get(k);
+            if (!t) return true;
+            if (t.kind === "auto") return false;
+            if (t.kind === "literal") return String(v).trim() !== t.value;
+            return true;
+        };
         let dataLines = 0;
 
         const sections = [];
@@ -6258,6 +6370,7 @@ class MonthlyRitualPlugin extends Plugin {
             // When the source carries a whitelist, only these metadata keys
             // reach the LLM; null means pass everything through (default).
             const allow = entry.fields;
+            const profile = entry.profile;
             const cache = this.app.metadataCache.getFileCache(file);
             const fm = cache?.frontmatter || {};
             const content = await this.app.vault.read(file);
@@ -6286,12 +6399,12 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 if (v === null || v === undefined) continue;
                 if (typeof v === "object") continue;
                 lines.push(`${k}: ${v}`);
-                if (!isBlank(v)) dataLines++;
+                if (isData(profile && profile.fm, k, v)) dataLines++;
             }
             for (const [k, v] of Object.entries(inlineFields)) {
                 if (allow && !allow.includes(k)) continue;
                 lines.push(`${k}:: ${v}`);
-                if (!isBlank(v)) dataLines++;
+                if (isData(profile && profile.inline, k, v)) dataLines++;
             }
             sections.push(lines.join("\n"));
         }
@@ -6465,6 +6578,36 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 matches.push({ file, sortKey: noteStart });
             }
         }
+
+        // Second pass, by NAME: walk the source container's periods across
+        // the range and pick up each period's note by its resolved filename.
+        // Catches notes whose stamp is missing or damaged — older versions
+        // could rewrite the blob as just "writeback=true" (no id/start), which
+        // silently dropped those notes out of every consumer's sources.
+        // Same inclusion rule as above: the period must START inside the range.
+        if (sourceContainer.naming) {
+            const seen = new Set(matches.map(m => m.file.path));
+            try {
+                let cursor = new Date(start);
+                for (let safety = 0; cursor <= end && safety < 400; safety++) {
+                    const range = await this.getPRBoundaryData(sourceContainer.boundaryDetector, cursor);
+                    if (!range) break;
+                    if (range.start >= start && range.start <= end) {
+                        const f = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(sourceContainer, range));
+                        if (f instanceof TFile && !seen.has(f.path)) {
+                            seen.add(f.path);
+                            matches.push({ file: f, sortKey: range.start });
+                        }
+                    }
+                    const next = addDays(range.end, 1);
+                    if (!(next > cursor)) break;
+                    cursor = next;
+                }
+            } catch (e) {
+                console.warn(`Periodic Ritual: name-based lookup of ${sourceContainer.name} notes stopped early`, e);
+            }
+        }
+
         matches.sort((a, b) => a.sortKey - b.sortKey);
         return matches.map(m => m.file);
     }
@@ -16228,6 +16371,17 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .setValue(!!s.prWaitForSyncBeforeGenerate)
                 .onChange(async v => {
                     s.prWaitForSyncBeforeGenerate = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Fields that never count as logged data")
+            .setDesc("A period's summary is skipped when nothing was logged in it. Values a note's template fills in by itself (computed fields, fixed defaults, placeholders) are already left out of that check. List here any other fields written automatically — by another plugin or script — that shouldn't be enough to trigger a summary on their own. Comma-separated; * is a wildcard (e.g. hw_*).")
+            .addText(t => t
+                .setPlaceholder("e.g. hw_*, steps")
+                .setValue(s.prNoDataIgnoreFields || "")
+                .onChange(async v => {
+                    s.prNoDataIgnoreFields = v.trim();
                     await this.plugin.saveSettings();
                 }));
 
