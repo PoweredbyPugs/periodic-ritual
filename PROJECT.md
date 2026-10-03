@@ -275,6 +275,15 @@ Debugging/inspection node. One universal `in-any` input, no output. "Dry Run" bu
 
 A container's `writeBackAt` field enables a second pass on existing notes. When set to "end" or "start", the catch-up flow detects when a write-back is due (e.g., the period has ended) and triggers `writeBackToPRContainerNote`. This runs the same pipeline as generation but with phase set to "writeback", so only primitives whose `runAt`/`runLLMAt` includes "writeback" (or "both") will fire. This allows alignment groups and LLM aggregation to be split across the two passes — for example, alignments at generate time, main LLM at writeback time.
 
+**Write-back is self-healing** (`runPRWriteBackPass`). It runs on every catch-up pass, not only the one that crosses a boundary, and looks back over the last `PR_WRITEBACK_LOOKBACK` (3) ended periods, oldest first.
+
+- **Done means the note says so.** `writeback=true` in the note's `periodic-ritual` blob is authoritative whenever the blob is intact (`id` matches the container) — it lives in the vault, so it syncs. Local `lastWriteBackEnd` only decides for the nearest period when the note has no usable stamp. Removing `writeback=true` from a note is how to request a redo.
+- **A failed run is not marked done.** `runPRLLMAggregation` returns `{ status: "written" | "failed" | "empty" | "nodata" }`; on `failed`/`empty`, `writeBackToPRContainerNote` returns `{ done: false }` without stamping, so the period stays owed. (Before this, a provider outage — e.g. an exhausted quota — silently lost every summary that fell due during it.)
+- **Retry pacing.** One attempt per pass per container: a failure, a fresh `writebackStartedAt` lock, or a note tried within `PR_WRITEBACK_RETRY_MS` (60 min, per session) stops the pass instead of skipping ahead to later periods.
+- **No data → no call.** Write-back passes `skipIfNoData`; when `buildPRSourcePayload` reports `hasData: false` (no source notes, or only blank / `⋯` placeholder values) the LLM is skipped and the note is closed with `writeback=true nodata=true`.
+- **Manual "write back"** targets the period that has ended: with `generateAt=start` the newest note is the one still in progress, so the command steps back one note unless `writeBackAt` is `start`.
+- `updatePRMetadataOnFile` merges the patch into the blob as it is on disk (inside `processFrontMatter`), not the metadataCache copy — the cached read used to drop `id/start/end` and leave `periodic-ritual: writeback=true`.
+
 ### Framework reinforcement
 
 A markdown FILE (not inline text) read via `loadTemplate()`. Injected at the highest-attention slot in the LLM user message (right before output instructions). More reliable than system prompts for procedural thinking guidance, mental models, and analytical lenses.

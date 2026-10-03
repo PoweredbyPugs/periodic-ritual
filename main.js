@@ -338,6 +338,15 @@ function makeReflectionConfig() {
 // device takes over. 10 minutes is generous for a slow LLM aggregation.
 const PR_WRITEBACK_LOCK_MS = 10 * 60 * 1000;
 
+// Write-back self-healing. Every catch-up pass re-checks this many of the
+// most recently ENDED periods (oldest first) and runs write-back on any
+// whose note isn't marked done — so a summary that failed (LLM down, quota
+// exhausted) is retried instead of being lost. A note that failed is not
+// retried more than once per PR_WRITEBACK_RETRY_MS within a session, which
+// keeps the 10-minute catch-up interval from hammering a broken provider.
+const PR_WRITEBACK_LOOKBACK = 3;
+const PR_WRITEBACK_RETRY_MS = 60 * 60 * 1000;
+
 // so users can drop a starter prompt into their vault with one click without
 // needing to download anything separately. Edit the source files in
 // prompts/ when these need updating, and re-paste here.
@@ -2385,6 +2394,11 @@ function dr_makeQuestion(text) {
         // day the phase begins (new moon / quarter day) — for "view or set
         // this phase's prompt" questions that write back to the arc note.
         phaseGateDayOnly: false,
+        // Shown in place of the prompt when phaseGateField is empty on the
+        // container's current note: the name of a token from the same
+        // boundary detector (e.g. a one-line description of the phase).
+        // Keeps the question from rendering blank before a prompt is set.
+        phaseGateFallbackToken: "",
         outputToField: false,
         outputFieldName: "",
         outputFieldType: "inline",
@@ -3073,6 +3087,10 @@ class DailyRitualModule {
             if (q.phaseGateField) {
                 const f = await this.findPRContainerCurrentNote(q.phaseGateContainerId);
                 value = await this.readFieldFromFileOrEmpty(f, q.phaseGateField);
+            }
+            if (!value && q.phaseGateFallbackToken) {
+                const v = data && data.tokens && data.tokens[q.phaseGateFallbackToken];
+                value = (v === null || v === undefined) ? "" : String(v);
             }
             return { value, hidden: false };
         }
@@ -4370,6 +4388,13 @@ class DailyRitualModule {
                             t.setPlaceholder("e.g. Training").setValue(q.phaseGateField || "")
                                 .onChange(async (v) => { q.phaseGateField = v.trim(); await this.saveSettings(); });
                         });
+                    new Setting(inputGroup)
+                        .setName("Fallback token")
+                        .setDesc("Shown instead when the prompt field is empty: the name of a token from the container's boundary detector (e.g. a one-line description of the phase). Leave blank to show nothing.")
+                        .addText((t) => {
+                            t.setPlaceholder("e.g. phaseChartLine").setValue(q.phaseGateFallbackToken || "")
+                                .onChange(async (v) => { q.phaseGateFallbackToken = v.trim(); await this.saveSettings(); });
+                        });
                 }
                 new Setting(inputGroup)
                     .setName("Text size")
@@ -4850,6 +4875,7 @@ class MonthlyRitualPlugin extends Plugin {
             if (q.skipIfNoInjectValue === undefined) q.skipIfNoInjectValue = false;
             if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
             if (q.phaseGateDayOnly === undefined) q.phaseGateDayOnly = false;
+            if (q.phaseGateFallbackToken === undefined) q.phaseGateFallbackToken = "";
             if (q.textSize === undefined) q.textSize = "h5";
             if (q.centerInjected === undefined) q.centerInjected = false;
             if (q.outputTargetMode === undefined) q.outputTargetMode = "active";
@@ -5950,11 +5976,22 @@ class MonthlyRitualPlugin extends Plugin {
         // 2. Main LLM aggregation (respects container.runLLMAt)
         const runLLMAt = container.runLLMAt || "both";
         const shouldRunLLM = runLLMAt === "both" || runLLMAt === phase;
+        let llmStatus = "";
         if (container.llmServiceId && container.systemPromptFile && !skipAutoLLM && shouldRunLLM) {
-            await this.runPRLLMAggregation(container, file, range, {
+            const res = await this.runPRLLMAggregation(container, file, range, {
                 ...opts,
                 includePreviousFrontmatter: true,
+                skipIfNoData: true,
             });
+            llmStatus = (res && res.status) || "failed";
+        }
+        // The summary didn't land (provider down, quota, empty reply). Leave
+        // the note un-marked so the catch-up write-back pass retries it —
+        // marking it done here is how summaries used to be lost for good.
+        if (llmStatus === "failed" || llmStatus === "empty") {
+            console.warn(`Periodic Ritual: ${container.name} — write-back on ${file.path} did not complete (LLM ${llmStatus}); will retry`);
+            if (!opts.silent) new Notice(`${container.name}: write-back did not complete — will retry later`);
+            return { file, done: false, status: llmStatus };
         }
         // 3. Legacy single alignments
         if (!skipAutoLLM) {
@@ -5976,10 +6013,13 @@ class MonthlyRitualPlugin extends Plugin {
         // data.json doesn't sync across devices; the vault does. A second
         // device seeing this marker will skip its own write-back even when
         // its local lastWriteBackEnd is stale.
-        await this.updatePRMetadataOnFile(file, container, { writeback: "true" });
+        // `nodata` records that the period was closed without a summary
+        // because nothing was logged in it (see skipIfNoData).
+        await this.updatePRMetadataOnFile(file, container,
+            llmStatus === "nodata" ? { writeback: "true", nodata: "true" } : { writeback: "true" });
 
         if (!opts.silent) new Notice(`${container.name}: write-back complete`);
-        return file;
+        return { file, done: true, status: llmStatus || "done" };
     }
 
     // Merge patchFields into the existing periodic-ritual metadata blob on
@@ -5997,8 +6037,14 @@ class MonthlyRitualPlugin extends Plugin {
 
         if (placement === "frontmatter") {
             try {
+                // Merge against the blob as it is ON DISK right now. The
+                // cache read above lags a write made moments ago (and is
+                // empty for a not-yet-indexed note); merging from it used
+                // to rewrite the blob as just the patch, dropping
+                // id/start/end ("periodic-ritual: writeback=true").
                 await this.app.fileManager.processFrontMatter(file, (fm) => {
-                    fm["periodic-ritual"] = blob;
+                    const live = this.parsePRMetadataBlob(fm["periodic-ritual"]);
+                    fm["periodic-ritual"] = live ? formatPRMetadataBlob({ ...live, ...patchFields }) : blob;
                 });
             } catch (e) {
                 console.error(`Periodic Ritual: failed to update PR frontmatter blob on ${file.path}`, e);
@@ -6154,7 +6200,7 @@ class MonthlyRitualPlugin extends Plugin {
         // Empty data sources is a valid state — the container has no
         // configured sources. Aggregation runs against an empty payload.
         if (sources.length === 0) {
-            return { count: 0, text: "(no data sources configured)", label: "no sources" };
+            return { count: 0, text: "(no data sources configured)", label: "no sources", hasData: false };
         }
 
         // Walk every configured source. Files are deduped by path so two
@@ -6197,8 +6243,14 @@ class MonthlyRitualPlugin extends Plugin {
         const sourceLabel = labelParts.length > 0 ? labelParts.join(" + ") : "daily notes";
 
         if (sourceFiles.length === 0) {
-            return { count: 0, text: `(no ${sourceLabel} in range)`, label: sourceLabel };
+            return { count: 0, text: `(no ${sourceLabel} in range)`, label: sourceLabel, hasData: false };
         }
+
+        // hasData: did any source note contribute a filled-in field? Blank
+        // values and bare template placeholders ("⋯") don't count. Lets
+        // write-back skip the LLM call for a period nothing was logged in.
+        const isBlank = (v) => /^[\s⋯…]*$/.test(String(v));
+        let dataLines = 0;
 
         const sections = [];
         for (const entry of sourceFiles) {
@@ -6234,15 +6286,17 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 if (v === null || v === undefined) continue;
                 if (typeof v === "object") continue;
                 lines.push(`${k}: ${v}`);
+                if (!isBlank(v)) dataLines++;
             }
             for (const [k, v] of Object.entries(inlineFields)) {
                 if (allow && !allow.includes(k)) continue;
                 lines.push(`${k}:: ${v}`);
+                if (!isBlank(v)) dataLines++;
             }
             sections.push(lines.join("\n"));
         }
 
-        return { count: sourceFiles.length, text: sections.join("\n\n---\n\n"), label: sourceLabel };
+        return { count: sourceFiles.length, text: sections.join("\n\n---\n\n"), label: sourceLabel, hasData: dataLines > 0 };
     }
 
     // Parse a Periodic Ritual metadata blob like
@@ -6518,15 +6572,20 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         this.lastPRLLMCall = payload;
     }
 
+    // Returns the outcome so write-back can tell "summary written" from
+    // "LLM call failed" (and not mark a failed period as done):
+    //   { status: "written" | "failed" | "empty" | "nodata" }
+    // Dry runs keep their own shape ({ parsed, responseText, … }).
     async runPRLLMAggregation(container, file, range, opts = {}) {
+        const failed = () => (opts.dryRun ? undefined : { status: "failed" });
         const service = this.getPRLLMService(container.llmServiceId);
         if (!service) {
             if (!opts.silent) new Notice(`${container.name}: LLM service not found`);
-            return;
+            return failed();
         }
         if (!service.model) {
             if (!opts.silent) new Notice(`${container.name}: LLM service "${service.name}" has no model selected`);
-            return;
+            return failed();
         }
 
         // Read the system prompt MD file — unless system prompts are
@@ -6542,12 +6601,12 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 const promptFile = this.app.vault.getAbstractFileByPath(container.systemPromptFile);
                 if (!promptFile || !(promptFile instanceof TFile)) {
                     if (!opts.silent) new Notice(`${container.name}: system prompt file not found: ${container.systemPromptFile}`);
-                    return;
+                    return failed();
                 }
                 systemPrompt = await this.app.vault.read(promptFile);
             } catch (e) {
                 if (!opts.silent) new Notice(`${container.name}: failed to read system prompt — ${e.message}`);
-                return;
+                return failed();
             }
         }
 
@@ -6571,6 +6630,16 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         // Build the source payload (daily notes by default, or another
         // PR container's notes when dataSource is set to container).
         const payload = await this.buildPRSourcePayload(container, range.start, range.end);
+
+        // Nothing was logged for this period: skip the call rather than
+        // have the model summarize an empty payload. Opt-in (write-back
+        // passes it); reflection runs carrying typed answers always proceed.
+        const hasAnswers = Array.isArray(opts.answers) && opts.answers.some(a => String(a || "").trim());
+        if (opts.skipIfNoData && !payload.hasData && !hasAnswers) {
+            console.log(`Periodic Ritual: ${container.name} — no source data for ${formatDate(range.start)} → ${formatDate(range.end)} (${payload.label}); skipping LLM aggregation`);
+            if (!opts.silent) new Notice(`${container.name}: no source data for this period — skipped`);
+            return opts.dryRun ? { parsed: {}, responseText: "", empty: true } : { status: "nodata" };
+        }
 
         // Compose the user message. Three optional sections beyond the
         // standard period header + daily notes:
@@ -6692,7 +6761,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         const provider = PROVIDERS[service.provider];
         if (!provider) {
             new Notice(`${container.name}: unknown provider "${service.provider}"`);
-            return;
+            return failed();
         }
 
         let responseText;
@@ -6741,12 +6810,12 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             // user needs to know if their key expired or rate limit hit.
             new Notice(`${container.name}: LLM call failed — ${e.message}`);
             console.error("Periodic Ritual LLM error:", e);
-            return;
+            return failed();
         }
 
         if (!responseText) {
             if (!opts.silent) new Notice(`${container.name}: LLM returned an empty response`);
-            return opts.dryRun ? { parsed: {}, responseText: "", empty: true } : undefined;
+            return opts.dryRun ? { parsed: {}, responseText: "", empty: true } : { status: "empty" };
         }
 
         // Parse YAML and merge into frontmatter
@@ -6754,7 +6823,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         const keys = Object.keys(parsed);
         if (keys.length === 0) {
             if (!opts.silent) new Notice(`${container.name}: LLM response had no fields to write`);
-            return opts.dryRun ? { parsed: {}, responseText, empty: true } : undefined;
+            return opts.dryRun ? { parsed: {}, responseText, empty: true } : { status: "empty" };
         }
 
         // Dry-run: do not mutate the file. Return the parsed keys so the
@@ -6769,9 +6838,11 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 for (const k of keys) fm[k] = parsed[k];
             });
             if (!opts.silent) new Notice(`${container.name}: wrote ${keys.length} field(s) from LLM`);
+            return { status: "written" };
         } catch (e) {
             if (!opts.silent) new Notice(`${container.name}: failed to write frontmatter — ${e.message}`);
             console.error("Periodic Ritual processFrontMatter error:", e);
+            return { status: "failed" };
         }
     }
 
@@ -8276,9 +8347,12 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             console.error(`Periodic Ritual: lastGeneratedEnd realign failed for ${container.name}`, e);
         }
 
-        // If lastGeneratedEnd is at or past the current period's end, we're
-        // up to date. Nothing to do.
-        if (lastEnd >= currentRange.end) return { created, wroteBack };
+        // If lastGeneratedEnd is at or past the current period's end, no
+        // note is due — but an earlier write-back may still be owed.
+        if (lastEnd >= currentRange.end) {
+            wroteBack += await this.runPRWriteBackPass(container, currentRange, now);
+            return { created, wroteBack };
+        }
 
         // Walk forward one period at a time, collecting period start dates.
         // In end mode, skip any period whose end is in the future.
@@ -8302,7 +8376,10 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             cursor = nextCursor;
         }
 
-        if (periodDates.length === 0) return { created, wroteBack };
+        if (periodDates.length === 0) {
+            wroteBack += await this.runPRWriteBackPass(container, currentRange, now);
+            return { created, wroteBack };
+        }
 
         console.log(`Periodic Ritual: ${container.name} — catch-up walking ${periodDates.length} period(s) from ${formatDate(periodDates[0])} (lastGeneratedEnd ${container.lastGeneratedEnd})`);
         for (const periodDate of periodDates) {
@@ -8310,80 +8387,128 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             if (result?.created) created++;
         }
 
-        // Write-back pass: if the container has writeBackAt set, check if
-        // there's an existing note for a period whose boundary has been
-        // crossed on the write-back side. For example, generateAt=start
-        // + writeBackAt=end means: when the period ENDS, re-run the
-        // pipeline on the already-existing note.
+        wroteBack += await this.runPRWriteBackPass(container, currentRange, now);
+        return { created, wroteBack };
+    }
+
+    // Write-back pass for one container (writeBackAt set): re-run the
+    // pipeline on already-existing notes whose period has ended — e.g.
+    // generateAt=start + writeBackAt=end means the note is created when the
+    // period opens and summarized when it closes.
+    //
+    // Runs on EVERY catch-up pass, not only the one that crosses a boundary,
+    // and looks back over the last PR_WRITEBACK_LOOKBACK ended periods
+    // (oldest first, so a later period's sources are filled before it runs).
+    // Together with writeBackToPRContainerNote not marking a failed run as
+    // done, that makes a missed summary self-healing: it stays owed until it
+    // lands. Returns the number of notes actually summarized.
+    //
+    // What counts as done, per note:
+    //   - the note's own stamp (`writeback=true` in its periodic-ritual
+    //     blob). It lives in the vault, so it syncs and is authoritative
+    //     whenever the note carries an intact stamp (`id` matches).
+    //     Removing `writeback=true` from a note is how to ask for a redo.
+    //   - local lastWriteBackEnd, only for the nearest period and only when
+    //     the note has no usable stamp (metadataPlacement "none", or a
+    //     blob that lost its id).
+    // Older periods are retried solely on the strength of an intact stamp,
+    // so pre-existing or hand-made notes are never swept up.
+    async runPRWriteBackPass(container, currentRange, now) {
         const writeBackAt = container.writeBackAt || "";
-        if (writeBackAt) {
-            // Find the most recently ENDED period that has an existing note
-            // but may not have been written back to yet. We use a simple
-            // heuristic: if the current period has ended (or is the one we
-            // just generated), check if its note exists and run the write-back.
-            try {
-                // Check the previous period (just ended)
-                const prevDate = addDays(currentRange.start, -1);
-                const prevRange = await this.getPRBoundaryData(container.boundaryDetector, prevDate);
-                if (prevRange && prevRange.end < now) {
-                    const prevEndStr = formatDate(prevRange.end);
-                    const prevFileName = this.resolveTokens(container.naming, prevRange.tokens);
-                    const prevFolder = container.saveDir || "";
-                    const prevPath = prevFolder ? `${prevFolder}/${prevFileName}.md` : `${prevFileName}.md`;
-                    const prevFile = this.app.vault.getAbstractFileByPath(prevPath);
+        if (!writeBackAt) return 0;
+        let wroteBack = 0;
+        try {
+            // Collect the ended periods, newest first, then run oldest first.
+            const periods = [];
+            let probe = addDays(currentRange.start, -1);
+            for (let i = 0; i < PR_WRITEBACK_LOOKBACK; i++) {
+                let range = null;
+                try {
+                    range = await this.getPRBoundaryData(container.boundaryDetector, probe);
+                } catch (e) {
+                    // Nearest period: let the outer handler log it. Older
+                    // ones (e.g. a detector whose data window doesn't reach
+                    // that far back) just end the lookback.
+                    if (i === 0) throw e;
+                    break;
+                }
+                if (!range || !(range.end < now)) break;
+                periods.unshift({ range, nearest: i === 0 });
+                const nextProbe = addDays(range.start, -1);
+                if (!(nextProbe < probe)) break;
+                probe = nextProbe;
+            }
 
-                    if (prevFile && prevFile instanceof TFile) {
-                        // Three-source guard: local lastWriteBackEnd (in data.json),
-                        // the note's writeback="true" marker (set at the end of
-                        // a successful run), AND the note's writebackStartedAt
-                        // timestamp (set at the start of any run). The last one
-                        // is what handles the multi-device race: if device A is
-                        // mid-run, device B sees the started-at timestamp and
-                        // bails so it doesn't fire its own concurrent write-back
-                        // that would overwrite A's result on completion.
-                        const noteMeta = await this.readPRMetadataFromFile(prevFile, container);
-                        const noteSaysDone = noteMeta?.writeback === "true";
-                        const localSaysDone = container.lastWriteBackEnd === prevEndStr;
+            if (!this._prWriteBackTriedAt) this._prWriteBackTriedAt = new Map();
+            for (const { range, nearest } of periods) {
+                const endStr = formatDate(range.end);
+                const file = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, range));
+                if (!(file instanceof TFile)) continue;
 
-                        // Skip if another device started write-back recently
-                        // (within PR_WRITEBACK_LOCK_MS). Orphaned starts older
-                        // than the lock window are ignored so the next device
-                        // can take over after a crash / disconnect.
-                        const startedAtStr = noteMeta?.writebackStartedAt;
-                        let anotherDeviceInProgress = false;
-                        if (startedAtStr) {
-                            const startedAtMs = Date.parse(startedAtStr);
-                            if (Number.isFinite(startedAtMs) && (Date.now() - startedAtMs) < PR_WRITEBACK_LOCK_MS) {
-                                anotherDeviceInProgress = true;
-                            }
-                        }
+                // Three signals: the note's writeback="true" marker (set at
+                // the end of a successful run), local lastWriteBackEnd (in
+                // data.json), and the note's writebackStartedAt timestamp
+                // (set at the start of any run). The last one handles the
+                // multi-device race: if device A is mid-run, device B sees
+                // the started-at timestamp and bails so it doesn't fire its
+                // own concurrent write-back that would overwrite A's result.
+                const noteMeta = await this.readPRMetadataFromFile(file, container);
+                const stamped = !!(noteMeta && noteMeta.id === container.id);
+                if (!nearest && !stamped) continue;
+                const noteSaysDone = noteMeta?.writeback === "true";
+                const localSaysDone = container.lastWriteBackEnd === endStr;
 
-                        if (localSaysDone || noteSaysDone) {
-                            // If the note says done but our local state is
-                            // stale (another device ran it), catch local up so
-                            // we don't re-enter this branch on every reload.
-                            if (noteSaysDone && !localSaysDone) {
-                                container.lastWriteBackEnd = prevEndStr;
-                                await this.saveSettings();
-                            }
-                        } else if (anotherDeviceInProgress) {
-                            console.log(`Periodic Ritual: skipping write-back for ${prevFile.path} — another device started at ${startedAtStr}`);
-                        } else {
-                            const shouldWriteBack = (writeBackAt === "end" && prevRange.end < now)
-                                || (writeBackAt === "start" && prevRange.start <= now);
-                            if (shouldWriteBack) {
-                                await this.writeBackToPRContainerNote(container, prevFile, prevRange, { silent: true });
-                                wroteBack++;
-                            }
-                        }
+                if (noteSaysDone || (localSaysDone && !stamped)) {
+                    // If the note says done but our local state is stale
+                    // (another device ran it), catch local up.
+                    if (nearest && noteSaysDone && !localSaysDone) {
+                        container.lastWriteBackEnd = endStr;
+                        await this.saveSettings();
+                    }
+                    continue;
+                }
+
+                // Hold off if a run started recently (within
+                // PR_WRITEBACK_LOCK_MS) — another device, or our own attempt
+                // that just failed — or if we already tried this note within
+                // the retry window. Orphaned starts older than the lock
+                // window are ignored so the next pass can take over after a
+                // crash / disconnect. Either way STOP here rather than skip
+                // ahead: later periods wait for this one (oldest first), and
+                // a failing provider gets one attempt per pass, not one per
+                // owed note.
+                const startedAtStr = noteMeta?.writebackStartedAt;
+                if (startedAtStr) {
+                    const startedAtMs = Date.parse(startedAtStr);
+                    if (Number.isFinite(startedAtMs) && (Date.now() - startedAtMs) < PR_WRITEBACK_LOCK_MS) {
+                        console.log(`Periodic Ritual: holding write-back for ${file.path} — a run started at ${startedAtStr}`);
+                        break;
                     }
                 }
-            } catch (e) {
-                console.error(`Periodic Ritual: write-back check failed for ${container.name}`, e);
-            }
-        }
+                const triedAt = this._prWriteBackTriedAt.get(file.path) || 0;
+                if (Date.now() - triedAt < PR_WRITEBACK_RETRY_MS) break;
 
-        return { created, wroteBack };
+                const shouldWriteBack = (writeBackAt === "end" && range.end < now)
+                    || (writeBackAt === "start" && range.start <= now);
+                if (!shouldWriteBack) continue;
+
+                this._prWriteBackTriedAt.set(file.path, Date.now());
+                const res = await this.writeBackToPRContainerNote(container, file, range, { silent: true });
+                if (!res || !res.done) {
+                    // Provider trouble — later periods would fail the same
+                    // way, and their sources may depend on this one.
+                    break;
+                }
+                this._prWriteBackTriedAt.delete(file.path);
+                if (res.status !== "nodata") wroteBack++;
+                // Let metadataCache index what was just written before a
+                // later period (or a dependent container) reads it as a source.
+                await new Promise(r => setTimeout(r, 1500));
+            }
+        } catch (e) {
+            console.error(`Periodic Ritual: write-back check failed for ${container.name}`, e);
+        }
+        return wroteBack;
     }
 
     // ─── Field pipeline ───
@@ -8941,7 +9066,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             return;
         }
         const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
-            const file = await this.findMostRecentPRContainerNote(container);
+            let file = await this.findMostRecentPRContainerNote(container);
             if (!file) {
                 new Notice(`${container.name}: no existing note to write back to.`);
                 return;
@@ -8949,7 +9074,22 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             // Derive the period range from the note's own metadata blob so
             // we run against the period that note actually represents, not
             // whatever today's boundary detector says.
-            const meta = await this.readPRMetadataFromFile(file, container);
+            let meta = await this.readPRMetadataFromFile(file, container);
+            // With generateAt=start the most recent note is the period still
+            // in progress. A write-back "at end" belongs to the period that
+            // just closed, so step back to the previous note — running it on
+            // the open period summarizes a near-empty span and marks the
+            // unfinished period as done.
+            const stillOpen = meta && meta.end && parseDateKeyLocal(meta.end) >= startOfDay(new Date());
+            if (stillOpen && (container.writeBackAt || "end") !== "start") {
+                const prev = await this.findPreviousPRContainerNote(container);
+                if (!prev) {
+                    new Notice(`${container.name}: the current period hasn't ended and there is no earlier note to write back to.`);
+                    return;
+                }
+                file = prev;
+                meta = await this.readPRMetadataFromFile(file, container);
+            }
             if (!meta || !meta.start || !meta.end) {
                 new Notice(`${container.name}: couldn't read periodic-ritual metadata from ${file.path}.`);
                 return;
