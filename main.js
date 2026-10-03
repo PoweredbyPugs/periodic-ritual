@@ -8,6 +8,20 @@ function escapeRegex(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Parse a note's leading YAML frontmatter block from raw content. Returns a
+// plain object, or null when there is no block / it fails to parse. Used
+// where metadataCache may not have re-indexed a write we just made.
+function parseRawFrontmatter(content) {
+    const m = String(content || "").match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+    if (!m) return null;
+    try {
+        const parsed = parseYaml(m[1]);
+        return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 function parseDateFromFilename(name) {
     const cleaned = name
         .replace(/\.md$/, "")
@@ -1503,7 +1517,7 @@ const DEFAULT_SETTINGS = {
     prSystemPromptsGlobalEnabled: true,
     prFrameworksGlobalEnabled: true,
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
-    prWaitForSyncBeforeGenerate: false, // hold auto-generate until Obsidian Sync settles (multi-device)
+    prWaitForSyncBeforeGenerate: true, // hold startup generation until Obsidian Sync settles (multi-device); no-op when Sync is off
     prGraphLayout: {},         // { [nodeId]: { x, y } } — node positions in the graph view
 };
 
@@ -2366,6 +2380,11 @@ function dr_makeQuestion(text) {
         phaseGateContainerId: "",
         phaseGatePhase: "",
         phaseGateField: "",
+        // Phase-day only: additionally require the detector's
+        // `practiceStartsToday` token, so the question shows once, on the
+        // day the phase begins (new moon / quarter day) — for "view or set
+        // this phase's prompt" questions that write back to the arc note.
+        phaseGateDayOnly: false,
         outputToField: false,
         outputFieldName: "",
         outputFieldType: "inline",
@@ -3037,14 +3056,19 @@ class DailyRitualModule {
             const container = this.findContainerById(q.phaseGateContainerId);
             if (!container) return { value: "", hidden: true };
             let phase = "";
+            let data = null;
             try {
-                const data = await this.plugin.getPRBoundaryData(container.boundaryDetector, new Date());
+                data = await this.plugin.getPRBoundaryData(container.boundaryDetector, new Date());
                 phase = String((data && data.tokens && data.tokens.practice) || "");
             } catch (e) {
                 console.error("Daily Ritual: phase-gate detector failed", e);
                 return { value: "", hidden: true };
             }
             if (phase !== q.phaseGatePhase) return { value: "", hidden: true };
+            if (q.phaseGateDayOnly) {
+                const startsToday = String((data && data.tokens && data.tokens.practiceStartsToday) || "");
+                if (startsToday !== "true") return { value: "", hidden: true };
+            }
             let value = "";
             if (q.phaseGateField) {
                 const f = await this.findPRContainerCurrentNote(q.phaseGateContainerId);
@@ -3411,18 +3435,22 @@ class DailyRitualModule {
         return best;
     }
 
-    // Called once on Obsidian start (after layout is ready). No-ops if the
-    // toggle is off or the modal already ran today (gate uses YYYY-MM-DD
-    // string compare against settings.lastAlignmentRunDate). Marks the
-    // gate satisfied BEFORE opening so dismissing without submitting still
-    // counts — otherwise a closed modal would re-pester on next reload
-    // that day. Manual command invocation ignores the gate.
+    // Called on Obsidian start (after layout is ready) and again when the
+    // local date rolls over while Obsidian stays open (see
+    // MonthlyRitualPlugin.scheduleMidnightRitual). No-ops if the toggle is
+    // off or the alignment was COMPLETED today (gate uses YYYY-MM-DD string
+    // compare against settings.lastAlignmentRunDate, which is stamped only
+    // by the modal's submit path — including the "nothing to ask" auto-
+    // submit). Dismissing without finishing does NOT satisfy the gate: the
+    // ritual re-opens on every launch that day until it is finished, and
+    // the persisted alignmentDraft resumes it mid-sequence. (An earlier
+    // version stamped the gate before opening; a crash inside open then
+    // silently burned the whole day.) Manual command invocation ignores
+    // the gate.
     async maybeOpenAlignmentOnStartup() {
         if (!this.settings.openAlignmentOnStartup) return;
         if (this.settings.lastAlignmentRunDate === dr_todayDateString()) return;
         if (!(this.settings.alignmentQuestions || []).length) return;
-        this.settings.lastAlignmentRunDate = dr_todayDateString();
-        await this.saveSettings();
         await this.openAlignment();
     }
 
@@ -3851,7 +3879,7 @@ class DailyRitualModule {
             });
         new Setting(containerEl)
             .setName("Open Daily Alignment on Obsidian start")
-            .setDesc("Auto-opens the alignment modal once per day shortly after Obsidian load. Skipped if already run today.")
+            .setDesc("Auto-opens the alignment modal shortly after Obsidian loads, and again at local midnight if Obsidian stays open into a new day. Keeps re-opening on every launch that day until the alignment is finished; closing it early saves a draft that resumes where you left off. Skipped once completed for the day.")
             .addToggle((t) => {
                 t.setValue(!!this.settings.openAlignmentOnStartup).onChange(async (v) => {
                     this.settings.openAlignmentOnStartup = v; await this.saveSettings();
@@ -4328,6 +4356,14 @@ class DailyRitualModule {
                                 .onChange(async (v) => { q.phaseGatePhase = v.trim(); await this.saveSettings(); });
                         });
                     new Setting(inputGroup)
+                        .setName("Phase-day only")
+                        .setDesc("Show only on the day the phase begins (the detector's `practiceStartsToday` token), not for the whole phase. Pair with an output target of the container's current note to set that phase's prompt once, on its day; a blank answer leaves the field as is.")
+                        .addToggle((t) => {
+                            t.setValue(!!q.phaseGateDayOnly).onChange(async (v) => {
+                                q.phaseGateDayOnly = v; await this.saveSettings();
+                            });
+                        });
+                    new Setting(inputGroup)
                         .setName("Prompt field")
                         .setDesc("Field on the container's current note to show as the prompt (inline first, then frontmatter). Leave blank for no injected prompt.")
                         .addText((t) => {
@@ -4622,19 +4658,19 @@ class MonthlyRitualPlugin extends Plugin {
         this.registerView(PR_GRAPH_VIEW_TYPE, (leaf) => new PRGraphView(leaf, this));
         this.addRibbonIcon("git-fork", "Periodic Ritual Graph", () => this.activatePRGraphView());
 
-        // Phase 3: auto-generation on load. Boundary-driven catch-up for any
-        // enabled Periodic Ritual containers whose periods have crossed since
-        // the last run. Deferred ~2 seconds so other plugins (Moon Phase /
-        // Helios) finish initializing first — boundary detectors in later
-        // phases will depend on them.
+        // Startup sequence. Runs once, ~2s after load so other plugins
+        // (Moon Phase / Helios) finish initializing first, and strictly in
+        // order behind the multi-device sync gate — see runStartupSequence.
+        setTimeout(() => {
+            this.runStartupSequence().catch(e => {
+                console.error("Periodic Ritual: startup sequence failed", e);
+            });
+        }, 2000);
+
+        // Phase 3: boundary-driven catch-up. Also poll every 10 minutes so
+        // boundaries crossed while Obsidian stays open (e.g. midnight into a
+        // new week) still trigger catch-up.
         if (this.settings.prAutoGenerateOnLoad) {
-            setTimeout(() => {
-                this.runPRAutoGenerate().catch(e => {
-                    console.error("Periodic Ritual: auto-generate failed", e);
-                });
-            }, 2000);
-            // Also poll every 10 minutes so boundaries crossed while Obsidian
-            // stays open (e.g. midnight into a new week) still trigger catch-up.
             this.registerInterval(window.setInterval(() => {
                 this.runPRAutoGenerate().catch(e => {
                     console.error("Periodic Ritual: interval auto-generate failed", e);
@@ -4642,35 +4678,106 @@ class MonthlyRitualPlugin extends Plugin {
             }, 10 * 60 * 1000));
         }
 
-        // Daily Ritual: optional auto-open of the morning Alignment modal.
-        // Deferred behind onLayoutReady so an active file (the daily note)
-        // is available, and behind a small extra delay so PR auto-generate
-        // (above) can finish stamping `lastGeneratedEnd` on any container
-        // that crossed today — otherwise `container-recent-crossing` and
-        // freshness-skip predicates wouldn't see today's transits yet.
-        this.app.workspace.onLayoutReady(() => {
-            setTimeout(() => {
-                this.dailyRitual.maybeOpenAlignmentOnStartup().catch(e => {
-                    console.error("Daily Ritual: alignment auto-open failed", e);
-                });
-            }, 3000);
-        });
-
         // Daily Ritual: optional background creation of today's daily note
-        // when the day boundary crosses. Same shape as PR auto-generate —
-        // 2s deferred initial check + 10-minute interval so midnight while
+        // when the day boundary crosses. 10-minute interval so midnight while
         // Obsidian stays open is caught within 10 minutes.
         if (this.settings.dailyRitual?.autoGenerateDailyNote) {
-            setTimeout(() => {
-                this.dailyRitual.ensureTodaysDailyNote().catch(e => {
-                    console.error("Daily Ritual: daily-note auto-generate failed", e);
-                });
-            }, 2000);
             this.registerInterval(window.setInterval(() => {
                 this.dailyRitual.ensureTodaysDailyNote().catch(e => {
                     console.error("Daily Ritual: interval daily-note auto-generate failed", e);
                 });
             }, 10 * 60 * 1000));
+        }
+    }
+
+    // Everything that fires automatically at launch, in dependency order:
+    //   1. Sync gate (waitForVaultSync) — no-op unless the setting is on
+    //      and Obsidian Sync is enabled. Holds until Sync's first pass this
+    //      session completes so notes another device already generated are
+    //      on disk BEFORE anything below decides whether to create them.
+    //   2. Periodic Ritual boundary catch-up (runPRAutoGenerate).
+    //   3. Daily Ritual: today's daily note (ensureTodaysDailyNote).
+    //   4. Daily Ritual: morning Alignment modal — after layout is ready
+    //      (needs an active file) and after 2/3, because its
+    //      `container-recent-crossing` / freshness predicates read the
+    //      lastGeneratedEnd stamped in step 2 and its run target is the
+    //      daily note from step 3.
+    // Previously 2/3/4 ran on independent 2s/2s/3s timers, so on a device
+    // that woke after another had already crossed a boundary, 2 and 3
+    // raced Sync and recreated notes (duplicates, "changes on disk are
+    // newer" conflicts), and 4 could open before 2 finished.
+    async runStartupSequence() {
+        const s = this.settings;
+        const wantsPR = !!s.prAutoGenerateOnLoad;
+        const wantsDaily = !!s.dailyRitual?.autoGenerateDailyNote;
+        const wantsAlign = !!s.dailyRitual?.openAlignmentOnStartup;
+        if (!wantsPR && !wantsDaily && !wantsAlign) return;
+
+        try {
+            await this.waitForVaultSync();
+        } catch (e) {
+            console.error("Periodic Ritual: sync gate failed; proceeding", e);
+        }
+        if (wantsPR) {
+            try {
+                await this.runPRAutoGenerate();
+            } catch (e) {
+                console.error("Periodic Ritual: auto-generate failed", e);
+            }
+        }
+        if (wantsDaily) {
+            try {
+                await this.dailyRitual.ensureTodaysDailyNote();
+            } catch (e) {
+                console.error("Daily Ritual: daily-note auto-generate failed", e);
+            }
+        }
+        if (wantsAlign) {
+            await new Promise(resolve => this.app.workspace.onLayoutReady(resolve));
+            try {
+                await this.dailyRitual.maybeOpenAlignmentOnStartup();
+            } catch (e) {
+                console.error("Daily Ritual: alignment auto-open failed", e);
+            }
+        }
+        this.scheduleMidnightRitual();
+    }
+
+    // Day rollover while Obsidian stays open. The startup sequence only
+    // runs once per launch, so a session that spans local midnight would
+    // otherwise get its boundary notes from the 10-minute interval but
+    // never the morning Alignment modal. One-shot timer armed for the next
+    // local midnight (+5s of slack so the date has definitely changed),
+    // re-armed after each firing (same shape as RitualCalendarView's
+    // scheduleMidnightRefresh), cleared in onunload. Runs steps 2-4 of the
+    // startup sequence in order; if the interval already started the
+    // boundary walk, runPRAutoGenerate joins it rather than racing it.
+    scheduleMidnightRitual() {
+        if (this._midnightRitualTimer) clearTimeout(this._midnightRitualTimer);
+        const now = new Date();
+        const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
+        const delay = Math.max(1000, next.getTime() - now.getTime());
+        this._midnightRitualTimer = setTimeout(() => {
+            this._midnightRitualTimer = null;
+            this.runMidnightRitual()
+                .catch(e => console.error("Periodic Ritual: midnight ritual failed", e))
+                .finally(() => this.scheduleMidnightRitual());
+        }, delay);
+    }
+
+    async runMidnightRitual() {
+        const s = this.settings;
+        if (s.prAutoGenerateOnLoad) {
+            try { await this.runPRAutoGenerate(); }
+            catch (e) { console.error("Periodic Ritual: midnight auto-generate failed", e); }
+        }
+        if (s.dailyRitual?.autoGenerateDailyNote) {
+            try { await this.dailyRitual.ensureTodaysDailyNote(); }
+            catch (e) { console.error("Daily Ritual: midnight daily-note auto-generate failed", e); }
+        }
+        if (s.dailyRitual?.openAlignmentOnStartup) {
+            try { await this.dailyRitual.maybeOpenAlignmentOnStartup(); }
+            catch (e) { console.error("Daily Ritual: midnight alignment auto-open failed", e); }
         }
     }
 
@@ -4695,6 +4802,13 @@ class MonthlyRitualPlugin extends Plugin {
         const leaf = this.app.workspace.getLeaf(true);
         await leaf.setViewState({ type: PR_GRAPH_VIEW_TYPE, active: true });
         this.app.workspace.revealLeaf(leaf);
+    }
+
+    onunload() {
+        if (this._midnightRitualTimer) {
+            clearTimeout(this._midnightRitualTimer);
+            this._midnightRitualTimer = null;
+        }
     }
 
     async loadSettings() {
@@ -4735,6 +4849,7 @@ class MonthlyRitualPlugin extends Plugin {
             if (q.varAlignmentOutputKey === undefined) q.varAlignmentOutputKey = "";
             if (q.skipIfNoInjectValue === undefined) q.skipIfNoInjectValue = false;
             if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
+            if (q.phaseGateDayOnly === undefined) q.phaseGateDayOnly = false;
             if (q.textSize === undefined) q.textSize = "h5";
             if (q.centerInjected === undefined) q.centerInjected = false;
             if (q.outputTargetMode === undefined) q.outputTargetMode = "active";
@@ -5919,14 +6034,25 @@ class MonthlyRitualPlugin extends Plugin {
     //      want it back, re-add it manually or re-create the note.
     async propagatePRFrontmatterToBody(file) {
         if (!file) return;
-        const cache = this.app.metadataCache.getFileCache(file);
-        const fm = cache?.frontmatter || {};
+        let content = await this.app.vault.read(file);
+
+        // Read the frontmatter from the RAW file, not from metadataCache.
+        // This runs immediately after processFrontMatter writes the LLM
+        // output, and the cache usually hasn't re-indexed yet — so keys
+        // written moments ago (arc_summary, mPlus, …) were missing from
+        // the key list and their `key::` lines in the body stayed empty
+        // while the frontmatter had the value. The cache is only a
+        // fallback for a note whose frontmatter block fails to parse.
+        let fm = parseRawFrontmatter(content);
+        if (!fm) {
+            const cache = this.app.metadataCache.getFileCache(file);
+            fm = cache?.frontmatter || {};
+        }
         const keys = Object.keys(fm).filter(k =>
             k !== "periodic-ritual" && k !== "position" && !k.startsWith("pr-")
         );
         if (keys.length === 0) return;
 
-        let content = await this.app.vault.read(file);
         let changed = false;
 
         for (const k of keys) {
@@ -5934,10 +6060,15 @@ class MonthlyRitualPlugin extends Plugin {
             if (v === null || v === undefined) continue;
             const valStr = typeof v === "object" ? JSON.stringify(v) : String(v);
 
-            // 1. Inline field replacement: `key:: old` → `key:: new`
+            // 1. Inline field replacement: `key:: old` → `key:: new`.
+            // Inline (dataview) fields are single-line, and the regex only
+            // ever rewrites one line, so a multi-line value (block scalar
+            // from the LLM) is flattened to one line here; the full text
+            // lives in frontmatter and in any {{pr:key}} marker.
+            const inlineVal = valStr.replace(/\s*\r?\n\s*/g, " ").trim();
             const inlineRe = new RegExp(`^(${escapeRegex(k)}::)[ \\t]*(.*)$`, "m");
             if (inlineRe.test(content)) {
-                content = content.replace(inlineRe, `$1 ${valStr}`);
+                content = content.replace(inlineRe, () => `${k}:: ${inlineVal}`); // fn replacer: no $-pattern expansion of LLM text
                 changed = true;
             }
 
@@ -7802,28 +7933,34 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
 
     // ─── Periodic Ritual reflection (Phase 6) ───
 
-    // Walk all enabled containers and catch each one up to the current period.
-    // Called from onload when prAutoGenerateOnLoad is true, or manually via
-    // the "Catch up missed notes" command.
+    // Multi-device gate: hold startup generation until Obsidian Sync has
+    // finished its first full pass this session, so a device that wakes
+    // after another already generated a boundary sees the synced note (and
+    // lastGeneratedEnd) and the idempotency guards short-circuit instead of
+    // regenerating. Sync is an INTERNAL plugin with no public API; this
+    // reads it defensively and ALWAYS falls back to proceeding (timeout,
+    // stall, absence, disabled, paused, error, unfamiliar shape) — startup
+    // must never hang on it.
     //
-    // Phase 8c: containers are processed in topological order based on
-    // dataSource dependencies. If container A reads from container B
-    // (A.dataSource = container:B), B must generate its current note
-    // BEFORE A so A's auto-LLM can find the fresh source data. The sort
-    // walks the dependency graph and processes leaves (sources) first.
-    // Best-effort gate: hold auto-generation until Obsidian Sync has finished
-    // pulling remote changes. Obsidian Sync is an INTERNAL plugin with no
-    // public API, so this reads its status defensively and ALWAYS falls back
-    // to proceeding (on timeout, absence, disable, pause, error, or an
-    // unfamiliar status shape) — auto-generate must never hang waiting on it.
+    // Two signals (verified against Obsidian 1.13.x):
+    //   - instance.getStatus(): enum derived from the plugin's own fields —
+    //     "uninitialized" | "disconnected" | "paused" | "syncing" |
+    //     "synced" | "error". `syncing` is the real in-progress flag.
+    //   - instance.syncStatus: free-text status-bar label. Goes "" →
+    //     "Initializing..." → "Connecting to server" → "Indexing..." /
+    //     "Comparing X" / per-file labels → "Fully synced".
+    // getStatus() reads "synced" for a moment between init and the first
+    // pass on launch (initialized + vaultId + !syncing), so "settled" also
+    // requires the label to read "Fully synced", or a syncing→synced
+    // transition observed during this wait. A stall watchdog covers the
+    // offline case, where the label sticks on "Connecting to server" and
+    // `syncing` never flips.
     //
-    // Why it matters (multi-device): without the gate, a device that wakes
-    // after another already generated a boundary re-runs the whole pipeline
-    // before Sync delivers the existing note + lastGeneratedEnd, producing
-    // duplicate work, a notification burst per device, and "changes on disk
-    // are newer" conflicts. Waiting for Sync lets this device's existing
-    // idempotency guards ("already exists" / "up to date") short-circuit.
-    async waitForVaultSync(maxWaitMs = 90000) {
+    // (An earlier version keyword-matched only the free-text label; none of
+    // its keywords matched the launch-time values "", "Initializing...",
+    // "Uninitialized" or "Comparing …", so it released before Sync had even
+    // connected — the exact race it was meant to close.)
+    async waitForVaultSync(maxWaitMs = 90000, stallMs = 25000) {
         if (!this.settings.prWaitForSyncBeforeGenerate) return;
         let syncPlugin = null;
         try {
@@ -7833,34 +7970,81 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         } catch (e) { syncPlugin = null; }
         const instance = syncPlugin?.instance;
         if (!syncPlugin?.enabled || !instance) return; // Sync off/absent → nothing to wait for.
+        // Unfamiliar shape (neither the enum getter nor the raw flag) → don't
+        // guess, don't wait.
+        if (typeof instance.getStatus !== "function" && typeof instance.syncing !== "boolean") {
+            console.warn("Periodic Ritual: sync-gate found no recognizable Sync status API; skipping wait");
+            return;
+        }
 
-        const readStatus = () => {
+        const readEnum = () => {
             try {
-                const raw = instance.syncStatus ?? instance.getStatus?.() ?? instance.status ?? "";
-                return String(raw).toLowerCase();
+                if (typeof instance.getStatus === "function") return String(instance.getStatus() ?? "").toLowerCase();
+                if (instance.syncing) return "syncing";
+                if (instance.pause) return "paused";
+                if (instance.initialized === false) return "uninitialized";
+                return "synced";
             } catch (e) { return ""; }
         };
-        // Substrings that indicate Sync is still working. Deliberately avoid
-        // the bare word "sync" — the SETTLED status "fully synced" contains
-        // it; match the progressive "synchroniz(ing)" form instead.
-        const BUSY = ["synchroniz", "connect", "download", "upload", "scan", "pull", "queue", "process", "index", "wait"];
-        const isBusy = () => { const s = readStatus(); return BUSY.some(m => s.includes(m)); };
+        const readLabel = () => {
+            try { return String(instance.syncStatus ?? "").toLowerCase(); } catch (e) { return ""; }
+        };
         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
         const start = Date.now();
+        let sawSyncing = false;
+        let lastSig = null;
+        let lastChangeAt = start;
+        let releasedVia = null;
         while (Date.now() - start < maxWaitMs) {
-            if (!isBusy()) {
-                // Debounce: Sync can read idle briefly between batches, so
-                // confirm it's still idle a beat later before proceeding.
-                await sleep(1500);
-                if (!isBusy()) return;
-            } else {
-                await sleep(1500);
+            const status = readEnum();
+            const label = readLabel();
+            const sig = `${status}|${label}`;
+            if (sig !== lastSig) { lastSig = sig; lastChangeAt = Date.now(); }
+            if (status === "syncing") sawSyncing = true;
+
+            // Nothing is coming: not linked to a remote vault, user paused
+            // Sync, or it errored out.
+            if (status === "paused" || status === "error" || status === "disconnected") {
+                releasedVia = status;
+                break;
             }
+            if (status === "synced" && (sawSyncing || label.includes("fully synced"))) {
+                // Debounce: Sync idles briefly between batches — confirm it
+                // is still idle a beat later before releasing.
+                await sleep(1500);
+                if (readEnum() !== "syncing") {
+                    releasedVia = sawSyncing ? "pass completed" : "already fully synced";
+                    break;
+                }
+                continue;
+            }
+            // Stall watchdog: not mid-pass and nothing has changed for a
+            // while (offline / stuck connecting / never initializes).
+            if (status !== "syncing" && (Date.now() - lastChangeAt) >= stallMs) {
+                releasedVia = `stalled at "${sig}"`;
+                break;
+            }
+            await sleep(500);
         }
-        console.warn(`Periodic Ritual: sync-gate timed out after ${Math.round(maxWaitMs / 1000)}s; proceeding with auto-generate`);
+        const waited = (Math.round((Date.now() - start) / 100) / 10).toFixed(1);
+        if (releasedVia) {
+            console.log(`Periodic Ritual: sync-gate released after ${waited}s (${releasedVia})`);
+        } else {
+            console.warn(`Periodic Ritual: sync-gate timed out after ${waited}s (last status "${lastSig}"); proceeding with auto-generate`);
+        }
     }
 
+    // Walk all enabled containers and catch each one up to the current period.
+    // Called from runStartupSequence when prAutoGenerateOnLoad is true, from
+    // the 10-minute interval, or manually via the "Catch up missed notes"
+    // command.
+    //
+    // Phase 8c: containers are processed in topological order based on
+    // dataSource dependencies. If container A reads from container B
+    // (A.dataSource = container:B), B must generate its current note
+    // BEFORE A so A's auto-LLM can find the fresh source data. The sort
+    // walks the dependency graph and processes leaves (sources) first.
     async runPRAutoGenerate() {
         const all = (this.settings.prContainers || []).filter(c => c.enabled);
         if (all.length === 0) {
@@ -7869,7 +8053,28 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             console.log("Periodic Ritual: no enabled containers");
             return;
         }
+        // Single-flight on this device: the startup pass can sit behind the
+        // sync gate and then run LLM write-backs for minutes, so the 10-min
+        // interval (or the command) must not start a second overlapping walk
+        // that would race it on lastGeneratedEnd / write-back.
+        // A concurrent caller (the midnight ritual, the command) awaits the
+        // in-flight walk so whatever it does next (open the Alignment
+        // modal) sees the fresh notes and lastGeneratedEnd stamps.
+        if (this._prAutoGenPromise) {
+            console.log("Periodic Ritual: auto-generate already running on this device; joining the in-flight run");
+            return this._prAutoGenPromise;
+        }
+        this._prAutoGenPromise = (async () => {
+            try {
+                await this.runPRAutoGenerateInner(all);
+            } finally {
+                this._prAutoGenPromise = null;
+            }
+        })();
+        return this._prAutoGenPromise;
+    }
 
+    async runPRAutoGenerateInner(all) {
         // Multi-device gate (no-op unless the setting is on and Sync is busy).
         await this.waitForVaultSync();
 
@@ -15819,7 +16024,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Wait for sync before generating")
-            .setDesc("For multi-device vaults on Obsidian Sync. When on, auto-generate holds until Sync finishes pulling remote changes, so a device that wakes after another already generated a period sees the synced notes and skips the work — instead of every device redundantly regenerating (which causes duplicate notifications and \"changes on disk are newer\" conflicts). Best enabled on secondary machines; harmless if Sync is off. Falls back to running after a timeout so generation never hangs.")
+            .setDesc("For multi-device vaults on Obsidian Sync. When on, startup generation (Periodic Ritual catch-up, Daily Ritual daily-note create, and the Alignment modal) holds until Sync completes its first pass, so a device that wakes after another already generated a period sees the synced notes and skips the work — instead of every device redundantly regenerating (duplicate notes, notification bursts, \"changes on disk are newer\" conflicts). Releases immediately when Sync is off, paused, unlinked, or errored, and after a stall/timeout so startup never hangs. Check the console for \"sync-gate released\" to see what it waited on.")
             .addToggle(t => t
                 .setValue(!!s.prWaitForSyncBeforeGenerate)
                 .onChange(async v => {
