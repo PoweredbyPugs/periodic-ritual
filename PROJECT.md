@@ -267,6 +267,8 @@ Debugging/inspection node. One universal `in-any` input, no output. "Dry Run" bu
 6. **propagatePRFrontmatterToBody** — syncs frontmatter values to inline fields (`key:: value`) and `{{pr:key}}` body markers.
 7. **Update `lastGeneratedEnd`.**
 
+**`lastGeneratedEnd` must be a period's last day.** Catch-up resumes at `lastGeneratedEnd + 1`, and the note lookups (`findMostRecentPRContainerNote`, used by every "container current note" read/write in Daily Ritual) re-run the detector *at* that day to recover the note's filename. Periods must therefore never share a day: `end` is inclusive, and the next period starts at `end + 1`. If a detector's convention changes under an existing stamp (a custom boundary script edited, a timezone change), the stamp lands inside the next period — lookups then resolve a note that doesn't exist and the next note is created a day late. `realignPRLastGeneratedEnd` heals this at the top of `catchUpPRContainer` and on a lookup miss; it refuses to change anything for a detector whose periods overlap.
+
 **System prompts never bleed between layers.** Each LLM call uses its own system prompt file. The alignment group call and the main container call are completely isolated — different system prompts, different framework files, different instruction blocks.
 
 ### Write-back lifecycle

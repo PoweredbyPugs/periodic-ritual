@@ -6783,19 +6783,68 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     // against that period's tokens.
     async findMostRecentPRContainerNote(container) {
         if (!container || !container.lastGeneratedEnd || !container.naming) return null;
-        const periodEndDate = parseDateKeyLocal(container.lastGeneratedEnd);
-        if (isNaN(periodEndDate.getTime())) return null;
-        try {
+        const lookup = async () => {
+            const periodEndDate = parseDateKeyLocal(container.lastGeneratedEnd);
+            if (isNaN(periodEndDate.getTime())) return null;
             const data = await this.getPRBoundaryData(container.boundaryDetector, periodEndDate);
-            const fileName = this.resolveTokens(container.naming, data.tokens);
-            const folderPath = container.saveDir || "";
-            const filePath = folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
-            const file = this.app.vault.getAbstractFileByPath(filePath);
+            const file = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, data));
             return (file && file instanceof TFile) ? file : null;
+        };
+        try {
+            const file = await lookup();
+            if (file) return file;
+            // Miss: lastGeneratedEnd may be stale relative to the detector
+            // (see realignPRLastGeneratedEnd). Catch-up normally heals it,
+            // but that doesn't run when auto-generate is off.
+            if (await this.realignPRLastGeneratedEnd(container)) return await lookup();
+            return null;
         } catch (e) {
             console.error("Periodic Ritual: findMostRecentPRContainerNote failed", e);
             return null;
         }
+    }
+
+    // Vault path of the container note for a detector result.
+    prContainerNotePath(container, data) {
+        const fileName = this.resolveTokens(container.naming, data.tokens);
+        const folderPath = container.saveDir || "";
+        return folderPath ? `${folderPath}/${fileName}.md` : `${fileName}.md`;
+    }
+
+    // lastGeneratedEnd must be the LAST day of the most recently generated
+    // period: catch-up resumes at lastGeneratedEnd + 1, and the note lookups
+    // above re-run the detector AT that day to recover the note's name. The
+    // stamp goes stale when a detector's period convention changes under it
+    // (a custom boundary script edited to stop sharing its boundary day
+    // between two periods, a timezone change): the stored day then falls
+    // INSIDE a period — typically the first day of the next, not-yet-
+    // generated one — so lookups resolve a note that doesn't exist and
+    // catch-up starts a day late.
+    //
+    // Heal: if the period containing the stored day already has its note,
+    // the stamp becomes that period's end; otherwise the day before that
+    // period's start. The new value is adopted only if the detector agrees
+    // it is itself a period end — detectors whose periods share a boundary
+    // day can't be normalized and are left alone (no flip-flop).
+    // Returns true when the stamp changed. Detector errors propagate.
+    async realignPRLastGeneratedEnd(container) {
+        if (!container || !container.lastGeneratedEnd || !container.naming) return false;
+        const stamped = parseDateKeyLocal(container.lastGeneratedEnd);
+        if (isNaN(stamped.getTime())) return false;
+        const at = await this.getPRBoundaryData(container.boundaryDetector, stamped);
+        if (!at || formatDate(at.end) === container.lastGeneratedEnd) return false;
+
+        const existing = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, at));
+        const candidate = (existing instanceof TFile) ? at.end : addDays(at.start, -1);
+        const candidateStr = formatDate(candidate);
+        if (candidateStr === container.lastGeneratedEnd) return false;
+        const check = await this.getPRBoundaryData(container.boundaryDetector, candidate);
+        if (!check || formatDate(check.end) !== candidateStr) return false;
+
+        console.log(`Periodic Ritual: ${container.name} — lastGeneratedEnd "${container.lastGeneratedEnd}" is not a period end under the current boundary; realigned to "${candidateStr}"`);
+        container.lastGeneratedEnd = candidateStr;
+        await this.saveSettings();
+        return true;
     }
 
     // Find the container's PREVIOUS note (one period before the most recent one).
@@ -8210,11 +8259,21 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             return { created, wroteBack };
         }
 
-        const lastEnd = parseDateKeyLocal(container.lastGeneratedEnd);
+        let lastEnd = parseDateKeyLocal(container.lastGeneratedEnd);
         if (isNaN(lastEnd.getTime())) {
             console.warn(`Periodic Ritual: ${container.name} has invalid lastGeneratedEnd "${container.lastGeneratedEnd}", falling back to current period`);
             if ((await this.generatePRContainerNote(container, now, genOpts))?.created) created++;
             return { created, wroteBack };
+        }
+
+        // Heal a stamp that isn't a period end under the current detector
+        // before walking from it — see realignPRLastGeneratedEnd.
+        try {
+            if (await this.realignPRLastGeneratedEnd(container)) {
+                lastEnd = parseDateKeyLocal(container.lastGeneratedEnd);
+            }
+        } catch (e) {
+            console.error(`Periodic Ritual: lastGeneratedEnd realign failed for ${container.name}`, e);
         }
 
         // If lastGeneratedEnd is at or past the current period's end, we're
