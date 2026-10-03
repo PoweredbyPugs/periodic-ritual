@@ -6029,6 +6029,13 @@ class MonthlyRitualPlugin extends Plugin {
         // propagate values into the note body (inline fields + markers).
         await this.propagatePRFrontmatterToBody(file);
 
+        // A forced run on a period that is still in progress must not close
+        // it: the real end-of-period write-back is still owed.
+        if (opts.keepOpen) {
+            if (!opts.silent) new Notice(`${container.name}: write-back complete (period still open — not marked done)`);
+            return { file, done: false, status: llmStatus || "done" };
+        }
+
         // Track when write-back last ran so the catch-up check won't re-fire
         // it every reload. Note: do NOT touch lastGeneratedEnd here — this
         // pass runs on a PREVIOUS period and would regress the high-water
@@ -6371,9 +6378,15 @@ class MonthlyRitualPlugin extends Plugin {
             // reach the LLM; null means pass everything through (default).
             const allow = entry.fields;
             const profile = entry.profile;
-            const cache = this.app.metadataCache.getFileCache(file);
-            const fm = cache?.frontmatter || {};
             const content = await this.app.vault.read(file);
+            // Frontmatter from the RAW file. A source note may have been
+            // written moments ago (a week's write-back feeding its month,
+            // the month feeding its quarter, all in one catch-up run) and
+            // metadataCache hasn't re-indexed it yet — reading the cache
+            // here handed the LLM the note's pre-write placeholders. Cache
+            // only as a fallback for a block that fails to parse.
+            const fm = parseRawFrontmatter(content)
+                || this.app.metadataCache.getFileCache(file)?.frontmatter || {};
 
             // Strip the YAML block before scanning for inline fields
             const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
@@ -8562,24 +8575,36 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         let wroteBack = 0;
         try {
             // Collect the ended periods, newest first, then run oldest first.
-            const periods = [];
-            let probe = addDays(currentRange.start, -1);
-            for (let i = 0; i < PR_WRITEBACK_LOOKBACK; i++) {
-                let range = null;
-                try {
-                    range = await this.getPRBoundaryData(container.boundaryDetector, probe);
-                } catch (e) {
-                    // Nearest period: let the outer handler log it. Older
-                    // ones (e.g. a detector whose data window doesn't reach
-                    // that far back) just end the lookback.
-                    if (i === 0) throw e;
-                    break;
+            // Resolved once per session per current period: the look-back
+            // doesn't change until the next boundary, and a custom detector
+            // may hit the network for every date it is asked about.
+            if (!this._prWriteBackPeriods) this._prWriteBackPeriods = new Map();
+            const memoKey = `${container.id}|${container.boundaryDetector}|${formatDate(currentRange.start)}`;
+            let periods = this._prWriteBackPeriods.get(memoKey);
+            if (!periods) {
+                periods = [];
+                let complete = true;
+                let probe = addDays(currentRange.start, -1);
+                for (let i = 0; i < PR_WRITEBACK_LOOKBACK; i++) {
+                    let range = null;
+                    try {
+                        range = await this.getPRBoundaryData(container.boundaryDetector, probe);
+                    } catch (e) {
+                        // Nearest period: let the outer handler log it. Older
+                        // ones (e.g. a detector whose data window doesn't reach
+                        // that far back) just end the lookback — and aren't
+                        // remembered, so a later pass can try again.
+                        if (i === 0) throw e;
+                        complete = false;
+                        break;
+                    }
+                    if (!range || !(range.end < now)) break;
+                    periods.unshift({ range, nearest: i === 0 });
+                    const nextProbe = addDays(range.start, -1);
+                    if (!(nextProbe < probe)) break;
+                    probe = nextProbe;
                 }
-                if (!range || !(range.end < now)) break;
-                periods.unshift({ range, nearest: i === 0 });
-                const nextProbe = addDays(range.start, -1);
-                if (!(nextProbe < probe)) break;
-                probe = nextProbe;
+                if (complete) this._prWriteBackPeriods.set(memoKey, periods);
             }
 
             if (!this._prWriteBackTriedAt) this._prWriteBackTriedAt = new Map();
@@ -9082,15 +9107,21 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             callback: () => this.activatePRGraphView(),
         });
 
-        // Force-run write-back on a container's most recent note, bypassing
-        // the catch-up guard. Useful when a multi-device overwrite or a
-        // manual edit means you want the pipeline to re-run on an already-
-        // marked-done period. Clears the `writeback=true` marker before
-        // running so the normal flow can stamp it fresh.
+        // Force-run write-back, bypassing the catch-up guards. Two targets:
+        //   previous — the period that most recently ENDED (the note a
+        //              write-back "at end" belongs to). The usual one.
+        //   current  — the container's most recent note, which with
+        //              generateAt=start is the period still in progress;
+        //              it is refreshed but not marked done.
+        this.addCommand({
+            id: "pr-writeback-previous",
+            name: "Write back Previous Container (force)",
+            callback: () => this.pickAndWriteBackPRContainer("previous"),
+        });
         this.addCommand({
             id: "pr-writeback-now",
             name: "Re-run write-back for a container (force)",
-            callback: () => this.pickAndWriteBackPRContainer(),
+            callback: () => this.pickAndWriteBackPRContainer("current"),
         });
     }
 
@@ -9197,19 +9228,67 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         modal.open();
     }
 
-    // Force-run write-back for a container, bypassing the catch-up guard.
-    // Unlike the auto path this does not check lastWriteBackEnd or the note's
-    // writeback marker — the user explicitly asked for it. Clears the marker
-    // first so the pipeline doesn't short-circuit anywhere downstream, then
-    // lets writeBackToPRContainerNote re-stamp it on completion.
-    async pickAndWriteBackPRContainer() {
+    // Force-run write-back for a container, bypassing the catch-up guards
+    // (lastWriteBackEnd, the note's writeback marker, the in-progress lock,
+    // the retry window) — the user explicitly asked for it. Clears the
+    // marker first, then lets writeBackToPRContainerNote re-stamp it.
+    //
+    // which = "previous": the period that most recently ended, resolved
+    //   through the boundary detector and the naming convention, so it works
+    //   even when the note's stamp is missing or damaged (the stamp is
+    //   repaired on the way).
+    // which = "current": the container's most recent note, using the period
+    //   recorded in its own stamp. If that period is still in progress the
+    //   note is refreshed but left un-marked, so the real end-of-period
+    //   write-back still runs.
+    // A period with nothing logged is still skipped (with a notice).
+    async pickAndWriteBackPRContainer(which = "current") {
         const containers = this.settings.prContainers || [];
         if (containers.length === 0) {
             new Notice("No Periodic Ritual containers configured.");
             return;
         }
         const modal = new PRContainerPickerModal(this.app, containers, async (container) => {
-            let file = await this.findMostRecentPRContainerNote(container);
+            try {
+                await this.forcePRWriteBack(container, which);
+            } catch (e) {
+                new Notice(`${container.name}: write-back failed — ${e.message}`);
+                console.error("Periodic Ritual: forced write-back failed", e);
+            }
+        });
+        modal.setPlaceholder(which === "previous"
+            ? "Pick a container — re-run write-back on its PREVIOUS (ended) period…"
+            : "Pick a container — re-run write-back on its most recent note…");
+        modal.open();
+    }
+
+    async forcePRWriteBack(container, which) {
+        let file = null;
+        let range = null;
+        let keepOpen = false;
+        const stampRepair = {};
+
+        if (which === "previous") {
+            const current = await this.getPRBoundaryData(container.boundaryDetector, new Date());
+            const prev = await this.getPRBoundaryData(container.boundaryDetector, addDays(current.start, -1));
+            const path = this.prContainerNotePath(container, prev);
+            file = this.app.vault.getAbstractFileByPath(path);
+            if (!(file instanceof TFile)) {
+                new Notice(`${container.name}: no note found for the previous period (${path}).`);
+                return;
+            }
+            range = { start: prev.start, end: prev.end, tokens: prev.tokens };
+            const meta = await this.readPRMetadataFromFile(file, container);
+            if (!meta || !meta.id) {
+                Object.assign(stampRepair, {
+                    id: container.id,
+                    boundary: container.boundaryDetector,
+                    start: formatDate(prev.start),
+                    end: formatDate(prev.end),
+                });
+            }
+        } else {
+            file = await this.findMostRecentPRContainerNote(container);
             if (!file) {
                 new Notice(`${container.name}: no existing note to write back to.`);
                 return;
@@ -9217,38 +9296,26 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             // Derive the period range from the note's own metadata blob so
             // we run against the period that note actually represents, not
             // whatever today's boundary detector says.
-            let meta = await this.readPRMetadataFromFile(file, container);
-            // With generateAt=start the most recent note is the period still
-            // in progress. A write-back "at end" belongs to the period that
-            // just closed, so step back to the previous note — running it on
-            // the open period summarizes a near-empty span and marks the
-            // unfinished period as done.
-            const stillOpen = meta && meta.end && parseDateKeyLocal(meta.end) >= startOfDay(new Date());
-            if (stillOpen && (container.writeBackAt || "end") !== "start") {
-                const prev = await this.findPreviousPRContainerNote(container);
-                if (!prev) {
-                    new Notice(`${container.name}: the current period hasn't ended and there is no earlier note to write back to.`);
-                    return;
-                }
-                file = prev;
-                meta = await this.readPRMetadataFromFile(file, container);
-            }
+            const meta = await this.readPRMetadataFromFile(file, container);
             if (!meta || !meta.start || !meta.end) {
                 new Notice(`${container.name}: couldn't read periodic-ritual metadata from ${file.path}.`);
                 return;
             }
-            const range = {
+            range = {
                 start: parseDateKeyLocal(meta.start),
                 end: parseDateKeyLocal(meta.end),
                 tokens: meta,
             };
-            // Clear both guards so downstream logic doesn't short-circuit.
+            keepOpen = range.end >= startOfDay(new Date());
+        }
+
+        // Clear both guards so downstream logic doesn't short-circuit.
+        if (!keepOpen) {
             container.lastWriteBackEnd = "";
             await this.saveSettings();
-            await this.updatePRMetadataOnFile(file, container, { writeback: "false" });
-            await this.writeBackToPRContainerNote(container, file, range, { silent: false });
-        });
-        modal.open();
+        }
+        await this.updatePRMetadataOnFile(file, container, { ...stampRepair, writeback: "false" });
+        return await this.writeBackToPRContainerNote(container, file, range, { silent: false, keepOpen });
     }
 
     updateCommandNames() {
