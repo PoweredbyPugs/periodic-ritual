@@ -646,7 +646,64 @@ function makePRContainer(overrides = {}) {
         // Legacy shapes (single { type, containerId }) are accepted via
         // getContainerDataSources() and normalized on next save.
         dataSource: { sources: [{ type: "daily" }] },
+        // Aims (Phase 1, Oct 2026). Where this container's aims-in-force
+        // live, per life area. They become headings the next level reads,
+        // are injected into this container's LLM call as "Aims in force"
+        // (the model answers each as `**aim** sentence`), gate the daily
+        // capture questions, and prefill a child's aims from its parent.
+        //   mode: ""                  — no aims
+        //         "previous-inline"   — inline `key:: aim` lines on the PREVIOUS
+        //                               period's note (the 2025 weekly convention:
+        //                               next week's aim is written at this
+        //                               week's review)
+        //         "self-frontmatter"  — `<prefix>_<area>` keys on this period's
+        //                               own note (monthly / quarterly aims)
+        //   fields: "health=🩸, study=📖, …"  area → inline key (previous-inline)
+        //   prefix: "alignment"                 frontmatter key prefix (self-frontmatter)
+        //   parentContainerId: ""               prefill self-frontmatter aims from
+        //                                       this container's note for the period
+        aims: { mode: "", fields: "", prefix: "alignment", parentContainerId: "" },
     }, overrides);
+}
+
+// "health=🩸, study=📖" → [{ area: "health", key: "🩸" }, …]
+function prParseAimFields(str) {
+    return String(str || "").split(",").map(x => x.trim()).filter(Boolean).map(pair => {
+        const i = pair.indexOf("=");
+        return i > 0 ? { area: pair.slice(0, i).trim(), key: pair.slice(i + 1).trim() } : null;
+    }).filter(x => x && x.area && x.key);
+}
+
+// An aim as text: bold markers stripped; blanks and placeholders → "".
+function prCleanAim(v) {
+    const t = String(v === null || v === undefined ? "" : v).trim().replace(/^\*\*(.*)\*\*$/s, "$1").trim();
+    return /^[⋯…?\s]*$/.test(t) ? "" : t;
+}
+
+// Fill `<prefix>_<area>` frontmatter keys on new-note content from a parent's
+// aims, as bold values. Only blank / placeholder keys are filled; a key the
+// template doesn't have is added. Values are quoted — a plain `**` would be
+// read by YAML as an alias.
+function prPrefillAimFields(content, prefix, aims) {
+    const entries = Object.entries(aims || {}).filter(([, v]) => prCleanAim(v));
+    if (!entries.length) return content;
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (!fmMatch) return content;
+    let fm = fmMatch[1];
+    const added = [];
+    for (const [area, aim] of entries) {
+        const key = `${prefix}_${area}`;
+        const value = JSON.stringify(`**${prCleanAim(aim)}**`);
+        const re = new RegExp(`^(${escapeRegex(key)}):[ \\t]*(.*)$`, "m");
+        const m = fm.match(re);
+        if (m) {
+            if (!prCleanAim(m[2])) fm = fm.replace(re, `$1: ${value}`);
+        } else {
+            added.push(`${key}: ${value}`);
+        }
+    }
+    if (added.length) fm = fm + "\n" + added.join("\n");
+    return content.slice(0, fmMatch.index) + `---\n${fm}\n---` + content.slice(fmMatch.index + fmMatch[0].length);
 }
 
 // Periodic Ritual question factory. Same shape as Daily Ritual's question
@@ -683,6 +740,11 @@ function makePRQuestion(text) {
         outputTarget: "current",
         outputNotePath: "",                // for "note"
         outputTargetContainerId: "",       // for "container-current" / "container-previous"
+        // Phase 1 (Oct 2026): varSource "aim" shows this container's aim in
+        // force for the area named in varField (plus what the period logged
+        // for it); prefillFromInject puts that aim in the input so Enter
+        // keeps it and blank drops it — the weekly review's wayfinding step.
+        prefillFromInject: false,
     };
 }
 
@@ -1535,6 +1597,7 @@ const DEFAULT_SETTINGS = {
     prAutoGenerateOnLoad: false, // single on/off toggle for boundary-driven auto-create
     prWaitForSyncBeforeGenerate: true, // hold startup generation until Obsidian Sync settles (multi-device); no-op when Sync is off
     prNoDataIgnoreFields: "",  // comma-separated field names (`*` wildcard) that never count as logged data, e.g. "hw_*"
+    prCheckServicesOnLaunch: true, // ping every AI service in use at launch; persistent notice when one can't be reached
     prGraphLayout: {},         // { [nodeId]: { x, y } } — node positions in the graph view
 };
 
@@ -2387,6 +2450,12 @@ function dr_makeQuestion(text) {
         varAlignmentOutputKey: "",
         skipIfNoInjectValue: false,
         skipUnlessBoundaryFreshToday: false,
+        // Phase 1 (Oct 2026): the evening capture lines. Shown only while the
+        // chosen container's aims in force include this area (see the
+        // container's `aims` block); the aim itself is shown above the input
+        // when nothing else is injected. Blank aim → the question is hidden.
+        skipUnlessAimContainerId: "",
+        skipUnlessAimArea: "",
         // Smart phase-gate (independent of injectVar). When on, the question
         // shows ONLY while the chosen container's detector reports its current
         // `practice` token === phaseGatePhase, and it injects the prompt read
@@ -3102,7 +3171,8 @@ class DailyRitualModule {
             }
             return { value, hidden: false };
         }
-        if (!q || !q.injectVar) return { value: "", hidden: false };
+        if (!q) return { value: "", hidden: false };
+        if (!q.injectVar) return await this.applyAimGate(q, { value: "", hidden: false });
         const src = q.varSource || "previous-daily";
         let value = "";
         // Tracked so skipUnlessBoundaryFreshToday knows which container to
@@ -3161,7 +3231,27 @@ class DailyRitualModule {
             if (!sourceContainer || !this.containerCrossedToday(sourceContainer)) hidden = true;
         }
         if (q.skipIfNoInjectValue && !value) hidden = true;
-        return { value, hidden };
+        return await this.applyAimGate(q, { value, hidden });
+    }
+
+    // Capture questions: shown only while the chosen container's aims in
+    // force name this area; the aim is the context above the input when
+    // nothing else is injected. No-op when the question has no aim gate.
+    async applyAimGate(q, resolved) {
+        if (!q.skipUnlessAimArea || !q.skipUnlessAimContainerId) return resolved;
+        let aim = "";
+        const c = this.findContainerById(q.skipUnlessAimContainerId);
+        if (c) {
+            try {
+                const range = await this.plugin.getPRBoundaryData(c.boundaryDetector, new Date());
+                const aims = await this.plugin.getPRAimsInForce(c, range);
+                aim = aims[q.skipUnlessAimArea] || "";
+            } catch (e) {
+                console.error("Daily Ritual: aim predicate failed", e);
+            }
+        }
+        if (!aim) return { value: resolved.value, hidden: true };
+        return { value: resolved.value || `**${aim}**`, hidden: resolved.hidden };
     }
 
     async readFieldFromFileOrEmpty(file, fieldName) {
@@ -4352,6 +4442,21 @@ class DailyRitualModule {
                             });
                     }
                 }
+                // ── Capture gate: only while the week (or any container) has an aim for this area ──
+                new Setting(inputGroup)
+                    .setName("Only while an aim is set for an area")
+                    .setDesc("Hide this question unless the chosen container's aims in force include the area named below (the container's Aims settings say where its aims live). The aim is shown above the input. Leave the area blank to disable.")
+                    .addDropdown((dd) => {
+                        dd.addOption("", "— container —");
+                        for (const c of this.listPRContainers()) dd.addOption(c.id, c.name || "(unnamed)");
+                        dd.setValue(q.skipUnlessAimContainerId || "").onChange(async (v) => {
+                            q.skipUnlessAimContainerId = v; await this.saveSettings();
+                        });
+                    })
+                    .addText((t) => {
+                        t.setPlaceholder("area, e.g. health").setValue(q.skipUnlessAimArea || "")
+                            .onChange(async (v) => { q.skipUnlessAimArea = v.trim(); await this.saveSettings(); });
+                    });
                 // ── Smart phase-gate ──────────────────────────────────────
                 // Independent of "Inject variable". Shows the question only
                 // while a container is in a given phase, and injects that
@@ -4751,6 +4856,11 @@ class MonthlyRitualPlugin extends Plugin {
         } catch (e) {
             console.error("Periodic Ritual: sync gate failed; proceeding", e);
         }
+        try {
+            await this.checkPRServicesAtLaunch();
+        } catch (e) {
+            console.error("Periodic Ritual: service check failed", e);
+        }
         if (wantsPR) {
             try {
                 await this.runPRAutoGenerate();
@@ -4774,6 +4884,36 @@ class MonthlyRitualPlugin extends Plugin {
             }
         }
         this.scheduleMidnightRitual();
+    }
+
+    // Launch check (Phase 1, Oct 2026): ping each AI service an enabled
+    // container or alignment group relies on. One that can't be reached gets
+    // a notice that stays until dismissed, naming what depends on it —
+    // instead of a failure at midnight nobody sees (the Gemini quota case).
+    // Nothing is blocked by this; the write-back retry logic still applies.
+    async checkPRServicesAtLaunch() {
+        if (this.settings.prCheckServicesOnLaunch === false) return;
+        const enabled = (this.settings.prContainers || []).filter(c => c.enabled !== false);
+        const used = new Map(); // serviceId → [names]
+        const note = (id, name) => { if (!id) return; if (!used.has(id)) used.set(id, []); used.get(id).push(name); };
+        for (const c of enabled) note(c.llmServiceId, c.name || "container");
+        for (const g of (this.settings.prAlignmentGroups || [])) {
+            if (!enabled.some(c => c.id === g.containerId)) continue;
+            note(g.llmServiceId, `${g.name || "group"} (group)`);
+        }
+        const timeout = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error(`no answer in ${ms / 1000}s`)), ms));
+        for (const [id, names] of used) {
+            const svc = this.getPRLLMService(id);
+            const provider = svc && PROVIDERS[svc.provider];
+            if (!svc || !provider || typeof provider.listModels !== "function") continue;
+            try {
+                await Promise.race([provider.listModels(svc), timeout(8000)]);
+            } catch (e) {
+                const why = String((e && e.message) || e).slice(0, 120);
+                console.warn(`Periodic Ritual: AI service "${svc.name}" unreachable at launch — ${why}`);
+                new Notice(`Periodic Ritual: AI service "${svc.name}" can't be reached (${why}).\nUsed by: ${names.join(", ")}.\nSummaries that need it will wait and retry.`, 0);
+            }
+        }
     }
 
     // Day rollover while Obsidian stays open. The startup sequence only
@@ -4884,6 +5024,8 @@ class MonthlyRitualPlugin extends Plugin {
             if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
             if (q.phaseGateDayOnly === undefined) q.phaseGateDayOnly = false;
             if (q.phaseGateFallbackToken === undefined) q.phaseGateFallbackToken = "";
+            if (q.skipUnlessAimContainerId === undefined) q.skipUnlessAimContainerId = "";
+            if (q.skipUnlessAimArea === undefined) q.skipUnlessAimArea = "";
             if (q.textSize === undefined) q.textSize = "h5";
             if (q.centerInjected === undefined) q.centerInjected = false;
             if (q.outputTargetMode === undefined) q.outputTargetMode = "active";
@@ -5850,6 +5992,18 @@ class MonthlyRitualPlugin extends Plugin {
             content = this.resolveTokens(content, data.tokens);
             content = resolveCoreTemplateTokens(content, fileName);
 
+            // Phase 1: a child container's aims start as its parent's
+            // (monthly ← quarterly), written as bold frontmatter values the
+            // user edits into this period's steps or leaves as they are.
+            if (container.aims && container.aims.mode === "self-frontmatter" && container.aims.parentContainerId) {
+                try {
+                    const parentAims = await this.getPRParentAims(container, { start: data.start, end: data.end });
+                    if (parentAims) content = prPrefillAimFields(content, (container.aims.prefix || "alignment").trim(), parentAims.aims);
+                } catch (e) {
+                    console.warn(`Periodic Ritual: ${container.name} — aim prefill skipped`, e);
+                }
+            }
+
             // Stamp Periodic Ritual metadata so future phases can find these
             // notes again. Placement is per-container — frontmatter, inline,
             // or none. See applyPRMetadata for details.
@@ -6701,6 +6855,13 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                 out.push(line);
                 continue;
             }
+            // Markdown bold at the start of a value (`**aim** sentence` —
+            // the aims format) would be read by YAML as an alias and sink
+            // the whole block. It's text: quote it.
+            if (value.startsWith("**")) {
+                out.push(`${key}: '${value.replace(/'/g, "''")}'`);
+                continue;
+            }
             // Value starts with a YAML-significant char — list, map, folded,
             // anchor, merge, tag. User presumably meant structure; leave it.
             if (/^[-?\[{>|!*&]/.test(value)) {
@@ -6877,6 +7038,26 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             }
         }
 
+        // Aims (Phase 1). This container's aims in force become required
+        // output keys, answered as `**aim** sentence` — the heading-plus-
+        // reflection shape the next level's tables read. A parent's aims are
+        // context only. Neither section appears when nothing is configured.
+        const aimsInForce = await this.getPRAimsInForce(container, range);
+        const aimAreas = Object.keys(aimsInForce);
+        if (aimAreas.length) {
+            parts.push("# Aims in force (this period)", "");
+            for (const area of aimAreas) parts.push(`- **${area}**: ${aimsInForce[area]}`);
+            parts.push("");
+            parts.push("For EACH area listed above, return a key named exactly after the area. Its value starts with the aim in bold, then one or two sentences measuring this period against that aim from the source notes — plain, specific, no scores: `**<aim>** <sentences>`. Do not return a key for an area that is not listed above.");
+            parts.push("");
+        }
+        const parentAims = await this.getPRParentAims(container, range);
+        if (parentAims && Object.keys(parentAims.aims).length) {
+            parts.push(`# Aims from ${parentAims.parent.name} (${formatDate(parentAims.parentRange.start)} → ${formatDate(parentAims.parentRange.end)})`, "");
+            for (const [area, aim] of Object.entries(parentAims.aims)) parts.push(`- **${area}**: ${aim}`);
+            parts.push("", "These are the larger period's aims — the frame this period's aims sit inside. Use them as context; never reproduce or overwrite them.", "");
+        }
+
         parts.push(`# Source notes (${payload.label || "daily notes"})`, "", payload.text);
 
         // Framework reinforcement — reads the markdown file at
@@ -7031,6 +7212,59 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         }
     }
 
+    // This container's aims in force for `range`, as { area: aim }. See the
+    // `aims` block in makePRContainer. Empty object when not configured or
+    // when the note that holds them doesn't exist. Never throws.
+    async getPRAimsInForce(container, range) {
+        const cfg = container && container.aims;
+        if (!cfg || !cfg.mode || !range || !range.start) return {};
+        const out = {};
+        try {
+            if (cfg.mode === "previous-inline") {
+                const prevRange = await this.getPRBoundaryData(container.boundaryDetector, addDays(range.start, -1));
+                const f = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, prevRange));
+                if (!(f instanceof TFile)) return {};
+                const body = (await this.app.vault.read(f)).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+                for (const { area, key } of prParseAimFields(cfg.fields)) {
+                    const m = body.match(new RegExp(`^${escapeRegex(key)}::[ \\t]*(.*)$`, "m"));
+                    const v = prCleanAim(m ? m[1] : "");
+                    if (v) out[area] = v;
+                }
+            } else if (cfg.mode === "self-frontmatter") {
+                const data = range.tokens ? range : await this.getPRBoundaryData(container.boundaryDetector, range.start);
+                const f = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, data));
+                if (!(f instanceof TFile)) return {};
+                const fm = parseRawFrontmatter(await this.app.vault.read(f))
+                    || this.app.metadataCache.getFileCache(f)?.frontmatter || {};
+                const prefix = (cfg.prefix || "alignment").trim();
+                for (const [k, v] of Object.entries(fm)) {
+                    if (!k.startsWith(prefix + "_")) continue;
+                    const c = prCleanAim(typeof v === "object" ? JSON.stringify(v) : v);
+                    if (c) out[k.slice(prefix.length + 1)] = c;
+                }
+            }
+        } catch (e) {
+            console.warn(`Periodic Ritual: couldn't read aims for ${container.name}`, e);
+        }
+        return out;
+    }
+
+    // The parent container's aims for the parent period that contains
+    // range.start (monthly → its quarter). { aims, parent } or null.
+    async getPRParentAims(container, range) {
+        const id = container && container.aims && container.aims.parentContainerId;
+        const parent = id ? (this.settings.prContainers || []).find(c => c.id === id) : null;
+        if (!parent || !range || !range.start) return null;
+        try {
+            const parentRange = await this.getPRBoundaryData(parent.boundaryDetector, range.start);
+            const aims = await this.getPRAimsInForce(parent, parentRange);
+            return { aims, parent, parentRange };
+        } catch (e) {
+            console.warn(`Periodic Ritual: couldn't resolve parent aims for ${container.name}`, e);
+            return null;
+        }
+    }
+
     // Vault path of the container note for a detector result.
     prContainerNotePath(container, data) {
         const fileName = this.resolveTokens(container.naming, data.tokens);
@@ -7107,10 +7341,29 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
     //   "container-current" — current corresponding note of another container
     //                         (uses findMostRecentPRContainerNote on that container)
     //   "container-previous"— previous note of another container
-    async resolvePRInjectedVar(question, container, currentFile) {
+    // opts.raw: for varSource "aim", return just the aim text (what the
+    // input is prefilled with) instead of the aim plus the period's entries.
+    async resolvePRInjectedVar(question, container, currentFile, opts = {}) {
         if (!question || !question.injectVar || !question.varField) return "";
         let sourceFile = null;
         const src = question.varSource || "previous-period";
+        if (src === "aim") {
+            // This container's aim in force for the area in varField, with
+            // what the period has logged for that area beneath it — the
+            // weekly review's "last aim, what happened" context.
+            try {
+                const range = await this.getPRBoundaryData(container.boundaryDetector, parseDateKeyLocal(container.lastGeneratedEnd));
+                const aims = await this.getPRAimsInForce(container, range);
+                const aim = aims[question.varField] || "";
+                if (opts.raw) return aim;
+                const entries = await this.collectPRFieldFromSubdivisions(container, range.start, range.end, question.varField);
+                const head = aim ? `**${aim}**` : "*no aim was set for this period*";
+                return entries ? `${head}\n\n${entries}` : head;
+            } catch (e) {
+                console.error("Periodic Ritual: aim injection failed", e);
+                return "";
+            }
+        }
         if (src === "current" && currentFile) {
             // Current note — the note being reflected on (last boundary
             // crossed in this container). Already has frontmatter from
@@ -7347,11 +7600,18 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         // The same array is also sent to the LLM (when useLLM is on) so the
         // model sees the context the user was responding to.
         const injectedVars = [];
+        const initialAnswers = [];
         for (const q of reflection.questions) {
             injectedVars.push(await this.resolvePRInjectedVar(q, container, file));
+            // Prefilled answer: the current value, so Enter keeps it and a
+            // cleared input means "none" (writePRAnswerToField skips blanks).
+            initialAnswers.push(q.prefillFromInject ? await this.resolvePRInjectedVar(q, container, file, { raw: true }) : "");
         }
 
-        new ReflectionModal(this.app, reflection.questions, injectedVars, async (answers) => {
+        // Daily Ritual's modal: markdown-rendered context, prefilled answers,
+        // and blank answers allowed (an unanswered question writes nothing).
+        const resolved = injectedVars.map(v => ({ value: v, hidden: false }));
+        new DRReflectionModal(this.app, reflection.questions, resolved, async (answers) => {
             // Step 1 — always: write each answer to its configured output
             // field. Persists raw answers regardless of LLM success or
             // whether the LLM is used at all.
@@ -7403,7 +7663,7 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
             });
 
             new Notice(`${container.name}: reflection complete`);
-        }).open();
+        }, { initialAnswers }).open();
     }
 
     // ─── Periodic Ritual alignments (Phase 7) ───
@@ -10899,6 +11159,7 @@ class PRGraphView extends ItemView {
                 [
                     { value: "current",            label: "Current note (last boundary crossed)" },
                     { value: "previous-period",    label: "Previous period (this container)" },
+                    { value: "aim",                label: "This container's aim in force (area in Field)" },
                     { value: "note",               label: "Specific note" },
                     { value: "container-current",  label: "Current note of another container" },
                     { value: "container-previous", label: "Previous note of another container" },
@@ -10931,6 +11192,7 @@ class PRGraphView extends ItemView {
             }
 
             addLabeledText("Field name", "today", () => q.varField, (v) => { q.varField = v; });
+            addLabeledToggle("Prefill the answer with it", () => !!q.prefillFromInject, (v) => { q.prefillFromInject = v; });
             addLabeledDropdown("Field type",
                 [
                     { value: "inline",      label: "Inline (key:: value)" },
@@ -14558,6 +14820,55 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 });
             });
 
+        // ── Aims (Phase 1) ──
+        // Where this container's aims in force live. See makePRContainer.
+        if (!container.aims) container.aims = { mode: "", fields: "", prefix: "alignment", parentContainerId: "" };
+        const aims = container.aims;
+        new Setting(card)
+            .setName("Aims")
+            .setDesc("Where this container's aims live, per life area. Aims become required keys in the LLM output (`**aim** sentence`), gate the Daily Ritual capture questions, and can be prefilled from a parent container.")
+            .addDropdown(dd => {
+                dd.addOption("", "None");
+                dd.addOption("previous-inline", "Previous note's inline fields (set at the review for the next period)");
+                dd.addOption("self-frontmatter", "This note's frontmatter (prefix_area)");
+                dd.setValue(aims.mode || "");
+                dd.onChange(async v => {
+                    aims.mode = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                });
+            });
+        if (aims.mode === "previous-inline") {
+            new Setting(card)
+                .setName("Aim fields")
+                .setDesc("area=inline key, comma-separated. The area names are the output keys the LLM writes.")
+                .addText(t => t
+                    .setPlaceholder("health=🩸, study=📖, creative=🌿, links=🩵, work=⚒️")
+                    .setValue(aims.fields || "")
+                    .onChange(async v => { aims.fields = v.trim(); await this.plugin.saveSettings(); }));
+        }
+        if (aims.mode === "self-frontmatter") {
+            new Setting(card)
+                .setName("Aim key prefix")
+                .setDesc("Frontmatter keys `<prefix>_<area>` on this container's notes hold the aims.")
+                .addText(t => t
+                    .setPlaceholder("alignment")
+                    .setValue(aims.prefix || "alignment")
+                    .onChange(async v => { aims.prefix = v.trim() || "alignment"; await this.plugin.saveSettings(); }));
+            new Setting(card)
+                .setName("Prefill from parent")
+                .setDesc("When a note is created, its aim keys start as this container's aims for the period (bold). Edit them into this period's steps or leave them. Those parent aims are also shown to the LLM as context.")
+                .addDropdown(dd => {
+                    dd.addOption("", "— none —");
+                    for (const other of (s.prContainers || [])) {
+                        if (other.id === container.id) continue;
+                        dd.addOption(other.id, other.name || "(unnamed)");
+                    }
+                    dd.setValue(aims.parentContainerId || "");
+                    dd.onChange(async v => { aims.parentContainerId = v; await this.plugin.saveSettings(); });
+                });
+        }
+
         // ── Data sources (multi-source) ──
         // What the auto-LLM aggregation reads from. Default: daily notes.
         // Multiple sources can be combined — the LLM reads everything
@@ -15121,6 +15432,7 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         .addDropdown(dd => {
                             dd.addOption("current", "Current note (last boundary crossed)");
                             dd.addOption("previous-period", "Previous period of THIS container");
+                            dd.addOption("aim", "This container's aim in force (area name in Field)");
                             dd.addOption("note", "A specific note");
                             dd.addOption("container-current", "Current note of ANOTHER container");
                             dd.addOption("container-previous", "Previous note of ANOTHER container");
@@ -15171,6 +15483,13 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                                 q.varField = v;
                                 await this.plugin.saveSettings();
                             }));
+
+                    new Setting(panel)
+                        .setName("Prefill the answer with it")
+                        .setDesc("Put the injected value in the input so Enter keeps it; clearing it writes nothing. For the aim source this is the current aim — the weekly review's wayfinding step.")
+                        .addToggle(t => t
+                            .setValue(!!q.prefillFromInject)
+                            .onChange(async v => { q.prefillFromInject = v; await this.plugin.saveSettings(); }));
 
                     new Setting(panel)
                         .setName("Field type")
@@ -16449,6 +16768,16 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                 .setValue(s.prNoDataIgnoreFields || "")
                 .onChange(async v => {
                     s.prNoDataIgnoreFields = v.trim();
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Check AI services at launch")
+            .setDesc("Shortly after Obsidian starts, ping every AI service an enabled container or group relies on. One that can't be reached gets a notice that stays until dismissed, naming what depends on it.")
+            .addToggle(t => t
+                .setValue(s.prCheckServicesOnLaunch !== false)
+                .onChange(async v => {
+                    s.prCheckServicesOnLaunch = v;
                     await this.plugin.saveSettings();
                 }));
 

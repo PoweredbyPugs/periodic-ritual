@@ -304,6 +304,20 @@ Uses `[ \t]*` not `\s*` to prevent cross-line bleed from empty fields.
 
 ---
 
+## Aims (Phase 1, Oct 2026)
+
+A container can declare where its **aims in force** live, per life area (`container.aims`): `previous-inline` — inline `key:: aim` lines on the *previous* period's note (the weekly convention: next week's aim is written at this week's review; the mapping is `aims.fields = "health=🩸, study=📖, …"`), or `self-frontmatter` — `<prefix>_<area>` keys on the period's own note (monthly, quarterly). `getPRAimsInForce(container, range)` returns `{ area: aim }` with bold stripped and blanks/`⋯` dropped; `getPRParentAims` resolves `aims.parentContainerId`'s aims for the parent period containing `range.start`.
+
+Where aims are used:
+- **LLM calls** (`runPRLLMAggregation`): an `# Aims in force` section lists them and makes each area a required output key in the shape `**aim** sentence` (`sanitizePRYamlForParse` quotes values that open with `**`, which YAML would otherwise read as an alias). A parent's aims are injected as context only. Nothing is injected when nothing is configured.
+- **Prefill at creation** (`generatePRContainerNote` → `prPrefillAimFields`): a `self-frontmatter` container with a parent starts each `<prefix>_<area>` as the parent's aim in bold; only blank/placeholder keys are filled.
+- **Daily Ritual capture gate** (`DailyRitualModule.applyAimGate`): a question with `skipUnlessAimContainerId` + `skipUnlessAimArea` is hidden unless that container's aims in force include the area; the aim is shown above the input.
+- **Reflection questions** with `varSource: "aim"` show the aim for `varField` plus the period's logged entries; `prefillFromInject` puts the raw aim in the input (Enter keeps, blank drops). Container reflections now use `DRReflectionModal` (markdown context, prefill, blanks allowed).
+
+A blank aim means the area is left alone at every level.
+
+**Launch check** (`checkPRServicesAtLaunch`, setting `prCheckServicesOnLaunch`): each AI service an enabled container/group uses is pinged via `listModels` at startup; an unreachable one gets a persistent notice naming its dependents.
+
 ## Graph view
 
 Node-based visual editor. Custom-built — no third-party library. DOM nodes + SVG bezier wires inside a pannable/zoomable viewport.
