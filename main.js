@@ -345,6 +345,8 @@ const PR_WRITEBACK_LOCK_MS = 10 * 60 * 1000;
 // retried more than once per PR_WRITEBACK_RETRY_MS within a session, which
 // keeps the 10-minute catch-up interval from hammering a broken provider.
 const PR_WRITEBACK_LOOKBACK = 3;
+// Reflect picker: how many recent periods per container are offered.
+const PR_REFLECT_LOOKBACK = 4;
 const PR_WRITEBACK_RETRY_MS = 60 * 60 * 1000;
 
 // so users can drop a starter prompt into their vault with one click without
@@ -1629,11 +1631,13 @@ class PRReflectQueueModal extends FuzzySuggestModal {
         super(app);
         this.items = items;
         this.onChooseCallback = onChoose;
-        this.setPlaceholder("Reflections waiting…");
+        this.setPlaceholder("Pick a period to reflect on — ✓ = already done (running again overwrites)");
     }
     getItems() { return this.items; }
     getItemText(item) {
-        return `${item.container.name || "(unnamed)"} — ${item.file.basename}`;
+        const mark = item.done ? "✓" : "○";
+        const span = item.range ? ` (${formatDate(item.range.start)} → ${formatDate(item.range.end)})` : "";
+        return `${mark} ${item.container.name || "(unnamed)"} — ${item.file.basename}${span}`;
     }
     onChooseItem(item) { this.onChooseCallback(item); }
 }
@@ -7353,7 +7357,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             // what the period has logged for that area beneath it — the
             // weekly review's "last aim, what happened" context.
             try {
-                const range = await this.getPRBoundaryData(container.boundaryDetector, parseDateKeyLocal(container.lastGeneratedEnd));
+                const range = opts.range || await this.getPRBoundaryData(container.boundaryDetector, parseDateKeyLocal(container.lastGeneratedEnd));
                 const aims = await this.getPRAimsInForce(container, range);
                 const aim = aims[question.varField] || "";
                 if (opts.raw) return aim;
@@ -7553,7 +7557,9 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
     //      context + (when not replacing auto) previous frontmatter.
     //   3. If reflection.replaceAutoLLM: alignments were skipped at boundary,
     //      so run them now. Otherwise they already ran in generatePRContainerNote.
-    async runPRContainerReflection(container) {
+    // target (optional): { file, range } — a specific period's note, from the
+    // Reflect picker. Without it, the most recent note.
+    async runPRContainerReflection(container, target = null) {
         if (!container) { new Notice("No container provided"); return; }
 
         const reflection = this.getPRReflectionForContainer(container);
@@ -7573,17 +7579,17 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
             return;
         }
 
-        const file = await this.findMostRecentPRContainerNote(container);
+        const file = (target && target.file) || await this.findMostRecentPRContainerNote(container);
         if (!file) {
             new Notice(`${container.name}: no recent note found. Generate one first.`);
             return;
         }
 
-        // Range is needed for the LLM call and the alignment passes. Pure
-        // Q&A reflections don't need it — skip the resolution if everything
-        // is going to be no-ops anyway.
-        let range = null;
-        if (reflection.useLLM || reflection.replaceAutoLLM) {
+        // Range: the chosen period's, else the period the most recent note
+        // belongs to. Needed for the LLM call, the alignment passes and the
+        // "aim" question source.
+        let range = (target && target.range) || null;
+        if (!range) {
             try {
                 range = await this.getPRBoundaryData(container.boundaryDetector, parseDateKeyLocal(container.lastGeneratedEnd));
             } catch (e) {
@@ -7603,10 +7609,10 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
         const injectedVars = [];
         const initialAnswers = [];
         for (const q of reflection.questions) {
-            injectedVars.push(await this.resolvePRInjectedVar(q, container, file));
+            injectedVars.push(await this.resolvePRInjectedVar(q, container, file, { range }));
             // Prefilled answer: the current value, so Enter keeps it and a
             // cleared input means "none" (writePRAnswerToField skips blanks).
-            initialAnswers.push(q.prefillFromInject ? await this.resolvePRInjectedVar(q, container, file, { raw: true }) : "");
+            initialAnswers.push(q.prefillFromInject ? await this.resolvePRInjectedVar(q, container, file, { raw: true, range }) : "");
         }
 
         // Daily Ritual's modal: markdown-rendered context, prefilled answers,
@@ -9434,44 +9440,53 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         return null;
     }
 
+    // Reflect picker: for every container with a reflection profile, the
+    // last PR_REFLECT_LOOKBACK periods that have a note (newest first),
+    // marked ✓ when already reflected on. A done period can be picked again
+    // — its answers overwrite the earlier ones and the stamp is refreshed.
     async pickAndReflectPRContainer() {
-        // Reflection QUEUE: containers that have a reflection attached,
-        // a generated note for the current period (boundary crossed), and
-        // whose note has NOT been reflected on yet (no `reflected` marker
-        // in the note's PR blob). Done reflections drop off the list —
-        // the picker shows only what's waiting.
-        const candidates = [];
         const withReflection = (this.settings.prContainers || []).filter(c => !!c.reflectionId);
         if (withReflection.length === 0) {
             new Notice("No containers have a reflection profile attached. Attach one in Settings → Containers.");
             return;
         }
-        let generated = 0;
+        const items = [];
         for (const c of withReflection) {
-            const file = await this.findMostRecentPRContainerNote(c);
-            if (!file) continue;
-            generated++;
-            const meta = await this.readPRMetadataFromFile(file, c);
-            if (meta && meta.reflected === "true") continue; // already done
-            candidates.push({ container: c, file });
-        }
-        if (candidates.length === 0) {
-            if (generated === 0) {
-                new Notice("No containers with reflections have a generated note for the current period. Generate one first.");
-            } else {
-                new Notice("All reflections are caught up ✓");
+            try {
+                items.push(...await this.listPRReflectablePeriods(c, PR_REFLECT_LOOKBACK));
+            } catch (e) {
+                console.error(`Periodic Ritual: couldn't list periods for ${c.name}`, e);
             }
+        }
+        if (items.length === 0) {
+            new Notice("No containers with reflections have a generated note yet. Generate one first.");
             return;
         }
-        if (candidates.length === 1) {
-            // Only one pending — skip the picker and go straight to Q&A.
-            await this.runPRContainerReflection(candidates[0].container);
-            return;
-        }
-        const modal = new PRReflectQueueModal(this.app, candidates, async (item) => {
-            await this.runPRContainerReflection(item.container);
+        const modal = new PRReflectQueueModal(this.app, items, async (item) => {
+            await this.runPRContainerReflection(item.container, { file: item.file, range: item.range });
         });
         modal.open();
+    }
+
+    // The container's last `count` periods (current first) that have a note:
+    // [{ container, file, range, done }]. Periods are walked through the
+    // detector; notes are found by name, so a damaged stamp doesn't hide one.
+    async listPRReflectablePeriods(container, count) {
+        const out = [];
+        let probe = new Date();
+        for (let i = 0; i < count; i++) {
+            const range = await this.getPRBoundaryData(container.boundaryDetector, probe);
+            if (!range) break;
+            const file = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, range));
+            if (file instanceof TFile) {
+                const meta = await this.readPRMetadataFromFile(file, container);
+                out.push({ container, file, range, done: !!(meta && meta.reflected === "true") });
+            }
+            const next = addDays(range.start, -1);
+            if (!(next < probe)) break;
+            probe = next;
+        }
+        return out;
     }
 
     // Fuzzy picker over all configured PR containers (enabled or not).
