@@ -4899,6 +4899,7 @@ class MonthlyRitualPlugin extends Plugin {
         for (const c of enabled) note(c.llmServiceId, c.name || "container");
         for (const g of (this.settings.prAlignmentGroups || [])) {
             if (!enabled.some(c => c.id === g.containerId)) continue;
+            if ((g.runAt || "both") === "never") continue; // stood down — nothing waits on it
             note(g.llmServiceId, `${g.name || "group"} (group)`);
         }
         const timeout = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error(`no answer in ${ms / 1000}s`)), ms));
