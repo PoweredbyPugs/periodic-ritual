@@ -316,6 +316,10 @@ Where aims are used:
 
 A blank aim means the area is left alone at every level.
 
+**Alignment groups and aims (Phase 1b).** `group.sourceScope` — `latest` (the source's newest note) or `period` (every source note inside the container's period, fields merged; what a measurement group needs — "latest" handed the health group Monday's empty note). `group.aimArea` — the group *owns* that life area: it receives the container's aim in force (`# Aim in force`), must answer `**aim** sentence`, skips when no aim is in force, and `prAreasOwnedByGroups` removes the area from the main summary's "Aims in force" (one writer per field). Group passes return `{ status }`; a failed/empty group is recorded on the note as `pendingGroups=<ids>` next to `writeback=true` (the period still closes), and `runPRWriteBackPass` retries only those groups with the usual pacing, clearing the marker on success. `updatePRMetadataOnFile` deletes a key whose patch value is `null`.
+
+**Hermes memory scope.** A Custom Harness service's `sessionKey` is sent as `X-Hermes-Session-Key`, which scopes the agent's long-term memory to this channel (Mei otherwise answers as to a stranger). Mei lives at `http://punkrecords:8642/p/mei` (gateway profile), not on 8643.
+
 **Launch check** (`checkPRServicesAtLaunch`, setting `prCheckServicesOnLaunch`): each AI service an enabled container/group uses is pinged via `listModels` at startup; an unreachable one gets a persistent notice naming its dependents.
 
 ## Graph view

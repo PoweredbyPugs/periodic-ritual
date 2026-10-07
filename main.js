@@ -287,7 +287,12 @@ const PROVIDERS = {
             // If the gateway is in token mode, the API key is REQUIRED;
             // requests without it return 401. If it's in open mode, the
             // header is ignored. We always send Bearer when a key is set.
-            return s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
+            const h = s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {};
+            // Hermes: a stable session key scopes the agent's long-term
+            // memory to this channel, so it remembers the user across calls
+            // instead of answering as a stranger. Requires API-key auth.
+            if (s.sessionKey) h["X-Hermes-Session-Key"] = String(s.sessionKey).trim();
+            return h;
         },
         async listModels(s) {
             if (typeof s === "string") s = { apiKey: s };
@@ -904,6 +909,18 @@ function makePRAlignmentGroup(overrides = {}) {
         containerId: "",              // target container — set by wire to in-alignment
         sourceKind: "",               // "data-source" | "container"
         sourceId: "",                 // id of the source primitive
+        // Phase 1b (Oct 2026):
+        //   sourceScope: "latest" — the source's newest note (guidelines that
+        //                live on one note, e.g. a quarter's aims)
+        //                "period" — every source note inside the container's
+        //                period, merged (measurements, e.g. the week's Sunday
+        //                hw_* numbers — "latest" would hand you Monday's note)
+        //   aimArea: when set, the group OWNS that life area: it gets the
+        //            container's aim in force for it, answers as
+        //            `**aim** sentence`, and the main summary leaves the area
+        //            alone. No aim in force → the group skips.
+        sourceScope: "latest",
+        aimArea: "",
         llmServiceId: "",             // LLM service used for the gap-analysis call
         // Config
         systemPromptFile: "",
@@ -6155,9 +6172,13 @@ class MonthlyRitualPlugin extends Plugin {
 
         // Same pipeline order as generatePRContainerNote, but phase =
         // "writeback" so only primitives with runAt matching fire.
-        // 1. Alignment groups first
+        // 1. Alignment groups first. A group whose call failed is recorded
+        //    as pending on the note and retried by the write-back pass —
+        //    the main summary still lands and the period still closes.
+        let pendingGroups = [];
         if (!skipAutoLLM && !noData) {
-            await this.runPRAlignmentGroupsForContainer(container, file, range, { ...opts, phase });
+            const groupRun = await this.runPRAlignmentGroupsForContainer(container, file, range, { ...opts, phase });
+            pendingGroups = (groupRun && groupRun.failed) || [];
         }
         // 2. Main LLM aggregation (respects container.runLLMAt)
         const runLLMAt = container.runLLMAt || "both";
@@ -6208,8 +6229,13 @@ class MonthlyRitualPlugin extends Plugin {
         // its local lastWriteBackEnd is stale.
         // `nodata` records that the period was closed without a summary
         // because nothing was logged in it (see skipIfNoData).
-        await this.updatePRMetadataOnFile(file, container,
-            llmStatus === "nodata" ? { writeback: "true", nodata: "true" } : { writeback: "true" });
+        await this.updatePRMetadataOnFile(file, container, {
+            writeback: "true",
+            ...(llmStatus === "nodata" ? { nodata: "true" } : {}),
+            // null removes the key
+            pendingGroups: pendingGroups.length ? pendingGroups.join(",") : null,
+        });
+        if (pendingGroups.length) console.warn(`Periodic Ritual: ${container.name} — ${pendingGroups.length} alignment group(s) still owed on ${file.path}; will retry`);
 
         if (!opts.silent) new Notice(`${container.name}: write-back complete`);
         return { file, done: true, status: llmStatus || "done" };
@@ -6226,6 +6252,7 @@ class MonthlyRitualPlugin extends Plugin {
 
         const current = (await this.readPRMetadataFromFile(file, container)) || {};
         const merged = { ...current, ...patchFields };
+        for (const k of Object.keys(merged)) if (merged[k] === null || merged[k] === undefined) delete merged[k];
         const blob = formatPRMetadataBlob(merged);
 
         if (placement === "frontmatter") {
@@ -6237,7 +6264,10 @@ class MonthlyRitualPlugin extends Plugin {
                 // id/start/end ("periodic-ritual: writeback=true").
                 await this.app.fileManager.processFrontMatter(file, (fm) => {
                     const live = this.parsePRMetadataBlob(fm["periodic-ritual"]);
-                    fm["periodic-ritual"] = live ? formatPRMetadataBlob({ ...live, ...patchFields }) : blob;
+                    if (!live) { fm["periodic-ritual"] = blob; return; }
+                    const next = { ...live, ...patchFields };
+                    for (const k of Object.keys(next)) if (next[k] === null || next[k] === undefined) delete next[k];
+                    fm["periodic-ritual"] = formatPRMetadataBlob(next);
                 });
             } catch (e) {
                 console.error(`Periodic Ritual: failed to update PR frontmatter blob on ${file.path}`, e);
@@ -7048,6 +7078,7 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         // reflection shape the next level's tables read. A parent's aims are
         // context only. Neither section appears when nothing is configured.
         const aimsInForce = await this.getPRAimsInForce(container, range);
+        for (const owned of this.prAreasOwnedByGroups(container)) delete aimsInForce[owned];
         const aimAreas = Object.keys(aimsInForce);
         if (aimAreas.length) {
             parts.push("# Aims in force (this period)", "");
@@ -7893,17 +7924,36 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
     //   - optionally the freshly-aggregated frontmatter (compressed actuals)
     //   - the extracted guidelines
     // Then parses the YAML response and merges keys into the container note.
+    // Returns { failed: [groupId…] } — groups whose LLM call failed or came
+    // back empty. opts.onlyGroupIds restricts the run (pendingGroups retry).
     async runPRAlignmentGroupsForContainer(container, file, range, opts = {}) {
         const phase = opts.phase || "generate";
         const groups = (this.settings.prAlignmentGroups || []).filter(g => {
             if (g.containerId !== container.id) return false;
+            if (Array.isArray(opts.onlyGroupIds) && !opts.onlyGroupIds.includes(g.id)) return false;
             const runAt = g.runAt || "both";
             return runAt === "both" || runAt === phase;
         });
-        if (groups.length === 0) return;
+        const failed = [];
         for (const g of groups) {
-            await this.runPRAlignmentGroupPass(g, container, file, range, opts);
+            let r = null;
+            try {
+                r = await this.runPRAlignmentGroupPass(g, container, file, range, opts);
+            } catch (e) {
+                console.error(`Periodic Ritual: alignment group "${g.name}" threw`, e);
+                r = { status: "failed" };
+            }
+            if (r && (r.status === "failed" || r.status === "empty")) failed.push(g.id);
         }
+        return { failed };
+    }
+
+    // Life areas owned by active aim groups of this container — the main
+    // summary leaves those to the group (one writer per field).
+    prAreasOwnedByGroups(container) {
+        return (this.settings.prAlignmentGroups || [])
+            .filter(g => g.containerId === container.id && g.aimArea && (g.runAt || "both") !== "never")
+            .map(g => g.aimArea);
     }
 
     // ─── Alignment group helpers ───
@@ -7917,40 +7967,54 @@ const re = new RegExp(`^${escapeRegex(question.varField)}::[ \\t]*(.+)$`, "m");
     //     guidelines,         // { alignmentKey: value } — filtered to prefix, meta keys excluded
     //   }
     // Returns null if the source can't be resolved.
-    async resolvePRAlignmentGroupSource(group) {
-        let sourceFile = null;
+    // range (optional): the container period, needed for sourceScope "period".
+    async resolvePRAlignmentGroupSource(group, range = null) {
+        let sourceFiles = [];
         let sourceLabel = "(no source)";
+        const periodScope = (group.sourceScope || "latest") === "period" && range && range.start && range.end;
         if (group.sourceKind === "data-source" && group.sourceId) {
             const ds = (this.settings.prDataSources || []).find(x => x.id === group.sourceId);
             if (ds) {
-                sourceFile = await this.resolveDataSourceLatest(ds);
+                sourceFiles = periodScope
+                    ? await this.resolveDataSourceForContainer(ds, range.start, range.end)
+                    : [await this.resolveDataSourceLatest(ds)].filter(Boolean);
                 sourceLabel = ds.name || "data source";
             }
         } else if (group.sourceKind === "container" && group.sourceId) {
             const srcContainer = (this.settings.prContainers || []).find(x => x.id === group.sourceId);
             if (srcContainer) {
-                sourceFile = await this.findMostRecentPRContainerNote(srcContainer);
+                sourceFiles = periodScope
+                    ? await this.findPRContainerNotesInRange(srcContainer, range.start, range.end)
+                    : [await this.findMostRecentPRContainerNote(srcContainer)].filter(Boolean);
                 sourceLabel = srcContainer.name || "container";
             }
         }
-        if (!sourceFile) return null;
+        sourceFiles = sourceFiles.filter(f => f instanceof TFile);
+        if (!sourceFiles.length) return null;
+        if (periodScope) sourceLabel += ` — ${sourceFiles.length} note${sourceFiles.length === 1 ? "" : "s"} in period`;
+        const sourceFile = sourceFiles[sourceFiles.length - 1];
 
         const prefix = (group.prefix || "alignment").trim();
         if (!prefix) return null;
 
-        const sourceFm = this.app.metadataCache.getFileCache(sourceFile)?.frontmatter || {};
+        // Merge fields across the source notes (period scope): a later note
+        // overrides an earlier one. Frontmatter read from the raw file.
+        const sourceFm = {};
         const sourceInline = {};
-        try {
-            const raw = await this.app.vault.read(sourceFile);
-            const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
-            // `[ \t]*` (not `\s*`) so empty inline fields don't consume the
-// newline and pick up the next line's value.
-const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
-            let m;
-            while ((m = inlineRegex.exec(body)) !== null) {
-                sourceInline[m[1]] = m[2].trim();
-            }
-        } catch (_) { /* ignore */ }
+        for (const f of sourceFiles) {
+            try {
+                const raw = await this.app.vault.read(f);
+                Object.assign(sourceFm, parseRawFrontmatter(raw) || this.app.metadataCache.getFileCache(f)?.frontmatter || {});
+                const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
+                // `[ \t]*` (not `\s*`) so empty inline fields don't consume the
+                // newline and pick up the next line's value.
+                const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
+                let m;
+                while ((m = inlineRegex.exec(body)) !== null) {
+                    sourceInline[m[1]] = m[2].trim();
+                }
+            } catch (_) { /* ignore */ }
+        }
 
         // A base alignment key: starts with `{prefix}_`, doesn't end with
         // one of the meta suffixes. `alignment_health` is a guideline,
@@ -8093,22 +8157,37 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         return null;
     }
 
+    // Returns { status } for the write-back bookkeeping:
+    //   "written" | "failed" | "empty" | "nosource" | "nofields" | "noaim" | "skipped"
     async runPRAlignmentGroupPass(group, container, file, range, opts = {}) {
         // 1. Resolve source → guidelines + raw source frontmatter / inline
-        const src = await this.resolvePRAlignmentGroupSource(group);
+        const src = await this.resolvePRAlignmentGroupSource(group, range);
         if (!src) {
             if (!opts.silent) new Notice(`${group.name}: guidelines source has no note to read`);
-            return;
+            return { status: "nosource" };
         }
         const { sourceFile, sourceLabel, sourceFm, sourceInline, guidelines } = src;
         if (Object.keys(guidelines).length === 0) {
             if (!opts.silent) new Notice(`${group.name}: no ${group.prefix}_* fields found in ${sourceFile.path}`);
-            return;
+            return { status: "nofields" };
+        }
+        // An aim-owning group measures against the container's aim in force
+        // for its area; with no aim set the area is left alone (the rule
+        // everywhere: blank aim → nothing written).
+        if (group.aimArea && range) {
+            const aims = await this.getPRAimsInForce(container, range);
+            src.aim = aims[group.aimArea] || "";
+            if (!src.aim) {
+                console.log(`Periodic Ritual: ${group.name} — no "${group.aimArea}" aim in force for this period; skipping`);
+                if (!opts.silent) new Notice(`${group.name}: no ${group.aimArea} aim in force — skipped`);
+                return { status: "noaim" };
+            }
         }
 
         // ── Combined mode: all alignments → one unified narrative ──
         if (group.combined || (group.defaultMode || "separate") === "combined") {
-            return await this._runPRAlignmentGroupCombined(group, container, file, range, src, opts);
+            const r = await this._runPRAlignmentGroupCombined(group, container, file, range, src, opts);
+            return (r && r.status) ? r : (opts.dryRun ? r : { status: r === undefined ? "failed" : "written" });
         }
 
         // 2. Resolve per-alignment config — split into splice-only vs LLM-required
@@ -8386,6 +8465,10 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         }
         parts.push("");
 
+        if (src.aim) {
+            parts.push(`# Aim in force (${group.aimArea})`, "", src.aim, "", "Measure the guidelines above against this aim: what moved toward it, what didn't, plainly and specifically. No scores.", "");
+        }
+
         const globalFW = this.settings.prFrameworksGlobalEnabled !== false;
         const useFW = globalFW && group.useFramework !== false && group.framework;
         if (useFW) {
@@ -8400,6 +8483,10 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         parts.push("# Instructions", "");
         parts.push(`Return a YAML block with exactly one key: \`${outputKey}\`.`);
         parts.push("");
+        if (src.aim) {
+            parts.push(`The value must START with the aim in bold, exactly: \`**${src.aim.replace(/\*/g, "")}**\` — then the sentences.`);
+            parts.push("");
+        }
         const maxSentences = group.combinedMaxSentences || 10;
         parts.push(`The value must be a single unified narrative (up to ${maxSentences} sentences) that addresses ALL of the guidelines above together. Weave connections between dimensions where they exist. Be concise and specific — cite numbers, counts, and patterns, not vague generalities.`);
         parts.push("");
@@ -8444,14 +8531,16 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             }
             responseText = provider.extractText(r.json);
         } catch (e) {
-            if (!opts.silent) new Notice(`${group.name}: LLM call failed — ${e.message}`);
+            // Surfaced even in silent catch-up: the group stays owed and is
+            // retried by the write-back pass (pendingGroups).
+            new Notice(`${group.name}: LLM call failed — ${e.message}`);
             console.error("Periodic Ritual alignment-group combined error:", e);
-            return;
+            return opts.dryRun ? undefined : { status: "failed" };
         }
 
         if (!responseText) {
             if (!opts.silent) new Notice(`${group.name}: empty response`);
-            return opts.dryRun ? { parsed: { [outputKey]: "" }, writes: {}, guidelines, systemPrompt, userMessage, empty: true, combined: true } : undefined;
+            return opts.dryRun ? { parsed: { [outputKey]: "" }, writes: {}, guidelines, systemPrompt, userMessage, empty: true, combined: true } : { status: "empty" };
         }
 
         // Parse through the standard YAML pipeline (fence stripping +
@@ -8465,12 +8554,14 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
             return { parsed: writes, writes, guidelines, systemPrompt, userMessage, combined: true, outputKey };
         }
 
-        if (!file) return;
+        if (!file) return { status: "skipped" };
         try {
             await this.writePRKeysToNote(file, writes, group.writeTo || "frontmatter");
             if (!opts.silent) new Notice(`${group.name}: wrote combined analysis to ${outputKey} (${group.writeTo || "frontmatter"})`);
+            return { status: "written" };
         } catch (e) {
             if (!opts.silent) new Notice(`${group.name}: failed to write — ${e.message}`);
+            return { status: "failed" };
         }
     }
 
@@ -8899,6 +8990,21 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
                     if (nearest && noteSaysDone && !localSaysDone) {
                         container.lastWriteBackEnd = endStr;
                         await this.saveSettings();
+                    }
+                    // Closed, but an alignment group is still owed (its
+                    // call failed when the period closed). Retry just those,
+                    // with the same pacing as a full write-back.
+                    const pending = stamped ? String(noteMeta.pendingGroups || "").split(",").map(x => x.trim()).filter(Boolean) : [];
+                    if (pending.length) {
+                        const key = `${file.path}#groups`;
+                        if (Date.now() - (this._prWriteBackTriedAt.get(key) || 0) < PR_WRITEBACK_RETRY_MS) break;
+                        this._prWriteBackTriedAt.set(key, Date.now());
+                        const run = await this.runPRAlignmentGroupsForContainer(container, file, range, { silent: true, phase: "writeback", onlyGroupIds: pending });
+                        const left = (run && run.failed) || [];
+                        await this.updatePRMetadataOnFile(file, container, { pendingGroups: left.length ? left.join(",") : null });
+                        if (left.length) break; // provider still down — stop here
+                        this._prWriteBackTriedAt.delete(key);
+                        wroteBack++;
                     }
                     continue;
                 }
@@ -15678,6 +15784,22 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
         const body = card.createDiv({ cls: "mr-pr-card-body" });
 
         new Setting(body)
+            .setName("Source scope")
+            .setDesc("Latest: the source's newest note (aims that live on one note). This period: every source note inside the container's period, merged — for measurements such as the week's Sunday health numbers.")
+            .addDropdown(dd => {
+                dd.addOption("latest", "Latest note");
+                dd.addOption("period", "This period's notes");
+                dd.setValue(group.sourceScope || "latest");
+                dd.onChange(async v => { group.sourceScope = v; await this.plugin.saveSettings(); });
+            });
+        new Setting(body)
+            .setName("Owns a life area")
+            .setDesc("Optional. The area whose aim this group measures against (e.g. health). The group receives the container's aim in force for it, answers as `**aim** sentence`, and the main summary leaves that area to this group. No aim in force → the group skips.")
+            .addText(t => t
+                .setPlaceholder("health")
+                .setValue(group.aimArea || "")
+                .onChange(async v => { group.aimArea = v.trim(); await this.plugin.saveSettings(); }));
+        new Setting(body)
             .setName("Prefix")
             .setDesc("Composes the output frontmatter keys and determines which source-note fields are auto-discovered as guidelines. For example, prefix=\"alignment\" reads every alignment_* field from the source note.")
             .addText(t => t
@@ -16332,6 +16454,18 @@ class MonthlyRitualSettingTab extends PluginSettingTab {
                         });
                     t.inputEl.style.width = "320px";
                 });
+        }
+        if (service.provider === "openclaw") {
+            new Setting(card)
+                .setName("Memory scope key")
+                .setDesc("Hermes only. A stable name sent with every call so the agent keeps its long-term memory of you for this channel (e.g. periodic-ritual). Blank = each call is anonymous.")
+                .addText(t => t
+                    .setPlaceholder("periodic-ritual")
+                    .setValue(service.sessionKey || "")
+                    .onChange(async v => {
+                        service.sessionKey = v.trim();
+                        await this.plugin.saveSettings();
+                    }));
         }
 
         // API key (password)
