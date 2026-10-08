@@ -311,7 +311,7 @@ A container can declare where its **aims in force** live, per life area (`contai
 Where aims are used:
 - **LLM calls** (`runPRLLMAggregation`): an `# Aims in force` section lists them and makes each area a required output key in the shape `**aim** sentence` (`sanitizePRYamlForParse` quotes values that open with `**`, which YAML would otherwise read as an alias). A parent's aims are injected as context only. Nothing is injected when nothing is configured.
 - **Prefill at creation** (`generatePRContainerNote` → `prPrefillAimFields`): a `self-frontmatter` container with a parent starts each `<prefix>_<area>` as the parent's aim in bold; only blank/placeholder keys are filled.
-- **Daily Ritual capture gate** (`DailyRitualModule.applyAimGate`): a question with `skipUnlessAimContainerId` + `skipUnlessAimArea` is hidden unless that container's aims in force include the area; the aim is shown above the input.
+- **Daily Ritual capture lines** (`DailyRitualModule.applyAimGate`): a question with `skipUnlessAimContainerId` + `skipUnlessAimArea` shows that container's aim in force for the area above the input when there is one. It is asked either way (the field names are historical: an earlier version hid the question with no aim; the user wants every day's entries captured regardless).
 - **Reflection questions** with `varSource: "aim"` show the aim for `varField` plus the period's logged entries; `prefillFromInject` puts the raw aim in the input (Enter keeps, blank drops). Container reflections now use `DRReflectionModal` (markdown context, prefill, blanks allowed).
 
 A blank aim means the area is left alone at every level.

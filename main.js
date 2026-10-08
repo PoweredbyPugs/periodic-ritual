@@ -3255,9 +3255,11 @@ class DailyRitualModule {
         return await this.applyAimGate(q, { value, hidden });
     }
 
-    // Capture questions: shown only while the chosen container's aims in
-    // force name this area; the aim is the context above the input when
-    // nothing else is injected. No-op when the question has no aim gate.
+    // Capture questions: the chosen container's aim in force for this area
+    // is shown above the input when there is one. The question is asked
+    // either way — the weekly tables read every day's entries, aim or not
+    // (user decision 2026-10-08; an earlier version hid the question when no
+    // aim was set). No-op when the question names no area.
     async applyAimGate(q, resolved) {
         if (!q.skipUnlessAimArea || !q.skipUnlessAimContainerId) return resolved;
         let aim = "";
@@ -3271,8 +3273,7 @@ class DailyRitualModule {
                 console.error("Daily Ritual: aim predicate failed", e);
             }
         }
-        if (!aim) return { value: resolved.value, hidden: true };
-        return { value: resolved.value || `**${aim}**`, hidden: resolved.hidden };
+        return { value: resolved.value || (aim ? `**${aim}**` : ""), hidden: resolved.hidden };
     }
 
     async readFieldFromFileOrEmpty(file, fieldName) {
@@ -4465,8 +4466,8 @@ class DailyRitualModule {
                 }
                 // ── Capture gate: only while the week (or any container) has an aim for this area ──
                 new Setting(inputGroup)
-                    .setName("Only while an aim is set for an area")
-                    .setDesc("Hide this question unless the chosen container's aims in force include the area named below (the container's Aims settings say where its aims live). The aim is shown above the input. Leave the area blank to disable.")
+                    .setName("Show the area's aim above the input")
+                    .setDesc("Pick a container and name a life area: when that container has an aim in force for the area, it is shown above the input. The question is asked either way. Leave the area blank to disable.")
                     .addDropdown((dd) => {
                         dd.addOption("", "— container —");
                         for (const c of this.listPRContainers()) dd.addOption(c.id, c.name || "(unnamed)");
