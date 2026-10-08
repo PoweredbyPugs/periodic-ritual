@@ -1261,8 +1261,11 @@
    "Text size" setting); this rule only owns the spacing that separates
    the injected block from the question below it. */
 /* Daily Ritual: compact orientation tag at the top-left of a step ("🌘♍III - Detach"). */
-.pr-dr-tag { font-size: 0.8em; color: var(--text-muted); text-align: left; margin: 0 0 8px; line-height: 1.2; }
+.pr-dr-tag { font-size: 0.85em; color: var(--text-muted); text-align: left; margin: 0 0 4px; line-height: 1.2; }
 .pr-dr-tag p { margin: 0; }
+/* The phase prompt beneath the tag: smaller still, readable, left-aligned, no heading weight. */
+.pr-dr-injected.pr-dr-injected-compact { font-size: 0.78em; font-weight: normal; color: var(--text-normal); text-align: left; line-height: 1.4; margin: 0 0 12px; }
+.pr-dr-injected.pr-dr-injected-compact p { margin: 0 0 4px; }
 
 .pr-dr-injected {
     margin-bottom: 8px;

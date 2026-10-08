@@ -2821,7 +2821,9 @@ class DRReflectionModal extends Modal {
             // spacing that separates it from the question.
             const size = q.textSize || "h5";
             const centerCls = q.centerInjected ? " pr-dr-injected-center" : "";
-            const varEl = contentEl.createDiv({ cls: `pr-dr-injected pr-dr-question-${size}${centerCls}` });
+            // Under a tag the prompt is a compact line, not a heading-sized block.
+            const compactCls = tag ? " pr-dr-injected-compact" : "";
+            const varEl = contentEl.createDiv({ cls: `pr-dr-injected pr-dr-question-${size}${centerCls}${compactCls}` });
             MarkdownRenderer.renderMarkdown(injected, varEl, "", this);
         }
         const imageSrc = this.imagePaths[qIdx] || "";
