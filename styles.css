@@ -1260,6 +1260,10 @@
    from the shared .pr-dr-question-h* class (driven by the question's
    "Text size" setting); this rule only owns the spacing that separates
    the injected block from the question below it. */
+/* Daily Ritual: compact orientation tag at the top-left of a step ("🌘♍III - Detach"). */
+.pr-dr-tag { font-size: 0.8em; color: var(--text-muted); text-align: left; margin: 0 0 8px; line-height: 1.2; }
+.pr-dr-tag p { margin: 0; }
+
 .pr-dr-injected {
     margin-bottom: 8px;
 }

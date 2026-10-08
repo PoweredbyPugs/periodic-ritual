@@ -2500,9 +2500,9 @@ function dr_makeQuestion(text) {
         // boundary detector (e.g. a one-line description of the phase).
         // Keeps the question from rendering blank before a prompt is set.
         phaseGateFallbackToken: "",
-        // Heading shown above the phase prompt: the name of a token from the
-        // same detector (e.g. `phaseLink` → "[[🌗 Duí Moon in Cancer|🌗 Cancer II]]"),
-        // so the daily step reads "current phase and sign, then the prompt".
+        // Small tag at the top-left of the step: the name of a token from the
+        // same detector (e.g. `moonTagPractice` → "🌘♍III - Detach"). Field
+        // name is historical (it began as a heading).
         phaseGateHeadingToken: "",
         outputToField: false,
         outputFieldName: "",
@@ -2805,6 +2805,12 @@ class DRReflectionModal extends Modal {
         contentEl.empty();
         const qIdx = this.visibleSteps[this.cursor];
         const q = this.questions[qIdx];
+        const tag = (this.injectedResolved[qIdx] || {}).tag || "";
+        if (tag) {
+            // Small, muted, top-left — orientation, not content.
+            const tagEl = contentEl.createDiv({ cls: "pr-dr-tag" });
+            MarkdownRenderer.renderMarkdown(tag, tagEl, "", this);
+        }
         const injected = (this.injectedResolved[qIdx] || {}).value || "";
         if (injected) {
             // Render the injected value as markdown so admonitions / bold /
@@ -3197,12 +3203,14 @@ class DailyRitualModule {
                 const v = data && data.tokens && data.tokens[q.phaseGateFallbackToken];
                 value = (v === null || v === undefined) ? "" : String(v);
             }
+            // Compact tag ("🌘♍III - Detach") rendered small at the top-left of
+            // the step, separate from the prompt.
+            let tag = "";
             if (q.phaseGateHeadingToken) {
                 const h = data && data.tokens && data.tokens[q.phaseGateHeadingToken];
-                const heading = (h === null || h === undefined) ? "" : String(h).trim();
-                if (heading) value = value ? `#### ${heading}\n\n${value}` : `#### ${heading}`;
+                tag = (h === null || h === undefined) ? "" : String(h).trim();
             }
-            return { value, hidden: false };
+            return { value, hidden: false, tag };
         }
         if (!q) return { value: "", hidden: false };
         if (!q.injectVar) return await this.applyAimGate(q, { value: "", hidden: false });
@@ -4543,10 +4551,10 @@ class DailyRitualModule {
                                 .onChange(async (v) => { q.phaseGateFallbackToken = v.trim(); await this.saveSettings(); });
                         });
                     new Setting(inputGroup)
-                        .setName("Heading token")
-                        .setDesc("Shown as a heading above the prompt: the name of a token from the container's boundary detector (e.g. phaseLink for the current moon phase and sign). Leave blank for no heading.")
+                        .setName("Tag token")
+                        .setDesc("A small line at the top-left of the step: the name of a token from the container's boundary detector (e.g. moonTagPractice → 🌘♍III - Detach). Leave blank for none.")
                         .addText((t) => {
-                            t.setPlaceholder("e.g. phaseLink").setValue(q.phaseGateHeadingToken || "")
+                            t.setPlaceholder("e.g. moonTagPractice").setValue(q.phaseGateHeadingToken || "")
                                 .onChange(async (v) => { q.phaseGateHeadingToken = v.trim(); await this.saveSettings(); });
                         });
                 }
