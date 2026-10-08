@@ -694,7 +694,7 @@ function prCleanAim(v) {
 // aims, as bold values. Only blank / placeholder keys are filled; a key the
 // template doesn't have is added. Values are quoted — a plain `**` would be
 // read by YAML as an alias.
-function prPrefillAimFields(content, prefix, aims) {
+function prPrefillAimFields(content, keyOf, aims) {
     const entries = Object.entries(aims || {}).filter(([, v]) => prCleanAim(v));
     if (!entries.length) return content;
     const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -702,7 +702,7 @@ function prPrefillAimFields(content, prefix, aims) {
     let fm = fmMatch[1];
     const added = [];
     for (const [area, aim] of entries) {
-        const key = `${prefix}_${area}`;
+        const key = keyOf(area);
         const value = JSON.stringify(`**${prCleanAim(aim)}**`);
         const re = new RegExp(`^(${escapeRegex(key)}):[ \\t]*(.*)$`, "m");
         const m = fm.match(re);
@@ -6024,7 +6024,19 @@ class MonthlyRitualPlugin extends Plugin {
             if (container.aims && container.aims.mode === "self-frontmatter" && container.aims.parentContainerId) {
                 try {
                     const parentAims = await this.getPRParentAims(container, { start: data.start, end: data.end });
-                    if (parentAims) content = prPrefillAimFields(content, (container.aims.prefix || "alignment").trim(), parentAims.aims);
+                    const prefix = (container.aims.prefix || "alignment").trim();
+                    if (parentAims) content = prPrefillAimFields(content, area => `${prefix}_${area}`, parentAims.aims);
+                } catch (e) {
+                    console.warn(`Periodic Ritual: ${container.name} — aim prefill skipped`, e);
+                }
+            }
+            // previous-inline (weekly): the aims set at last week's review
+            // become this note's bold area values at creation, so this
+            // week's frontmatter is the one reliable, editable place.
+            if (container.aims && container.aims.mode === "previous-inline") {
+                try {
+                    const aims = await this.getPRAimsInForce(container, data);
+                    content = prPrefillAimFields(content, area => area, aims);
                 } catch (e) {
                     console.warn(`Periodic Ritual: ${container.name} — aim prefill skipped`, e);
                 }
@@ -7262,29 +7274,31 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         try {
             if (cfg.mode === "previous-inline") {
                 const fields = prParseAimFields(cfg.fields);
-                const prevRange = await this.getPRBoundaryData(container.boundaryDetector, addDays(range.start, -1));
-                const prev = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, prevRange));
-                if (prev instanceof TFile) {
-                    const body = (await this.app.vault.read(prev)).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
-                    for (const { area, key } of fields) {
-                        const m = body.match(new RegExp(`^${escapeRegex(key)}::[ \\t]*(.*)$`, "m"));
-                        const v = prCleanAim(m ? m[1] : "");
-                        if (v) out[area] = v;
-                    }
-                }
-                // The 2025 shape also allows the aim typed straight into THIS
-                // note's frontmatter as a bold value (`health: "**aim**"`),
-                // before any sentences follow it. Honour that where the
-                // previous note's line is blank.
+                // 1. THIS note's frontmatter, when the area holds a bold aim
+                //    and nothing else yet (`health: "**aim**"`). Written at
+                //    creation from the previous note's lines, and editable by
+                //    hand — the reliable place (user decision 2026-10-08).
                 const cur = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container,
                     range.tokens ? range : await this.getPRBoundaryData(container.boundaryDetector, range.start)));
                 if (cur instanceof TFile) {
                     const fm = parseRawFrontmatter(await this.app.vault.read(cur)) || {};
                     for (const { area } of fields) {
-                        if (out[area]) continue;
                         const raw = String(fm[area] === null || fm[area] === undefined ? "" : fm[area]).trim();
                         if (!/^\*\*[^*]+\*\*$/.test(raw)) continue;
                         const v = prCleanAim(raw);
+                        if (v) out[area] = v;
+                    }
+                }
+                // 2. The PREVIOUS note's inline lines (`🩸:: aim`, written at
+                //    its review for the week after it) for any area still blank.
+                const prevRange = await this.getPRBoundaryData(container.boundaryDetector, addDays(range.start, -1));
+                const prev = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, prevRange));
+                if (prev instanceof TFile) {
+                    const body = (await this.app.vault.read(prev)).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+                    for (const { area, key } of fields) {
+                        if (out[area]) continue;
+                        const m = body.match(new RegExp(`^${escapeRegex(key)}::[ \\t]*(.*)$`, "m"));
+                        const v = prCleanAim(m ? m[1] : "");
                         if (v) out[area] = v;
                     }
                 }
