@@ -684,7 +684,10 @@ function prParseAimFields(str) {
 // An aim as text: bold markers stripped; blanks and placeholders → "".
 function prCleanAim(v) {
     const t = String(v === null || v === undefined ? "" : v).trim().replace(/^\*\*(.*)\*\*$/s, "$1").trim();
-    return /^[⋯…?\s]*$/.test(t) ? "" : t;
+    // Blank, a bare placeholder, or a glyph-only template default ("🩸") → no aim.
+    if (/^[⋯…?\s]*$/.test(t)) return "";
+    if (/^[\p{Extended_Pictographic}\p{Emoji_Component}\s]+$/u.test(t)) return "";
+    return t;
 }
 
 // Fill `<prefix>_<area>` frontmatter keys on new-note content from a parent's
@@ -7258,14 +7261,32 @@ const inlineRegex = /^([a-zA-Z0-9_-]+)::[ \t]*(.+)$/gm;
         const out = {};
         try {
             if (cfg.mode === "previous-inline") {
+                const fields = prParseAimFields(cfg.fields);
                 const prevRange = await this.getPRBoundaryData(container.boundaryDetector, addDays(range.start, -1));
-                const f = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, prevRange));
-                if (!(f instanceof TFile)) return {};
-                const body = (await this.app.vault.read(f)).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
-                for (const { area, key } of prParseAimFields(cfg.fields)) {
-                    const m = body.match(new RegExp(`^${escapeRegex(key)}::[ \\t]*(.*)$`, "m"));
-                    const v = prCleanAim(m ? m[1] : "");
-                    if (v) out[area] = v;
+                const prev = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container, prevRange));
+                if (prev instanceof TFile) {
+                    const body = (await this.app.vault.read(prev)).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+                    for (const { area, key } of fields) {
+                        const m = body.match(new RegExp(`^${escapeRegex(key)}::[ \\t]*(.*)$`, "m"));
+                        const v = prCleanAim(m ? m[1] : "");
+                        if (v) out[area] = v;
+                    }
+                }
+                // The 2025 shape also allows the aim typed straight into THIS
+                // note's frontmatter as a bold value (`health: "**aim**"`),
+                // before any sentences follow it. Honour that where the
+                // previous note's line is blank.
+                const cur = this.app.vault.getAbstractFileByPath(this.prContainerNotePath(container,
+                    range.tokens ? range : await this.getPRBoundaryData(container.boundaryDetector, range.start)));
+                if (cur instanceof TFile) {
+                    const fm = parseRawFrontmatter(await this.app.vault.read(cur)) || {};
+                    for (const { area } of fields) {
+                        if (out[area]) continue;
+                        const raw = String(fm[area] === null || fm[area] === undefined ? "" : fm[area]).trim();
+                        if (!/^\*\*[^*]+\*\*$/.test(raw)) continue;
+                        const v = prCleanAim(raw);
+                        if (v) out[area] = v;
+                    }
                 }
             } else if (cfg.mode === "self-frontmatter") {
                 const data = range.tokens ? range : await this.getPRBoundaryData(container.boundaryDetector, range.start);
