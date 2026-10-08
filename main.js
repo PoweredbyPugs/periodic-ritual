@@ -2500,6 +2500,10 @@ function dr_makeQuestion(text) {
         // boundary detector (e.g. a one-line description of the phase).
         // Keeps the question from rendering blank before a prompt is set.
         phaseGateFallbackToken: "",
+        // Heading shown above the phase prompt: the name of a token from the
+        // same detector (e.g. `phaseLink` → "[[🌗 Duí Moon in Cancer|🌗 Cancer II]]"),
+        // so the daily step reads "current phase and sign, then the prompt".
+        phaseGateHeadingToken: "",
         outputToField: false,
         outputFieldName: "",
         outputFieldType: "inline",
@@ -3192,6 +3196,11 @@ class DailyRitualModule {
             if (!value && q.phaseGateFallbackToken) {
                 const v = data && data.tokens && data.tokens[q.phaseGateFallbackToken];
                 value = (v === null || v === undefined) ? "" : String(v);
+            }
+            if (q.phaseGateHeadingToken) {
+                const h = data && data.tokens && data.tokens[q.phaseGateHeadingToken];
+                const heading = (h === null || h === undefined) ? "" : String(h).trim();
+                if (heading) value = value ? `#### ${heading}\n\n${value}` : `#### ${heading}`;
             }
             return { value, hidden: false };
         }
@@ -4533,6 +4542,13 @@ class DailyRitualModule {
                             t.setPlaceholder("e.g. phaseChartLine").setValue(q.phaseGateFallbackToken || "")
                                 .onChange(async (v) => { q.phaseGateFallbackToken = v.trim(); await this.saveSettings(); });
                         });
+                    new Setting(inputGroup)
+                        .setName("Heading token")
+                        .setDesc("Shown as a heading above the prompt: the name of a token from the container's boundary detector (e.g. phaseLink for the current moon phase and sign). Leave blank for no heading.")
+                        .addText((t) => {
+                            t.setPlaceholder("e.g. phaseLink").setValue(q.phaseGateHeadingToken || "")
+                                .onChange(async (v) => { q.phaseGateHeadingToken = v.trim(); await this.saveSettings(); });
+                        });
                 }
                 new Setting(inputGroup)
                     .setName("Text size")
@@ -5050,6 +5066,7 @@ class MonthlyRitualPlugin extends Plugin {
             if (q.skipUnlessBoundaryFreshToday === undefined) q.skipUnlessBoundaryFreshToday = false;
             if (q.phaseGateDayOnly === undefined) q.phaseGateDayOnly = false;
             if (q.phaseGateFallbackToken === undefined) q.phaseGateFallbackToken = "";
+            if (q.phaseGateHeadingToken === undefined) q.phaseGateHeadingToken = "";
             if (q.skipUnlessAimContainerId === undefined) q.skipUnlessAimContainerId = "";
             if (q.skipUnlessAimArea === undefined) q.skipUnlessAimArea = "";
             if (q.textSize === undefined) q.textSize = "h5";
