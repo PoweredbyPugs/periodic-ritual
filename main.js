@@ -3460,7 +3460,15 @@ class DailyRitualModule {
             await this.saveSettings();
         }
         const onDraftChange = async ({ answers, step }) => {
-            this.settings.alignmentDraft = { date: dr_todayDateString(), filePath: file.path, answers: [...answers], step };
+            // Never let a reopened, untouched modal wipe text typed earlier
+            // today: keep the earlier draft's answer wherever the new one is
+            // blank. (A morning's thoughts were lost this way on 2026-10-08.)
+            const prev = this.settings.alignmentDraft;
+            const merged = [...answers];
+            if (prev && prev.date === dr_todayDateString() && Array.isArray(prev.answers) && prev.answers.length === merged.length) {
+                for (let i = 0; i < merged.length; i++) if (!String(merged[i] || "").trim() && prev.answers[i]) merged[i] = prev.answers[i];
+            }
+            this.settings.alignmentDraft = { date: dr_todayDateString(), filePath: file.path, answers: merged, step };
             await this.saveSettings();
         };
         new DRReflectionModal(this.app, questions, resolved, async (answers) => {
